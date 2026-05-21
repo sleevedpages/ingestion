@@ -1,0 +1,57 @@
+name = "sleevedpages-ingestion"
+main = "src/worker.ts"
+compatibility_date = "2024-11-01"
+
+# Binds to the same D1 database used by the main SleevedPages app
+[[d1_databases]]
+binding = "DB"
+database_name = "sleevedpagesdb"
+database_id = "42cf2813-0a3d-4d04-a67c-aff01c265bef"
+migrations_dir = "db/migrations"
+
+# Queue: orchestrator dispatches one message per group; consumers process them independently.
+# Each consumer invocation handles up to 10 groups (~120 subrequests max — well within limits).
+# max_concurrent_consumers = 1 keeps TCGCSV fetch rate orderly.
+[[queues.producers]]
+binding = "SYNC_QUEUE"
+queue   = "sleevedpages-sync-queue"
+
+[[queues.consumers]]
+queue                  = "sleevedpages-sync-queue"
+max_batch_size         = 10
+max_batch_timeout      = 30
+max_retries            = 2
+max_concurrent_consumers = 1
+
+[[r2_buckets]]
+binding     = "IMAGES_BUCKET"
+bucket_name = "sleeved-pages-images"
+
+# Runs daily at 6 AM UTC; mirrors Pokémon images every Sunday at 3 AM UTC
+[triggers]
+crons = ["0 6 * * *", "0 3 * * SUN"]
+
+[vars]
+TCGCSV_BASE_URL = "https://tcgcsv.com"
+LOG_LEVEL = "info"
+# DRY_RUN = "false"
+# BACKFILL_LIMIT = "50"  # Removed — full sync is ~2,000-2,500 requests, within the 10K limit
+# FORCE_SYNC = "true"      # Keep true until all sets are ingested, then remove
+
+[dev]
+port = 8788   # Use a different port from the main app (8787)
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1

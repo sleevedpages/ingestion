@@ -1,0 +1,18 @@
+# Local development overrides for wrangler dev.
+# Copy to .dev.vars (which is gitignored) and fill in as needed.
+# These override the [vars] block in wrangler.toml during local development.
+
+# Uncomment to override the TCGCSV base URL (e.g. point at a mock server)
+# TCGCSV_BASE_URL=https://tcgcsv.com
+
+# Uncomment to skip DB writes during local testing
+DRY_RUN=true
+
+# Uncomment for staged initial backfill (max sets per TCG per run)
+BACKFILL_LIMIT=50
+
+# Uncomment to bypass "no TCGCSV change" early-exit for repeated backfill runs
+# FORCE_SYNC=true
+
+# Log verbosity: debug | info | warn | error
+# LOG_LEVEL=debug
