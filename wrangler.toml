@@ -33,7 +33,7 @@ crons = ["0 6 * * *", "0 3 * * SUN"]
 
 [vars]
 TCGCSV_BASE_URL = "https://tcgcsv.com"
-LOG_LEVEL = "info"
+LOG_LEVEL = "debug"
 # DRY_RUN = "false"
 # BACKFILL_LIMIT = "50"  # Removed — full sync is ~2,000-2,500 requests, within the 10K limit
 # FORCE_SYNC = "true"      # Keep true until all sets are ingested, then remove

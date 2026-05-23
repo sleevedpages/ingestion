@@ -1,5 +1,5 @@
 import { runIngestion, processGroupMessage, type IngestionConfig, type SyncGroupMessage } from './ingestion/index.js';
-import { runMirrorJob } from './image-mirror.js';
+import { runMirrorJob, getPendingCards, uploadCardImage } from './image-mirror.js';
 import { logger } from './ingestion/logger.js';
 
 export interface Env {
@@ -57,10 +57,52 @@ export default {
 
     if (pathname === '/mirror' && request.method === 'POST') {
       try {
-        const result = await runMirrorJob({ DB: env.DB, IMAGES_BUCKET: env.IMAGES_BUCKET });
+        // maxBatches=1 keeps the HTTP response well under 30s
+        const result = await runMirrorJob({ DB: env.DB, IMAGES_BUCKET: env.IMAGES_BUCKET }, 1);
         return json({ ok: true, ...result });
       } catch (err) {
         logger.error('Manual mirror failed', { error: String(err) });
+        return json({ ok: false, error: String(err) }, 500);
+      }
+    }
+
+    // GET /mirror/pending?limit=N
+    // Returns the next N cards that still need mirroring, for use by mirror-local.mjs.
+    if (pathname === '/mirror/pending' && request.method === 'GET') {
+      const qs          = new URL(request.url).searchParams;
+      const limit       = Math.min(200, Math.max(1, parseInt(qs.get('limit') ?? '50', 10)));
+      const skrydexOnly = qs.get('skrydex_only') === '1';
+      const cards       = await getPendingCards(env.DB, limit, skrydexOnly);
+      return json({ ok: true, cards, has_more: cards.length === limit });
+    }
+
+    // POST /mirror/upload
+    // Accepts image bytes (base64) fetched by mirror-local.mjs from a non-datacenter IP,
+    // writes them to R2, and updates tcg_products.
+    if (pathname === '/mirror/upload' && request.method === 'POST') {
+      try {
+        const body = await request.json() as {
+          tcgplayer_product_id: number;
+          imageBase64:          string;
+          contentType:          string;
+          source:               'skrydex' | 'tcgplayer';
+        };
+
+        // Decode base64 → ArrayBuffer
+        const binary = atob(body.imageBase64);
+        const bytes  = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+        const r2Url = await uploadCardImage(
+          { DB: env.DB, IMAGES_BUCKET: env.IMAGES_BUCKET },
+          body.tcgplayer_product_id,
+          bytes.buffer,
+          body.contentType,
+          body.source,
+        );
+        return json({ ok: true, url: r2Url });
+      } catch (err) {
+        logger.error('Mirror upload failed', { error: String(err) });
         return json({ ok: false, error: String(err) }, 500);
       }
     }
@@ -79,8 +121,10 @@ export default {
     ctx: ExecutionContext
   ): Promise<void> {
     if (event.cron === '0 3 * * SUN') {
+      // Infinity = loop until no cards remain or the 25s wall-clock guard trips.
+      // ctx.waitUntil keeps the Worker alive until the promise settles.
       ctx.waitUntil(
-        runMirrorJob({ DB: env.DB, IMAGES_BUCKET: env.IMAGES_BUCKET }).catch((err) =>
+        runMirrorJob({ DB: env.DB, IMAGES_BUCKET: env.IMAGES_BUCKET }, Infinity).catch((err) =>
           logger.error('Scheduled mirror failed', { error: String(err) })
         )
       );
