@@ -115,12 +115,10 @@ export default {
     return json({ ok: false, error: 'Not found' }, 404);
   },
 
-  /**
-   * Cron handler:
-   *  "0 6 * * *"    — daily TCGPlayer data sync
-   *  "0 3 * * SUN"  — weekly image mirror + Scrydex set mapping
-   *  "*/10 * * * *" — every 10 min: process pending Scrydex webhook log rows
-   */
+  // Cron handler:
+  //   "0 6 * * *"         — daily TCGPlayer data sync
+  //   "0 3 * * SUN"       — weekly image mirror + Scrydex set mapping
+  //   every-10-min cron   — process pending Scrydex webhook log rows
   async scheduled(
     event: ScheduledEvent,
     env: Env,
