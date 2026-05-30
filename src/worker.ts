@@ -60,6 +60,32 @@ export default {
       return json({ ok: true, message: 'Sync started' });
     }
 
+    // POST /scrydex/process — process pending webhook log rows immediately
+    if (pathname === '/scrydex/process' && request.method === 'POST') {
+      if (!env.SCRYDEX_API_KEY || !env.SCRYDEX_TEAM_ID) {
+        return json({ ok: false, error: 'SCRYDEX_API_KEY / SCRYDEX_TEAM_ID not set' }, 503);
+      }
+      ctx.waitUntil(
+        processPendingWebhooks(env).catch((err) =>
+          logger.error('Manual Scrydex process failed', { error: String(err) })
+        )
+      );
+      return json({ ok: true, message: 'Scrydex processing started' });
+    }
+
+    // POST /scrydex/sync-sets — pull Scrydex expansion catalog and update skrydex_set_id
+    if (pathname === '/scrydex/sync-sets' && request.method === 'POST') {
+      if (!env.SCRYDEX_API_KEY || !env.SCRYDEX_TEAM_ID) {
+        return json({ ok: false, error: 'SCRYDEX_API_KEY / SCRYDEX_TEAM_ID not set' }, 503);
+      }
+      ctx.waitUntil(
+        syncScrydexSetMappings(env).catch((err) =>
+          logger.error('Manual Scrydex set mapping failed', { error: String(err) })
+        )
+      );
+      return json({ ok: true, message: 'Scrydex set mapping started' });
+    }
+
     if (pathname === '/mirror' && request.method === 'POST') {
       try {
         // maxBatches=1 keeps the HTTP response well under 30s
