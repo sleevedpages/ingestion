@@ -32,9 +32,12 @@ node scripts/mirror-local.mjs --batch 100 --concurrency 10
 ## Project Structure
 ```
 src/
-  worker.ts           # Entry point: fetch handler, cron handler, queue consumer
-  image-mirror.ts     # R2 image mirroring logic + HTTP endpoint helpers
-  run.ts              # Local dev runner (not deployed)
+  worker.ts              # Entry point: fetch handler, cron handler, queue consumer
+  image-mirror.ts        # R2 image mirroring logic + HTTP endpoint helpers
+  scrydexProcessor.ts    # Process pending scrydex_webhook_log rows → upsert scrydex_prices
+  scrydexSetMapping.ts   # Sync Scrydex expansion catalog → populate tcg_sets.skrydex_set_id
+  scrydexImageSync.ts    # Write Scrydex image URLs to tcg_products before R2 mirror
+  run.ts                 # Local dev runner (not deployed)
   ingestion/
     index.ts          # runIngestion() orchestrator
     categories.ts     # Sync TCGPlayer categories (games)
@@ -138,10 +141,23 @@ Handles both Pokémon (Skrydex + TCGPlayer fallback) and One Piece (Skrydex + TC
 - Scrydex sends webhooks to Content app at `/api/webhooks/scrydex`
 - Webhook handler is instant — only logs to `scrydex_webhook_log` (status = `'pending'`)
 - This Worker picks up pending rows every 10 minutes via `processPendingWebhooks()`
-  - Fetches prices per expansion from Scrydex API (1 credit/expansion)
-  - Matches cards by `card_number` + `skrydex_set_id`/`abbreviation` join
-  - Upserts into `scrydex_prices` table (batched at 100 statements per D1 call)
-- Product lookup uses expansion-based query (no IN clause) to avoid D1's ~512 variable limit
+  - Primary match: `variant.marketplaces[tcgplayer].product_id` → `tcg_products.tcgplayer_product_id`
+  - Fallback: `card.number` + `skrydex_set_id` join via `tcgplayer_group_id` (NOT `set_id` — that column doesn't exist)
+  - Price condition format: `'NM'`, `'NM (foil)'`, `'NM (altArt)'`
+  - Batches writes at 100 statements per `env.DB.batch()` call
+
+### Image Sync
+- `syncScrydexImages()` runs weekly before the R2 mirror job
+- One Piece + Gundam: each variant has a unique TCGPlayer product_id → use `variant.images[front].large`
+- All other games: variants share a product_id → use `card.images[front].large`, match via `tcgplayer_group_id`
+- Only updates rows where `image_url` is NULL or not already on R2
+
+### HTTP Endpoints (admin-triggered, require `x-worker-secret` header)
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/scrydex/process` | Process pending webhook log rows |
+| `POST` | `/scrydex/sync-sets` | Pull Scrydex expansion catalog → update `skrydex_set_id` |
+| `POST` | `/scrydex/sync-images` | Write Scrydex image URLs to `tcg_products` |
 
 ## Environment Variables
 | Var | Default | Purpose |
@@ -151,8 +167,9 @@ Handles both Pokémon (Skrydex + TCGPlayer fallback) and One Piece (Skrydex + TC
 | `DRY_RUN` | `false` | Skip DB writes when `true` |
 | `BACKFILL_LIMIT` | null | Limit products upserted per sync (dev only) |
 | `FORCE_SYNC` | `false` | Re-sync all sets regardless of `synced_at` |
-| `SCRYDEX_API_KEY` | — | Scrydex API key — required for price processing and set mapping |
+| `SCRYDEX_API_KEY` | — | Scrydex API key — required for price processing, set mapping, image sync |
 | `SCRYDEX_TEAM_ID` | — | Scrydex team ID — required alongside API key |
+| `INGESTION_WORKER_SECRET` | — | Shared secret for admin-triggered HTTP endpoints (`/scrydex/*`) |
 
 ## D1 Schema (Ingestion tables)
 

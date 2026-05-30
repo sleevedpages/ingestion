@@ -2,6 +2,7 @@ import { runIngestion, processGroupMessage, type IngestionConfig, type SyncGroup
 import { runMirrorJob, getPendingCards, uploadCardImage } from './image-mirror.js';
 import { processPendingWebhooks } from './scrydexProcessor.js';
 import { syncScrydexSetMappings } from './scrydexSetMapping.js';
+import { syncScrydexImages } from './scrydexImageSync.js';
 import { logger } from './ingestion/logger.js';
 
 export interface Env {
@@ -13,9 +14,11 @@ export interface Env {
   DRY_RUN?: string;
   BACKFILL_LIMIT?: string;
   FORCE_SYNC?: string;
-  // Scrydex price + set mapping
+  // Scrydex
   SCRYDEX_API_KEY?: string;
   SCRYDEX_TEAM_ID?: string;
+  // Shared secret for admin-triggered HTTP endpoints
+  INGESTION_WORKER_SECRET?: string;
 }
 
 function buildConfig(env: Env): IngestionConfig {
@@ -60,30 +63,42 @@ export default {
       return json({ ok: true, message: 'Sync started' });
     }
 
-    // POST /scrydex/process — process pending webhook log rows immediately
-    if (pathname === '/scrydex/process' && request.method === 'POST') {
-      if (!env.SCRYDEX_API_KEY || !env.SCRYDEX_TEAM_ID) {
-        return json({ ok: false, error: 'SCRYDEX_API_KEY / SCRYDEX_TEAM_ID not set' }, 503);
+    // ── Scrydex manual trigger endpoints (require x-worker-secret header) ────────
+    if (pathname.startsWith('/scrydex/') && request.method === 'POST') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
       }
-      ctx.waitUntil(
-        processPendingWebhooks(env).catch((err) =>
-          logger.error('Manual Scrydex process failed', { error: String(err) })
-        )
-      );
-      return json({ ok: true, message: 'Scrydex processing started' });
-    }
+      if (!env.SCRYDEX_API_KEY || !env.SCRYDEX_TEAM_ID) {
+        return json({ ok: false, error: 'SCRYDEX_API_KEY / SCRYDEX_TEAM_ID not configured' }, 503);
+      }
 
-    // POST /scrydex/sync-sets — pull Scrydex expansion catalog and update skrydex_set_id
-    if (pathname === '/scrydex/sync-sets' && request.method === 'POST') {
-      if (!env.SCRYDEX_API_KEY || !env.SCRYDEX_TEAM_ID) {
-        return json({ ok: false, error: 'SCRYDEX_API_KEY / SCRYDEX_TEAM_ID not set' }, 503);
+      if (pathname === '/scrydex/process') {
+        ctx.waitUntil(
+          processPendingWebhooks(env).catch((err) =>
+            logger.error('Manual Scrydex process failed', { error: String(err) })
+          )
+        );
+        return json({ ok: true, message: 'Scrydex webhook processing started' });
       }
-      ctx.waitUntil(
-        syncScrydexSetMappings(env).catch((err) =>
-          logger.error('Manual Scrydex set mapping failed', { error: String(err) })
-        )
-      );
-      return json({ ok: true, message: 'Scrydex set mapping started' });
+
+      if (pathname === '/scrydex/sync-sets') {
+        ctx.waitUntil(
+          syncScrydexSetMappings(env).catch((err) =>
+            logger.error('Manual Scrydex set mapping failed', { error: String(err) })
+          )
+        );
+        return json({ ok: true, message: 'Scrydex set mapping started' });
+      }
+
+      if (pathname === '/scrydex/sync-images') {
+        ctx.waitUntil(
+          syncScrydexImages(env).catch((err) =>
+            logger.error('Manual Scrydex image sync failed', { error: String(err) })
+          )
+        );
+        return json({ ok: true, message: 'Scrydex image sync started' });
+      }
     }
 
     if (pathname === '/mirror' && request.method === 'POST') {
@@ -153,14 +168,21 @@ export default {
     switch (event.cron) {
 
       case '0 3 * * SUN':
-        // Weekly: image mirror (loop until empty) + Scrydex set mapping in parallel
+        // Weekly pipeline — order matters:
+        //   1. syncScrydexSetMappings: populates skrydex_set_id on tcg_sets
+        //   2. syncScrydexImages: uses skrydex_set_id to write image URLs to tcg_products
+        //   3. runMirrorJob: reads updated image_url to fetch + store in R2
         ctx.waitUntil(
-          Promise.all([
-            runMirrorJob({ DB: env.DB, IMAGES_BUCKET: env.IMAGES_BUCKET }, Infinity)
-              .catch((err) => logger.error('Scheduled mirror failed', { error: String(err) })),
-            syncScrydexSetMappings(env)
-              .catch((err) => logger.error('Scrydex set mapping failed', { error: String(err) })),
-          ])
+          (async () => {
+            if (env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID) {
+              await syncScrydexSetMappings(env)
+                .catch((err) => logger.error('Scrydex set mapping failed', { error: String(err) }))
+              await syncScrydexImages(env)
+                .catch((err) => logger.error('Scrydex image sync failed', { error: String(err) }))
+            }
+            await runMirrorJob({ DB: env.DB, IMAGES_BUCKET: env.IMAGES_BUCKET }, Infinity)
+              .catch((err) => logger.error('Scheduled mirror failed', { error: String(err) }))
+          })()
         );
         break;
 

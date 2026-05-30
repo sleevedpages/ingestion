@@ -1,18 +1,22 @@
 /**
- * Scrydex webhook processor
+ * Scrydex Webhook Processor
  *
- * Runs every 10 minutes via cron — polls `scrydex_webhook_log` for pending
- * rows and fetches updated prices from the Scrydex API.
+ * Runs every 10 minutes via cron — picks up pending scrydex_webhook_log rows
+ * and fetches updated prices from the Scrydex API.
  *
- * Runs in the Ingestion Worker with no timeout budget concerns (unlike the
- * Pages Function waitUntil() which was killed after 30 seconds).
+ * Price matching strategy (in priority order):
+ *   1. variant.marketplaces[tcgplayer].product_id → tcg_products.tcgplayer_product_id
+ *   2. Fallback: card.number + expansion skrydex_set_id join
+ *      (uses tcgplayer_group_id, NOT the non-existent set_id column)
  *
- * Key design decisions vs the original Pages Function implementation:
- * - Product lookup uses a single expansion-based query (3 bind params) instead
- *   of an IN clause, avoiding D1's ~512 SQL variable limit on large MTG sets.
- * - Batch writes are chunked at 100 statements per env.DB.batch() call.
- * - Uses the correct join: p.tcgplayer_group_id = s.tcgplayer_group_id
- *   (tcg_products has no set_id column).
+ * Variant handling:
+ *   One Piece + Gundam: each variant has a unique TCGPlayer product_id + own images
+ *   All others (Pokemon, MTG, Lorcana, Riftbound): variants share a product_id
+ *
+ * Price condition format:
+ *   'NM'             — standard near-mint
+ *   'NM (foil)'      — foil variant
+ *   'NM (altArt)'    — alternate art variant
  */
 
 import type { Env } from './worker.js'
@@ -28,7 +32,7 @@ const SLUG_TO_GAME: Record<string, string> = {
   riftbound:         'Riftbound',
 }
 
-const BATCH_SIZE = 100   // max statements per D1 batch call
+const BATCH_SIZE = 100
 
 export async function processPendingWebhooks(env: Env): Promise<void> {
   const pending = await env.DB.prepare(`
@@ -36,7 +40,7 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
     FROM   scrydex_webhook_log
     WHERE  status = 'pending'
     ORDER BY received_at ASC
-    LIMIT 50
+    LIMIT 20
   `).all()
 
   if (!pending.results.length) return
@@ -50,36 +54,36 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
 
     try {
       const expansionIds: string[] = JSON.parse(row.expansion_ids_json as string)
-      const eventName  = row.event_name as string
-      const gameSlug   = eventName.split('.')[0]
-      const priceType  = eventName.includes('graded') ? 'graded' : 'raw'
-      const gameName   = SLUG_TO_GAME[gameSlug] ?? gameSlug
+      const eventName   = row.event_name as string
+      const gameSlug    = eventName.split('.')[0]
+      const priceType   = eventName.includes('graded') ? 'graded' : 'raw'
+      const gameName    = SLUG_TO_GAME[gameSlug] ?? gameSlug
 
-      let totalPricesUpserted = 0
-      let totalCreditsUsed    = 0
+      let pricesUpserted = 0
+      let creditsUsed    = 0
 
       for (const expansionId of expansionIds) {
         try {
-          const cards = await fetchExpansionPrices(env, gameSlug, expansionId)
-          totalCreditsUsed++
+          const cards = await fetchExpansionCards(env, gameSlug, expansionId, true)
+          creditsUsed++
 
-          if (!cards.length) continue
-
-          const upserts = await buildPriceUpserts(
-            env.DB, cards, gameName, expansionId, priceType
-          )
-
-          if (upserts.length) {
-            for (let i = 0; i < upserts.length; i += BATCH_SIZE) {
-              await env.DB.batch(upserts.slice(i, i + BATCH_SIZE))
-            }
-            totalPricesUpserted += upserts.length
+          const allUpserts: D1PreparedStatement[] = []
+          for (const card of cards) {
+            const upserts = await buildPriceUpserts(
+              env.DB, card, gameName, expansionId, priceType
+            )
+            allUpserts.push(...upserts)
           }
 
-          // Be a good API citizen
+          // Batch writes in chunks of 100
+          for (let i = 0; i < allUpserts.length; i += BATCH_SIZE) {
+            await env.DB.batch(allUpserts.slice(i, i + BATCH_SIZE))
+          }
+          pricesUpserted += allUpserts.length
+
           await new Promise(r => setTimeout(r, 100))
         } catch (err) {
-          console.error(`[ScrydexProcessor] Expansion ${expansionId} failed:`, err)
+          console.error(`[ScrydexProcessor] Expansion ${expansionId}:`, err)
         }
       }
 
@@ -90,11 +94,11 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
           credits_used    = ?,
           completed_at    = unixepoch()
         WHERE id = ?
-      `).bind(totalPricesUpserted, totalCreditsUsed, row.id).run()
+      `).bind(pricesUpserted, creditsUsed, row.id).run()
 
       console.log(
-        `[ScrydexProcessor] ${eventName} done:`,
-        `${expansionIds.length} expansions, ${totalPricesUpserted} prices, ${totalCreditsUsed} credits`
+        `[ScrydexProcessor] ${eventName}:`,
+        `${expansionIds.length} expansions, ${pricesUpserted} prices, ${creditsUsed} credits`
       )
     } catch (err) {
       console.error(`[ScrydexProcessor] Fatal on row ${row.id}:`, err)
@@ -111,71 +115,89 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
 
 // ─── Scrydex API ──────────────────────────────────────────────────────────────
 
-async function fetchExpansionPrices(env: Env, gameSlug: string, expansionId: string) {
-  const url = `${SCRYDEX_BASE}/${gameSlug}/v1/cards?expansion=${expansionId}&include=prices&limit=500`
-  const res = await fetch(url, {
+async function fetchExpansionCards(
+  env: Env,
+  gameSlug: string,
+  expansionId: string,
+  includePrices: boolean,
+): Promise<unknown[]> {
+  const url = new URL(`${SCRYDEX_BASE}/${gameSlug}/v1/cards`)
+  url.searchParams.set('expansion', expansionId)
+  url.searchParams.set('limit', '500')
+  if (includePrices) url.searchParams.set('include', 'prices')
+
+  const res = await fetch(url.toString(), {
     headers: {
       'X-Api-Key': env.SCRYDEX_API_KEY!,
       'X-Team-ID': env.SCRYDEX_TEAM_ID!,
       'Accept':    'application/json',
     },
   })
-  if (res.status === 429) throw new Error('Scrydex rate limit — back off and retry')
-  if (!res.ok) throw new Error(`Scrydex API ${res.status}`)
+  if (res.status === 429) throw new Error('Scrydex rate limit')
+  if (!res.ok) throw new Error(`Scrydex ${res.status} for ${gameSlug}/${expansionId}`)
   const data = await res.json() as { data?: unknown[] }
   return data.data ?? []
 }
 
-// ─── Product matching + upsert building ──────────────────────────────────────
+// ─── Price upsert building ────────────────────────────────────────────────────
 
 async function buildPriceUpserts(
   db:          D1Database,
-  scrydexCards: unknown[],
-  game:         string,
-  expansionId:  string,
-  priceType:    string
+  card:        unknown,
+  gameName:    string,
+  expansionId: string,
+  priceType:   string,
 ): Promise<D1PreparedStatement[]> {
-  // Fetch ALL products for this expansion in one query — only 3 bind params,
-  // no IN clause, no variable-count limit regardless of set size.
-  // tcg_products joins to tcg_sets via tcgplayer_group_id (not set_id).
-  const { results: expansionProducts } = await db.prepare(`
-    SELECT p.id, LOWER(p.card_number) AS cn
-    FROM   tcg_products p
-    JOIN   tcg_sets s       ON p.tcgplayer_group_id = s.tcgplayer_group_id
-    JOIN   tcg_categories c ON s.tcgplayer_category_id = c.tcgplayer_category_id
-    WHERE (
-      LOWER(s.skrydex_set_id) = LOWER(?)
-      OR LOWER(s.abbreviation) = LOWER(?)
-    )
-    AND LOWER(c.name) LIKE LOWER(?)
-  `).bind(
-    expansionId,
-    expansionId,
-    `%${game.split(' ')[0]}%`,
-  ).all()
-
-  // card_number (lowercase) → internal tcg_products.id
-  const productMap = new Map<string, number>(
-    expansionProducts.map((p: any) => [p.cn as string, p.id as number])
-  )
-
+  const c = card as any
   const upserts: D1PreparedStatement[] = []
+  const variants: any[] = c.variants ?? []
 
-  for (const card of scrydexCards as any[]) {
-    const cardNumber: string = card.number ?? card.card_number ?? ''
-    if (!cardNumber) continue
+  for (const variant of variants) {
+    // Primary match: TCGPlayer product_id from marketplace data
+    const tcgMarket   = (variant.marketplaces ?? []).find((m: any) => m.name === 'tcgplayer')
+    const tcgProductId = tcgMarket?.product_id ? parseInt(tcgMarket.product_id, 10) : null
 
-    const productId = productMap.get(cardNumber.toLowerCase())
-    if (!productId) continue
+    let product: { id: number } | null = null
 
-    for (const price of (card.prices ?? []) as any[]) {
+    if (tcgProductId) {
+      product = await db.prepare(
+        'SELECT id FROM tcg_products WHERE tcgplayer_product_id = ? LIMIT 1'
+      ).bind(tcgProductId).first() as { id: number } | null
+    }
+
+    // Fallback: card number + skrydex_set_id expansion join
+    // NOTE: join on tcgplayer_group_id — tcg_products has NO set_id column
+    if (!product) {
+      product = await db.prepare(`
+        SELECT p.id
+        FROM   tcg_products p
+        JOIN   tcg_sets s ON p.tcgplayer_group_id = s.tcgplayer_group_id
+        WHERE  LOWER(p.card_number) = LOWER(?)
+        AND    LOWER(s.skrydex_set_id) = LOWER(?)
+        LIMIT 1
+      `).bind(c.number ?? '', expansionId).first() as { id: number } | null
+    }
+
+    if (!product) continue
+
+    const variantName: string  = variant.name ?? 'normal'
+    const variantPrices: any[] = variant.prices ?? []
+
+    for (const price of variantPrices) {
+      if (price.type !== priceType) continue
+
+      // Condition format: 'NM', 'NM (foil)', 'NM (altArt)'
+      const condition = variantName === 'normal'
+        ? price.condition
+        : `${price.condition} (${variantName})`
+
       upserts.push(
         db.prepare(`
           INSERT INTO scrydex_prices
-            (tcg_product_id, scrydex_card_id, price_type, condition, is_foil,
+            (tcg_product_id, price_type, condition, is_foil,
              currency, low_price, market_price, trends_json,
              game, source_expansion_id, last_updated)
-          VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, unixepoch())
+          VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, unixepoch())
           ON CONFLICT(tcg_product_id, price_type, condition, is_foil, currency)
           DO UPDATE SET
             low_price           = excluded.low_price,
@@ -184,15 +206,14 @@ async function buildPriceUpserts(
             source_expansion_id = excluded.source_expansion_id,
             last_updated        = excluded.last_updated
         `).bind(
-          productId,
-          card.id      ?? null,
+          product.id,
           priceType,
-          price.condition,
+          condition,
           price.currency ?? 'USD',
           price.low      ?? null,
           price.market   ?? null,
           price.trends   ? JSON.stringify(price.trends) : null,
-          game,
+          gameName,
           expansionId,
         )
       )
