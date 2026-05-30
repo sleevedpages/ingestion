@@ -2,7 +2,8 @@ name = "sleevedpages-ingestion"
 main = "src/worker.ts"
 compatibility_date = "2024-11-01"
 
-# Binds to the same D1 database used by the main SleevedPages app
+# ── Production bindings (default) ────────────────────────────────────────────
+
 [[d1_databases]]
 binding = "DB"
 database_name = "sleevedpagesdb"
@@ -17,10 +18,10 @@ binding = "SYNC_QUEUE"
 queue   = "sleevedpages-sync-queue"
 
 [[queues.consumers]]
-queue                  = "sleevedpages-sync-queue"
-max_batch_size         = 10
-max_batch_timeout      = 30
-max_retries            = 2
+queue                    = "sleevedpages-sync-queue"
+max_batch_size           = 10
+max_batch_timeout        = 30
+max_retries              = 2
 max_concurrent_consumers = 1
 
 [[r2_buckets]]
@@ -55,3 +56,39 @@ invocation_logs = true
 enabled = false
 persist = true
 head_sampling_rate = 1
+
+# ── Preview / UAT bindings (non-default deployments) ─────────────────────────
+# Uses the isolated UAT database so test syncs never write to production data.
+# R2 images are shared (read-only reference data).
+#
+# Queue: the UAT worker uses the same queue by default.  If you need full queue
+# isolation (e.g. to test consumer logic without affecting prod throughput),
+# create a UAT queue:
+#   npx wrangler queues create sleevedpages-sync-queue-uat
+# Then update the queue names below to `sleevedpages-sync-queue-uat`.
+
+[env.preview]
+
+[[env.preview.d1_databases]]
+binding = "DB"
+database_name = "sleevedpagesdb-uat"
+database_id = "bfb51cf2-5a64-42a3-9575-4a9fc0c38e16"
+
+[[env.preview.queues.producers]]
+binding = "SYNC_QUEUE"
+queue   = "sleevedpages-sync-queue"
+
+[[env.preview.queues.consumers]]
+queue                    = "sleevedpages-sync-queue"
+max_batch_size           = 10
+max_batch_timeout        = 30
+max_retries              = 2
+max_concurrent_consumers = 1
+
+[[env.preview.r2_buckets]]
+binding     = "IMAGES_BUCKET"
+bucket_name = "sleeved-pages-images"
+
+[env.preview.vars]
+TCGCSV_BASE_URL = "https://tcgcsv.com"
+LOG_LEVEL = "debug"

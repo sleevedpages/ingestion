@@ -79,6 +79,10 @@ web_modules/
 .env.production.local
 .env.local
 
+# Wrangler local dev secrets — never commit real values
+.dev.vars
+.dev.vars.uat
+
 # parcel-bundler cache (https://parceljs.org/)
 .cache
 .parcel-cache
