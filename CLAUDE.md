@@ -69,7 +69,8 @@ db/migrations/
 | Cron | Job |
 |------|-----|
 | `0 6 * * *` | Daily TCG data sync (categories → sets → products → prices) |
-| `0 3 * * SUN` | Weekly image mirror job (Sunday 3 AM UTC) |
+| `0 3 * * SUN` | Weekly image mirror + Scrydex set mapping (Sunday 3 AM UTC) |
+| `*/10 * * * *` | Process pending Scrydex webhook log rows → upsert `scrydex_prices` |
 
 ## HTTP Endpoints
 | Method | Path | Description |
@@ -122,11 +123,25 @@ Handles both Pokémon (Skrydex + TCGPlayer fallback) and One Piece (Skrydex + TC
 
 `--skrydex-only` flag filters to Pokémon + One Piece cards with a Skrydex set mapping — use this first to get high-res images before the TCGPlayer pass.
 
-## Skrydex Set Mapping
-- `tcg_sets.skrydex_set_id` maps a TCGPlayer set to its Scrydex CDN identifier
-- Managed via Admin UI → Skrydex Set Mappings
-- Lookup map for known sets is in `src/lib/skrydexSets.ts`
-- Radiant Collection (RC) cards live within the parent set (e.g. `g1` for Generations) — set `skrydex_set_id = 'g1'` on the Generations set and RC cards will resolve correctly
+## Skrydex Integration
+
+### Set Mapping
+- `tcg_sets.skrydex_set_id` maps a TCGPlayer set to its Scrydex expansion identifier
+- **Auto-populated weekly** by `syncScrydexSetMappings()` in `src/scrydexSetMapping.ts`
+  - Fetches Scrydex expansion catalog for all 6 games (6 credits/week)
+  - Matches by: `tcg_sets.abbreviation` = Scrydex `code`/`ptcgo_code` (priority), then normalised name
+- Can also be set manually via Admin UI → Skrydex Set Mappings
+- Lookup map for known Pokémon sets still in `src/lib/skrydexSets.ts` (used by image mirror)
+- Radiant Collection (RC) cards share the parent set's `skrydex_set_id` (e.g. `g1` for Generations)
+
+### Price Processing
+- Scrydex sends webhooks to Content app at `/api/webhooks/scrydex`
+- Webhook handler is instant — only logs to `scrydex_webhook_log` (status = `'pending'`)
+- This Worker picks up pending rows every 10 minutes via `processPendingWebhooks()`
+  - Fetches prices per expansion from Scrydex API (1 credit/expansion)
+  - Matches cards by `card_number` + `skrydex_set_id`/`abbreviation` join
+  - Upserts into `scrydex_prices` table (batched at 100 statements per D1 call)
+- Product lookup uses expansion-based query (no IN clause) to avoid D1's ~512 variable limit
 
 ## Environment Variables
 | Var | Default | Purpose |
@@ -136,6 +151,8 @@ Handles both Pokémon (Skrydex + TCGPlayer fallback) and One Piece (Skrydex + TC
 | `DRY_RUN` | `false` | Skip DB writes when `true` |
 | `BACKFILL_LIMIT` | null | Limit products upserted per sync (dev only) |
 | `FORCE_SYNC` | `false` | Re-sync all sets regardless of `synced_at` |
+| `SCRYDEX_API_KEY` | — | Scrydex API key — required for price processing and set mapping |
+| `SCRYDEX_TEAM_ID` | — | Scrydex team ID — required alongside API key |
 
 ## D1 Schema (Ingestion tables)
 

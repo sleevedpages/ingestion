@@ -1,5 +1,7 @@
 import { runIngestion, processGroupMessage, type IngestionConfig, type SyncGroupMessage } from './ingestion/index.js';
 import { runMirrorJob, getPendingCards, uploadCardImage } from './image-mirror.js';
+import { processPendingWebhooks } from './scrydexProcessor.js';
+import { syncScrydexSetMappings } from './scrydexSetMapping.js';
 import { logger } from './ingestion/logger.js';
 
 export interface Env {
@@ -11,6 +13,9 @@ export interface Env {
   DRY_RUN?: string;
   BACKFILL_LIMIT?: string;
   FORCE_SYNC?: string;
+  // Scrydex price + set mapping
+  SCRYDEX_API_KEY?: string;
+  SCRYDEX_TEAM_ID?: string;
 }
 
 function buildConfig(env: Env): IngestionConfig {
@@ -112,28 +117,48 @@ export default {
 
   /**
    * Cron handler:
-   *  "0 6 * * *" — daily TCGPlayer data sync
-   *  "0 3 * * 0" — weekly Sunday image mirror job
+   *  "0 6 * * *"    — daily TCGPlayer data sync
+   *  "0 3 * * SUN"  — weekly image mirror + Scrydex set mapping
+   *  "*/10 * * * *" — every 10 min: process pending Scrydex webhook log rows
    */
   async scheduled(
     event: ScheduledEvent,
     env: Env,
     ctx: ExecutionContext
   ): Promise<void> {
-    if (event.cron === '0 3 * * SUN') {
-      // Infinity = loop until no cards remain or the 25s wall-clock guard trips.
-      // ctx.waitUntil keeps the Worker alive until the promise settles.
-      ctx.waitUntil(
-        runMirrorJob({ DB: env.DB, IMAGES_BUCKET: env.IMAGES_BUCKET }, Infinity).catch((err) =>
-          logger.error('Scheduled mirror failed', { error: String(err) })
-        )
-      );
-    } else {
-      ctx.waitUntil(
-        runIngestion(buildConfig(env)).catch((err) =>
-          logger.error('Scheduled sync failed', { error: String(err) })
-        )
-      );
+    switch (event.cron) {
+
+      case '0 3 * * SUN':
+        // Weekly: image mirror (loop until empty) + Scrydex set mapping in parallel
+        ctx.waitUntil(
+          Promise.all([
+            runMirrorJob({ DB: env.DB, IMAGES_BUCKET: env.IMAGES_BUCKET }, Infinity)
+              .catch((err) => logger.error('Scheduled mirror failed', { error: String(err) })),
+            syncScrydexSetMappings(env)
+              .catch((err) => logger.error('Scrydex set mapping failed', { error: String(err) })),
+          ])
+        );
+        break;
+
+      case '*/10 * * * *':
+        // Every 10 min: drain pending Scrydex webhook log rows
+        if (env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID) {
+          ctx.waitUntil(
+            processPendingWebhooks(env).catch((err) =>
+              logger.error('Scrydex webhook processing failed', { error: String(err) })
+            )
+          );
+        }
+        break;
+
+      default:
+        // "0 6 * * *" and any other cron — daily TCG sync
+        ctx.waitUntil(
+          runIngestion(buildConfig(env)).catch((err) =>
+            logger.error('Scheduled sync failed', { error: String(err) })
+          )
+        );
+        break;
     }
   },
 

@@ -28,9 +28,12 @@ max_concurrent_consumers = 1
 binding     = "IMAGES_BUCKET"
 bucket_name = "sleeved-pages-images"
 
-# Runs daily at 6 AM UTC; mirrors Pokémon images every Sunday at 3 AM UTC
+# Cron schedule:
+#   0 6 * * *    — daily TCGPlayer data sync
+#   0 3 * * SUN  — weekly image mirror + Scrydex set mapping
+#   */10 * * * * — every 10 min: process pending Scrydex webhook log rows
 [triggers]
-crons = ["0 6 * * *", "0 3 * * SUN"]
+crons = ["0 6 * * *", "0 3 * * SUN", "*/10 * * * *"]
 
 [vars]
 TCGCSV_BASE_URL = "https://tcgcsv.com"
