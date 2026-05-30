@@ -76,10 +76,10 @@ database_id = "bfb51cf2-5a64-42a3-9575-4a9fc0c38e16"
 
 [[env.preview.queues.producers]]
 binding = "SYNC_QUEUE"
-queue   = "sleevedpages-sync-queue"
+queue   = "sleevedpages-sync-queue-uat"
 
 [[env.preview.queues.consumers]]
-queue                    = "sleevedpages-sync-queue"
+queue                    = "sleevedpages-sync-queue-uat"
 max_batch_size           = 10
 max_batch_timeout        = 30
 max_retries              = 2
