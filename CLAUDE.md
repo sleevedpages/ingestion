@@ -76,13 +76,18 @@ db/migrations/
 | `*/10 * * * *` | Process pending Scrydex webhook log rows → upsert `scrydex_prices` |
 
 ## HTTP Endpoints
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/` | Health check |
-| `POST` | `/sync` | Manual trigger for data sync (non-blocking) |
-| `POST` | `/mirror` | Manual trigger for image mirror job (1 batch, fast) |
-| `GET` | `/mirror/pending?limit=N&skrydex_only=1` | Returns next N cards needing mirroring |
-| `POST` | `/mirror/upload` | Accepts base64 image bytes + writes to R2 |
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/` | None | Health check |
+| `POST` | `/sync` | None | Manual trigger for TCG data sync (non-blocking) |
+| `POST` | `/mirror` | None | Manual trigger for image mirror (1 batch) |
+| `GET` | `/mirror/pending?limit=N&skrydex_only=1` | None | Next N cards needing mirroring |
+| `POST` | `/mirror/upload` | None | Upload image bytes → R2 (used by mirror-local.mjs) |
+| `POST` | `/scrydex/process` | `x-worker-secret` | Process pending webhook log rows |
+| `POST` | `/scrydex/sync-sets` | `x-worker-secret` | Pull Scrydex expansion catalog → update `skrydex_set_id` |
+| `POST` | `/scrydex/sync-images` | `x-worker-secret` | Write Scrydex image URLs to `tcg_products` |
+
+Scrydex endpoints are called from the Admin panel via Content app proxy (`POST /api/admin/scrydex/trigger`). Direct calls require `x-worker-secret: <INGESTION_WORKER_SECRET>` header.
 
 ## Data Sync Pipeline
 `runIngestion()` flow:
