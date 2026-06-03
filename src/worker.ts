@@ -4,6 +4,7 @@ import { processPendingWebhooks } from './scrydexProcessor.js';
 import { syncScrydexSetMappings } from './scrydexSetMapping.js';
 import { syncScrydexImages } from './scrydexImageSync.js';
 import { cleanupScrydexApiLog } from './lib/scrydexClient.js';
+import { backfillR2ImageUrls } from './backfillR2Urls.js';
 import { logger } from './ingestion/logger.js';
 
 export interface Env {
@@ -101,6 +102,20 @@ export default {
         );
         return json({ ok: true, message: 'Scrydex image sync started' });
       }
+    }
+
+    // POST /admin/backfill-r2-urls — one-time backfill of R2 URLs in tcg_products
+    if (pathname === '/admin/backfill-r2-urls' && request.method === 'POST') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      ctx.waitUntil(
+        backfillR2ImageUrls(env).catch((err) =>
+          logger.error('R2 URL backfill failed', { error: String(err) })
+        )
+      );
+      return json({ ok: true, message: 'R2 backfill started — check worker logs for completion summary' });
     }
 
     if (pathname === '/mirror' && request.method === 'POST') {
