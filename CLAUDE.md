@@ -70,11 +70,20 @@ db/migrations/
 ```
 
 ## Cron Schedule
+
+**Production** (`[triggers]` in `wrangler.toml`):
 | Cron | Job |
 |------|-----|
 | `0 6 * * *` | Daily TCG data sync (categories → sets → products → prices) |
-| `0 3 * * SUN` | Weekly: `scrydex_api_log` cleanup (90-day retention). **Re-enable** `syncScrydexSetMappings`, `syncScrydexImages`, and `runMirrorJob` after deploying credit-control fixes (freshness window + `syncScrydexImages` pre-filter) and raising `SCRYDEX_MONTHLY_LIMIT` to ≥15000 |
-| `*/10 * * * *` | Process pending Scrydex webhook log rows → upsert `scrydex_prices` |
+| `0 3 * * SUN` | Weekly: `syncScrydexSetMappings` → `syncScrydexImages` → `runMirrorJob` (Infinity batches) → `scrydex_api_log` cleanup (90-day retention) |
+| `*/10 * * * *` | Process pending Scrydex webhook log rows → upsert `scrydex_prices` (with 20h freshness deduplication) |
+
+**UAT** (`[env.preview.triggers]` in `wrangler.toml`) — **Scrydex crons are permanently absent**:
+| Cron | Job |
+|------|-----|
+| `0 6 * * *` | Daily TCG data sync only |
+
+The `0 3 * * SUN` and `*/10 * * * *` crons are not registered in the UAT environment. UAT card data is sourced from a weekly prod → UAT sync; Scrydex API calls from UAT would consume production credits. The Content App webhook handler (`/api/webhooks/scrydex`) remains active in UAT for endpoint testing. **Do not add Scrydex crons back to `[env.preview.triggers]`.**
 
 ## HTTP Endpoints
 | Method | Path | Auth | Description |
@@ -161,12 +170,15 @@ Credit guard: blocks calls when `scrydex_api_log` shows ≥ `SCRYDEX_MONTHLY_LIM
   - Fallback: `card.number` + `skrydex_set_id` join via `tcgplayer_group_id` (NOT `set_id` — that column doesn't exist)
   - Price condition format: `'NM'`, `'NM (foil)'`, `'NM (altArt)'`
   - Batches writes at 100 statements per `env.DB.batch()` call
+- **Freshness deduplication** (`SCRYDEX_PRICE_FRESHNESS_HOURS`, default 20h): before fetching an expansion, the processor checks `scrydex_prices.last_updated` for that `source_expansion_id`. If any row was written within the freshness window, the webhook is marked complete without an API call. This eliminates the 5–6×/day redundant sweeps Scrydex sends for large historical catalogs (MTG). Requires index `idx_scrydex_prices_expansion` (migration 0042).
+- **Game filter** (`SCRYDEX_PRICE_GAMES`, optional): comma-separated slug allowlist. Webhooks for unlisted games are immediately completed with `prices_upserted=0`. Leave unset in production to process all games.
 
 ### Image Sync
 - `syncScrydexImages()` runs weekly before the R2 mirror job
 - One Piece + Gundam: each variant has a unique TCGPlayer product_id → use `variant.images[front].large`
 - All other games: variants share a product_id → use `card.images[front].large`, match via `tcgplayer_group_id`
 - Only updates rows where `image_url` is NULL or not already on R2
+- **Set pre-filter**: only fetches API data for sets that still have at least one product without an R2 image URL. Once a set is fully mirrored, it is skipped entirely — saving 1 credit per already-synced set per weekly run (352 mapped sets in production → near-zero cost after initial R2 backfill).
 
 ### HTTP Endpoints (admin-triggered, require `x-worker-secret` header)
 | Method | Path | Description |
@@ -185,7 +197,7 @@ Credit guard: blocks calls when `scrydex_api_log` shows ≥ `SCRYDEX_MONTHLY_LIM
 | `FORCE_SYNC` | `false` | Re-sync all sets regardless of `synced_at` |
 | `SCRYDEX_API_KEY` | — | Scrydex API key — required for price processing, set mapping, image sync |
 | `SCRYDEX_TEAM_ID` | — | Scrydex team ID — required alongside API key |
-| `SCRYDEX_MONTHLY_LIMIT` | `5000` | Monthly Scrydex credit cap. Guard blocks calls when usage ≥ `SCRYDEX_MONTHLY_LIMIT - 500` |
+| `SCRYDEX_MONTHLY_LIMIT` | `50000` | Monthly Scrydex credit cap (upgraded tier). Guard blocks calls when usage ≥ `SCRYDEX_MONTHLY_LIMIT - 500`. Set the same value in the Content app env vars. |
 | `INGESTION_WORKER_SECRET` | — | Shared secret for admin-triggered HTTP endpoints (`/scrydex/*`) |
 | `SCRYDEX_PRICE_FRESHNESS_HOURS` | `20` | Freshness window for webhook processor. If scrydex_prices already has rows for an expansion updated within this many hours, skip the API call and mark the webhook complete. Eliminates the 5–6×/day redundant MTG refetches. |
 | `SCRYDEX_PRICE_GAMES` | (all) | Optional comma-separated slug allowlist, e.g. `pokemon,onepiece,gundam`. Webhooks for unlisted games are immediately completed without an API call. Set this to exclude MTG if MTG prices are not displayed in the app. |

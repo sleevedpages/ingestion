@@ -188,19 +188,17 @@ export default {
     switch (event.cron) {
 
       case '0 3 * * SUN':
-        // Weekly pipeline
+        // Weekly pipeline (production only — UAT has this cron permanently disabled in wrangler.toml)
         ctx.waitUntil(
           (async () => {
-            // TEMPORARILY DISABLED — Scrydex credit investigation, re-enable after audit
-            // if (env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID) {
-            //   await syncScrydexSetMappings(env)
-            //     .catch((err) => logger.error('Scrydex set mapping failed', { error: String(err) }))
-            //   await syncScrydexImages(env)
-            //     .catch((err) => logger.error('Scrydex image sync failed', { error: String(err) }))
-            // }
-            // TEMPORARILY DISABLED — Scrydex credit investigation, re-enable after audit
-            // await runMirrorJob({ DB: env.DB, IMAGES_BUCKET: env.IMAGES_BUCKET }, Infinity)
-            //   .catch((err) => logger.error('Scheduled mirror failed', { error: String(err) }))
+            if (env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID) {
+              await syncScrydexSetMappings(env)
+                .catch((err) => logger.error('Scrydex set mapping failed', { error: String(err) }))
+              await syncScrydexImages(env)
+                .catch((err) => logger.error('Scrydex image sync failed', { error: String(err) }))
+            }
+            await runMirrorJob({ DB: env.DB, IMAGES_BUCKET: env.IMAGES_BUCKET }, Infinity)
+              .catch((err) => logger.error('Scheduled mirror failed', { error: String(err) }))
 
             await cleanupScrydexApiLog(env.DB)
               .catch((err) => logger.error('scrydex_api_log cleanup failed', { error: String(err) }))

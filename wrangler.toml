@@ -92,6 +92,15 @@ max_concurrent_consumers = 1
 binding     = "IMAGES_BUCKET"
 bucket_name = "sleeved-pages-images"
 
+# DISABLED: Scrydex crons (0 3 * * SUN, */10 * * * *) are intentionally absent from
+# the UAT trigger list.  UAT card data is sourced from a weekly prod → UAT sync; running
+# Scrydex API calls from UAT would burn production credits against the UAT database.
+# The Content App webhook handler (/api/webhooks/scrydex) is left untouched so webhook
+# delivery can be tested locally — rows just won't be processed into scrydex_prices.
+# Do not add the Scrydex crons back here.
+[env.preview.triggers]
+crons = ["0 6 * * *"]
+
 [env.preview.vars]
 TCGCSV_BASE_URL = "https://tcgcsv.com"
 LOG_LEVEL = "debug"
