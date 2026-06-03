@@ -4,6 +4,22 @@
  * Runs every 10 minutes via cron — picks up pending scrydex_webhook_log rows
  * and fetches updated prices from the Scrydex API.
  *
+ * Credit-control measures (added after June 2026 credit archaeology):
+ *
+ *   1. FRESHNESS WINDOW (SCRYDEX_PRICE_FRESHNESS_HOURS, default 20h)
+ *      Before fetching prices for an expansion, checks whether scrydex_prices
+ *      already has rows for that expansion+priceType updated within the window.
+ *      If fresh, the webhook is marked complete without an API call.
+ *      This eliminates the 5-6x/day redundant MTG fetches that were burning
+ *      ~390 credits/day for 68 sets.
+ *
+ *   2. GAME FILTER (SCRYDEX_PRICE_GAMES env var, optional)
+ *      Comma-separated list of game slugs to actually process, e.g.
+ *        SCRYDEX_PRICE_GAMES=pokemon,onepiece,gundam,lorcana,riftbound
+ *      Webhooks for other games (e.g. magicthegathering) are immediately
+ *      completed with prices_upserted=0 and a 'game-filtered' note.
+ *      Unset → all games are processed.
+ *
  * Price matching strategy (in priority order):
  *   1. variant.marketplaces[tcgplayer].product_id → tcg_products.tcgplayer_product_id
  *   2. Fallback: card.number + expansion skrydex_set_id join
@@ -31,20 +47,60 @@ const SLUG_TO_GAME: Record<string, string> = {
   riftbound:         'Riftbound',
 }
 
-const BATCH_SIZE = 100
+const BATCH_SIZE          = 100
+const PENDING_FETCH_LIMIT = 50  // increased from 20; deduplication makes each run cheaper
+
+// ─── Freshness check ─────────────────────────────────────────────────────────
+
+/**
+ * Returns true when scrydex_prices already has at least one row for this
+ * expansion + priceType that was written within maxAgeSeconds.
+ * Relies on idx_scrydex_prices_expansion (migration 0042) for fast lookup.
+ */
+async function isExpansionFresh(
+  db:            D1Database,
+  expansionId:   string,
+  priceType:     string,
+  maxAgeSeconds: number,
+): Promise<boolean> {
+  const row = await db.prepare(`
+    SELECT 1 FROM scrydex_prices
+    WHERE  source_expansion_id = ?
+    AND    price_type          = ?
+    AND    last_updated        > unixepoch() - ?
+    LIMIT 1
+  `).bind(expansionId, priceType, maxAgeSeconds).first<{ 1: number }>()
+  return row !== null
+}
+
+// ─── Main processor ───────────────────────────────────────────────────────────
 
 export async function processPendingWebhooks(env: Env): Promise<void> {
+  // ── Config ──────────────────────────────────────────────────────────────────
+  const freshnessHours = env.SCRYDEX_PRICE_FRESHNESS_HOURS
+    ? parseInt(env.SCRYDEX_PRICE_FRESHNESS_HOURS, 10)
+    : 20                              // default: don't re-fetch within 20 h
+  const freshnessSeconds = freshnessHours * 3600
+
+  // Optional allowlist — only process these game slugs; skip all others.
+  // Unset → process everything.
+  const gameFilter: Set<string> | null = env.SCRYDEX_PRICE_GAMES
+    ? new Set(env.SCRYDEX_PRICE_GAMES.split(',').map(s => s.trim()).filter(Boolean))
+    : null
+
+  // ── Fetch pending rows ───────────────────────────────────────────────────────
   const pending = await env.DB.prepare(`
     SELECT id, event_name, expansion_ids_json
     FROM   scrydex_webhook_log
     WHERE  status = 'pending'
     ORDER BY received_at ASC
-    LIMIT 20
+    LIMIT ${PENDING_FETCH_LIMIT}
   `).all()
 
   if (!pending.results.length) return
 
-  console.log(`[ScrydexProcessor] ${pending.results.length} pending webhook(s)`)
+  console.log(`[ScrydexProcessor] ${pending.results.length} pending webhook(s) ` +
+    `(freshness=${freshnessHours}h, gameFilter=${gameFilter ? [...gameFilter].join(',') : 'all'})`)
 
   for (const row of pending.results) {
     await env.DB.prepare(
@@ -58,10 +114,32 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
       const priceType   = eventName.includes('graded') ? 'graded' : 'raw'
       const gameName    = SLUG_TO_GAME[gameSlug] ?? gameSlug
 
+      // ── Game filter ─────────────────────────────────────────────────────────
+      if (gameFilter && !gameFilter.has(gameSlug)) {
+        await env.DB.prepare(`
+          UPDATE scrydex_webhook_log SET
+            status          = 'complete',
+            prices_upserted = 0,
+            credits_used    = 0,
+            completed_at    = unixepoch()
+          WHERE id = ?
+        `).bind(row.id).run()
+        console.log(`[ScrydexProcessor] ${eventName}: skipped (game-filtered)`)
+        continue
+      }
+
       let pricesUpserted = 0
       let creditsUsed    = 0
+      let skippedFresh   = 0
 
       for (const expansionId of expansionIds) {
+        // ── Freshness check ────────────────────────────────────────────────────
+        const fresh = await isExpansionFresh(env.DB, expansionId, priceType, freshnessSeconds)
+        if (fresh) {
+          skippedFresh++
+          continue
+        }
+
         try {
           const cards = await fetchExpansionCards(env, gameSlug, expansionId, true)
           creditsUsed++
@@ -101,7 +179,8 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
 
       console.log(
         `[ScrydexProcessor] ${eventName}:`,
-        `${expansionIds.length} expansions, ${pricesUpserted} prices, ${creditsUsed} credits`
+        `${expansionIds.length} expansions (${skippedFresh} fresh-skipped),`,
+        `${pricesUpserted} prices, ${creditsUsed} credits`
       )
     } catch (err) {
       console.error(`[ScrydexProcessor] Fatal on row ${row.id}:`, err)
@@ -119,14 +198,14 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
 // ─── Scrydex API ──────────────────────────────────────────────────────────────
 
 async function fetchExpansionCards(
-  env: Env,
-  gameSlug: string,
-  expansionId: string,
+  env:           Env,
+  gameSlug:      string,
+  expansionId:   string,
   includePrices: boolean,
 ): Promise<unknown[]> {
   const params: Record<string, string> = {
     expansion: expansionId,
-    limit: '500',
+    limit:     '500',
   }
   if (includePrices) params.include = 'prices'
 
@@ -152,7 +231,7 @@ async function buildPriceUpserts(
 
   for (const variant of variants) {
     // Primary match: TCGPlayer product_id from marketplace data
-    const tcgMarket   = (variant.marketplaces ?? []).find((m: any) => m.name === 'tcgplayer')
+    const tcgMarket    = (variant.marketplaces ?? []).find((m: any) => m.name === 'tcgplayer')
     const tcgProductId = tcgMarket?.product_id ? parseInt(tcgMarket.product_id, 10) : null
 
     let product: { id: number } | null = null

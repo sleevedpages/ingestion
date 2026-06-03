@@ -45,12 +45,24 @@ export async function syncScrydexImages(env: Env): Promise<SyncResult> {
 
   // Select tcgplayer_group_id so we can use it directly in the UPDATE
   // (tcg_products joins to tcg_sets via tcgplayer_group_id, NOT an internal set_id)
+  // Only process sets that still have at least one product needing an image URL.
+  // Once a set is fully R2-mirrored, this EXISTS check returns nothing and the
+  // set is skipped — saving 1 credit per already-synced set per weekly run.
+  // With 352 mapped sets in production, this drops the weekly cost from ~352
+  // credits to near-zero once the initial sync + R2 backfill are complete.
   const { results: sets } = await env.DB.prepare(`
     SELECT s.id, s.name, s.abbreviation, s.skrydex_set_id,
            s.tcgplayer_group_id, c.name AS game
     FROM   tcg_sets s
     JOIN   tcg_categories c ON s.tcgplayer_category_id = c.tcgplayer_category_id
     WHERE  s.skrydex_set_id IS NOT NULL
+    AND EXISTS (
+      SELECT 1 FROM tcg_products p2
+      WHERE  p2.tcgplayer_group_id = s.tcgplayer_group_id
+      AND   (p2.image_url IS NULL
+             OR p2.image_url = ''
+             OR p2.image_url NOT LIKE 'https://images.sleevedpages.com%')
+    )
     ORDER BY s.id ASC
   `).all()
 

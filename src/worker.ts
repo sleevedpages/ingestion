@@ -22,6 +22,9 @@ export interface Env {
   SCRYDEX_MONTHLY_LIMIT?: string;
   // Shared secret for admin-triggered HTTP endpoints
   INGESTION_WORKER_SECRET?: string;
+  // Credit-control env vars (see scrydexProcessor.ts for details)
+  SCRYDEX_PRICE_FRESHNESS_HOURS?: string;  // default 20 — freshness window before re-fetching an expansion
+  SCRYDEX_PRICE_GAMES?: string;            // comma-separated slug allowlist, e.g. 'pokemon,onepiece'
 }
 
 function buildConfig(env: Env): IngestionConfig {

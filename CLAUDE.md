@@ -73,7 +73,7 @@ db/migrations/
 | Cron | Job |
 |------|-----|
 | `0 6 * * *` | Daily TCG data sync (categories → sets → products → prices) |
-| `0 3 * * SUN` | Weekly: `scrydex_api_log` cleanup (90-day retention). **TEMPORARILY**: `syncScrydexSetMappings`, `syncScrydexImages`, and `runMirrorJob` are commented out pending Scrydex credit audit — re-enable after audit |
+| `0 3 * * SUN` | Weekly: `scrydex_api_log` cleanup (90-day retention). **Re-enable** `syncScrydexSetMappings`, `syncScrydexImages`, and `runMirrorJob` after deploying credit-control fixes (freshness window + `syncScrydexImages` pre-filter) and raising `SCRYDEX_MONTHLY_LIMIT` to ≥15000 |
 | `*/10 * * * *` | Process pending Scrydex webhook log rows → upsert `scrydex_prices` |
 
 ## HTTP Endpoints
@@ -187,6 +187,8 @@ Credit guard: blocks calls when `scrydex_api_log` shows ≥ `SCRYDEX_MONTHLY_LIM
 | `SCRYDEX_TEAM_ID` | — | Scrydex team ID — required alongside API key |
 | `SCRYDEX_MONTHLY_LIMIT` | `5000` | Monthly Scrydex credit cap. Guard blocks calls when usage ≥ `SCRYDEX_MONTHLY_LIMIT - 500` |
 | `INGESTION_WORKER_SECRET` | — | Shared secret for admin-triggered HTTP endpoints (`/scrydex/*`) |
+| `SCRYDEX_PRICE_FRESHNESS_HOURS` | `20` | Freshness window for webhook processor. If scrydex_prices already has rows for an expansion updated within this many hours, skip the API call and mark the webhook complete. Eliminates the 5–6×/day redundant MTG refetches. |
+| `SCRYDEX_PRICE_GAMES` | (all) | Optional comma-separated slug allowlist, e.g. `pokemon,onepiece,gundam`. Webhooks for unlisted games are immediately completed without an API call. Set this to exclude MTG if MTG prices are not displayed in the app. |
 
 ## D1 Schema (Ingestion tables)
 
