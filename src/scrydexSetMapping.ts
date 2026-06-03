@@ -17,8 +17,7 @@
  */
 
 import type { Env } from './worker.js'
-
-const SCRYDEX_BASE = 'https://api.scrydex.com'
+import { scrydexFetch, ScrydexCreditLimitError } from './lib/scrydexClient.js'
 
 const GAME_CONFIGS = [
   { slug: 'pokemon',           categoryName: 'Pokemon'            },
@@ -41,15 +40,11 @@ export async function syncScrydexSetMappings(env: Env): Promise<SyncResult> {
 
   for (const game of GAME_CONFIGS) {
     try {
-      const res = await fetch(
-        `${SCRYDEX_BASE}/${game.slug}/v1/expansions?limit=500`,
-        {
-          headers: {
-            'X-Api-Key': env.SCRYDEX_API_KEY!,
-            'X-Team-ID': env.SCRYDEX_TEAM_ID!,
-            'Accept':    'application/json',
-          },
-        }
+      const res = await scrydexFetch(
+        env,
+        `/${game.slug}/v1/expansions`,
+        'syncScrydexSetMappings',
+        { params: { limit: '500' } },
       )
       result.creditsUsed++
 
@@ -128,6 +123,10 @@ export async function syncScrydexSetMappings(env: Env): Promise<SyncResult> {
       // Pace requests across games
       await new Promise(r => setTimeout(r, 200))
     } catch (err) {
+      if (err instanceof ScrydexCreditLimitError) {
+        console.warn('[SetMapping] Credit limit guard triggered — stopping game processing')
+        break
+      }
       console.error(`[SetMapping] Error on ${game.slug}:`, err)
     }
   }

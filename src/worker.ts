@@ -3,6 +3,7 @@ import { runMirrorJob, getPendingCards, uploadCardImage } from './image-mirror.j
 import { processPendingWebhooks } from './scrydexProcessor.js';
 import { syncScrydexSetMappings } from './scrydexSetMapping.js';
 import { syncScrydexImages } from './scrydexImageSync.js';
+import { cleanupScrydexApiLog } from './lib/scrydexClient.js';
 import { logger } from './ingestion/logger.js';
 
 export interface Env {
@@ -17,6 +18,7 @@ export interface Env {
   // Scrydex
   SCRYDEX_API_KEY?: string;
   SCRYDEX_TEAM_ID?: string;
+  SCRYDEX_MONTHLY_LIMIT?: string;
   // Shared secret for admin-triggered HTTP endpoints
   INGESTION_WORKER_SECRET?: string;
 }
@@ -168,20 +170,22 @@ export default {
     switch (event.cron) {
 
       case '0 3 * * SUN':
-        // Weekly pipeline — order matters:
-        //   1. syncScrydexSetMappings: populates skrydex_set_id on tcg_sets
-        //   2. syncScrydexImages: uses skrydex_set_id to write image URLs to tcg_products
-        //   3. runMirrorJob: reads updated image_url to fetch + store in R2
+        // Weekly pipeline
         ctx.waitUntil(
           (async () => {
-            if (env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID) {
-              await syncScrydexSetMappings(env)
-                .catch((err) => logger.error('Scrydex set mapping failed', { error: String(err) }))
-              await syncScrydexImages(env)
-                .catch((err) => logger.error('Scrydex image sync failed', { error: String(err) }))
-            }
-            await runMirrorJob({ DB: env.DB, IMAGES_BUCKET: env.IMAGES_BUCKET }, Infinity)
-              .catch((err) => logger.error('Scheduled mirror failed', { error: String(err) }))
+            // TEMPORARILY DISABLED — Scrydex credit investigation, re-enable after audit
+            // if (env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID) {
+            //   await syncScrydexSetMappings(env)
+            //     .catch((err) => logger.error('Scrydex set mapping failed', { error: String(err) }))
+            //   await syncScrydexImages(env)
+            //     .catch((err) => logger.error('Scrydex image sync failed', { error: String(err) }))
+            // }
+            // TEMPORARILY DISABLED — Scrydex credit investigation, re-enable after audit
+            // await runMirrorJob({ DB: env.DB, IMAGES_BUCKET: env.IMAGES_BUCKET }, Infinity)
+            //   .catch((err) => logger.error('Scheduled mirror failed', { error: String(err) }))
+
+            await cleanupScrydexApiLog(env.DB)
+              .catch((err) => logger.error('scrydex_api_log cleanup failed', { error: String(err) }))
           })()
         );
         break;

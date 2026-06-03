@@ -20,8 +20,7 @@
  */
 
 import type { Env } from './worker.js'
-
-const SCRYDEX_BASE = 'https://api.scrydex.com'
+import { scrydexFetch, ScrydexCreditLimitError } from './lib/scrydexClient.js'
 
 const SLUG_TO_GAME: Record<string, string> = {
   pokemon:           'Pokemon',
@@ -83,6 +82,10 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
 
           await new Promise(r => setTimeout(r, 100))
         } catch (err) {
+          if (err instanceof ScrydexCreditLimitError) {
+            console.warn('[ScrydexProcessor] Credit limit guard triggered — stopping expansion processing')
+            break
+          }
           console.error(`[ScrydexProcessor] Expansion ${expansionId}:`, err)
         }
       }
@@ -121,18 +124,13 @@ async function fetchExpansionCards(
   expansionId: string,
   includePrices: boolean,
 ): Promise<unknown[]> {
-  const url = new URL(`${SCRYDEX_BASE}/${gameSlug}/v1/cards`)
-  url.searchParams.set('expansion', expansionId)
-  url.searchParams.set('limit', '500')
-  if (includePrices) url.searchParams.set('include', 'prices')
+  const params: Record<string, string> = {
+    expansion: expansionId,
+    limit: '500',
+  }
+  if (includePrices) params.include = 'prices'
 
-  const res = await fetch(url.toString(), {
-    headers: {
-      'X-Api-Key': env.SCRYDEX_API_KEY!,
-      'X-Team-ID': env.SCRYDEX_TEAM_ID!,
-      'Accept':    'application/json',
-    },
-  })
+  const res = await scrydexFetch(env, `/${gameSlug}/v1/cards`, 'processPendingWebhooks', { params })
   if (res.status === 429) throw new Error('Scrydex rate limit')
   if (!res.ok) throw new Error(`Scrydex ${res.status} for ${gameSlug}/${expansionId}`)
   const data = await res.json() as { data?: unknown[] }

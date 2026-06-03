@@ -51,6 +51,7 @@ src/
     logger.ts         # Structured JSON logger (LOG_LEVEL env var)
     price-config.ts   # Which games/sets to sync prices for
   lib/
+    scrydexClient.ts  # Scrydex API fetch wrapper — credit guard + scrydex_api_log logging
     skrydexUrl.ts     # URL builders for Skrydex/Scrydex image CDN
     skrydexSets.ts    # tcg_sets.name → skrydex_set_id lookup map
   types/
@@ -72,7 +73,7 @@ db/migrations/
 | Cron | Job |
 |------|-----|
 | `0 6 * * *` | Daily TCG data sync (categories → sets → products → prices) |
-| `0 3 * * SUN` | Weekly image mirror + Scrydex set mapping (Sunday 3 AM UTC) |
+| `0 3 * * SUN` | Weekly: `scrydex_api_log` cleanup (90-day retention). **TEMPORARILY**: `syncScrydexSetMappings`, `syncScrydexImages`, and `runMirrorJob` are commented out pending Scrydex credit audit — re-enable after audit |
 | `*/10 * * * *` | Process pending Scrydex webhook log rows → upsert `scrydex_prices` |
 
 ## HTTP Endpoints
@@ -133,6 +134,16 @@ Handles both Pokémon (Skrydex + TCGPlayer fallback) and One Piece (Skrydex + TC
 
 ## Skrydex Integration
 
+### scrydexClient.ts — API Wrapper (required for all outbound calls)
+`src/lib/scrydexClient.ts` is the single entry point for every outbound Scrydex API call in the Ingestion worker. **No file may call the Scrydex API directly** — all calls go through `scrydexFetch()`.
+
+Key exports:
+- `scrydexFetch(env, endpoint, jobName, options?)` — authenticated fetch with credit guard + logging. Returns `Response`. Throws `ScrydexCreditLimitError` when guard trips.
+- `ScrydexCreditLimitError` — named error class; catch with `instanceof` in expansion/set loops and break out gracefully.
+- `cleanupScrydexApiLog(db)` — deletes rows older than 90 days; called from weekly cron.
+
+Credit guard: blocks calls when `scrydex_api_log` shows ≥ `SCRYDEX_MONTHLY_LIMIT - 500` credits used this month. Guard inserts a `status='blocked'` row and throws — never crashes the worker.
+
 ### Set Mapping
 - `tcg_sets.skrydex_set_id` maps a TCGPlayer set to its Scrydex expansion identifier
 - **Auto-populated weekly** by `syncScrydexSetMappings()` in `src/scrydexSetMapping.ts`
@@ -174,6 +185,7 @@ Handles both Pokémon (Skrydex + TCGPlayer fallback) and One Piece (Skrydex + TC
 | `FORCE_SYNC` | `false` | Re-sync all sets regardless of `synced_at` |
 | `SCRYDEX_API_KEY` | — | Scrydex API key — required for price processing, set mapping, image sync |
 | `SCRYDEX_TEAM_ID` | — | Scrydex team ID — required alongside API key |
+| `SCRYDEX_MONTHLY_LIMIT` | `5000` | Monthly Scrydex credit cap. Guard blocks calls when usage ≥ `SCRYDEX_MONTHLY_LIMIT - 500` |
 | `INGESTION_WORKER_SECRET` | — | Shared secret for admin-triggered HTTP endpoints (`/scrydex/*`) |
 
 ## D1 Schema (Ingestion tables)
@@ -186,6 +198,7 @@ Handles both Pokémon (Skrydex + TCGPlayer fallback) and One Piece (Skrydex + TC
 | `tcg_prices` | Market prices. `sub_type_name`: `Normal`, `Holofoil`, `Reverse Holofoil`, etc. |
 | `tcg_sync_log` | One row per sync run with counts + status |
 | `image_mirror_log` | One row per mirror job with processed/mirrored/failed/source counts |
+| `scrydex_api_log` | One row per outbound Scrydex API call — endpoint, job_name, status, credits_used. Used for monthly credit guard and admin dashboard. 90-day retention via weekly cron. Added by Content migration `0040_scrydex_api_log.sql` |
 
 ## Re-mirror Logic
 Cards are re-queued for mirroring when:

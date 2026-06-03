@@ -20,8 +20,7 @@
  */
 
 import type { Env } from './worker.js'
-
-const SCRYDEX_BASE = 'https://api.scrydex.com'
+import { scrydexFetch, ScrydexCreditLimitError } from './lib/scrydexClient.js'
 
 // Games where each variant has a unique product_id + its own image
 const VARIANT_IMAGE_GAMES = new Set(['onepiece', 'gundam'])
@@ -61,15 +60,11 @@ export async function syncScrydexImages(env: Env): Promise<SyncResult> {
     if (!gameSlug) continue
 
     try {
-      const res = await fetch(
-        `${SCRYDEX_BASE}/${gameSlug}/v1/cards?expansion=${set.skrydex_set_id}&limit=500`,
-        {
-          headers: {
-            'X-Api-Key': env.SCRYDEX_API_KEY!,
-            'X-Team-ID': env.SCRYDEX_TEAM_ID!,
-            'Accept':    'application/json',
-          },
-        }
+      const res = await scrydexFetch(
+        env,
+        `/${gameSlug}/v1/cards`,
+        'syncScrydexImages',
+        { params: { expansion: set.skrydex_set_id, limit: '500' } },
       )
       result.creditsUsed++
 
@@ -141,6 +136,10 @@ export async function syncScrydexImages(env: Env): Promise<SyncResult> {
       console.log(`[ImageSync] ${set.name}: ${updates.length} image URLs updated`)
       await new Promise(r => setTimeout(r, 100))
     } catch (err) {
+      if (err instanceof ScrydexCreditLimitError) {
+        console.warn('[ImageSync] Credit limit guard triggered — stopping set processing')
+        break
+      }
       console.error(`[ImageSync] Error on ${set.name}:`, err)
     }
   }
