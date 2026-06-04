@@ -4,7 +4,7 @@ import { processPendingWebhooks } from './scrydexProcessor.js';
 import { syncScrydexSetMappings } from './scrydexSetMapping.js';
 import { syncScrydexImages } from './scrydexImageSync.js';
 import { cleanupScrydexApiLog } from './lib/scrydexClient.js';
-import { backfillR2ImageUrls } from './backfillR2Urls.js';
+import { backfillR2ImageUrls, backfillVariantImages } from './backfillR2Urls.js';
 import { logger } from './ingestion/logger.js';
 
 export interface Env {
@@ -98,13 +98,38 @@ export default {
       }
 
       if (pathname === '/scrydex/sync-images') {
+        const body = request.headers.get('content-type')?.includes('application/json')
+          ? await request.json().catch(() => ({})) as { game?: string }
+          : {} as { game?: string };
+        const game = body.game || undefined;
         ctx.waitUntil(
-          syncScrydexImages(env).catch((err) =>
+          syncScrydexImages(env, game).catch((err) =>
             logger.error('Manual Scrydex image sync failed', { error: String(err) })
           )
         );
-        return json({ ok: true, message: 'Scrydex image sync started' });
+        return json({ ok: true, message: game ? `Scrydex image sync started for ${game}` : 'Scrydex image sync started' });
       }
+    }
+
+    // POST /admin/sync-variant-images — re-mirror variant-specific images per game
+    if (pathname === '/admin/sync-variant-images' && request.method === 'POST') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      if (!env.SCRYDEX_API_KEY || !env.SCRYDEX_TEAM_ID) {
+        return json({ ok: false, error: 'SCRYDEX_API_KEY / SCRYDEX_TEAM_ID not configured' }, 503);
+      }
+      const body = request.headers.get('content-type')?.includes('application/json')
+        ? await request.json().catch(() => ({})) as { game?: string }
+        : {} as { game?: string };
+      const game = body.game || undefined;
+      ctx.waitUntil(
+        backfillVariantImages(env, game).catch((err) =>
+          logger.error('Variant image backfill failed', { error: String(err) })
+        )
+      );
+      return json({ ok: true, message: game ? `Variant image re-sync started for ${game}` : 'Variant image re-sync started for all variant-image games' });
     }
 
     // POST /admin/backfill-r2-urls — one-time backfill of R2 URLs in tcg_products

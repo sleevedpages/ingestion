@@ -96,12 +96,36 @@ function extFromContentType(ct: string): string {
   return 'jpg';
 }
 
-/** Processes a single card: fetches image and stores in R2. Returns source used. */
+/** Processes a single card: fetches image and stores in R2. Returns source used.
+ *  When sourceImageUrl is provided it is used directly as the mirror source (variant backfill path),
+ *  skipping both the Pokémon Skrydex CDN attempt and the tcg_products.image_url lookup. */
 async function mirrorCard(
   card: CardRow,
   bucket: R2Bucket,
-  db: D1Database
+  db: D1Database,
+  sourceImageUrl?: string
 ): Promise<'skrydex' | 'tcgplayer' | 'failed'> {
+  // Fast path: caller supplies a specific source URL (e.g. per-variant Scrydex CDN URL)
+  if (sourceImageUrl) {
+    const fetched = await fetchImage(sourceImageUrl);
+    if (!fetched) return 'failed';
+    const ext = extFromContentType(fetched.contentType);
+    const key = `cards/${card.tcgplayer_product_id}.${ext}`;
+    try {
+      await bucket.put(key, fetched.buffer, {
+        httpMetadata: { contentType: fetched.contentType, cacheControl: 'public, max-age=31536000' },
+      });
+      const r2Url = `${R2_PUBLIC_BASE}/${key}`;
+      await db.prepare(
+        `UPDATE tcg_products SET image_url = ?, image_source = 'skrydex' WHERE tcgplayer_product_id = ?`
+      ).bind(r2Url, card.tcgplayer_product_id).run();
+      return 'skrydex';
+    } catch (e) {
+      logger.warn('R2 put failed (variant source URL)', { key, error: String(e) });
+      return 'failed';
+    }
+  }
+
   const isPoke = isPokemon(card.category_name);
 
   let imageUrl: string | null = null;

@@ -28,6 +28,9 @@ const GAME_CONFIGS = [
   { slug: 'riftbound',         categoryName: 'Riftbound'          },
 ] as const
 
+// Games where each TCGPlayer product is a distinct variant — audit these after mapping
+const VARIANT_IMAGE_CATEGORY_NAMES = new Set(['One Piece Card Game', 'Gundam Card Game'])
+
 interface SyncResult {
   mapped:      number   // sets newly mapped (were NULL)
   updated:     number   // sets with changed mapping
@@ -118,6 +121,35 @@ export async function syncScrydexSetMappings(env: Env): Promise<SyncResult> {
           await env.DB.batch(updates.slice(i, i + 100))
         }
         console.log(`[SetMapping] ${game.slug}: ${updates.length} sets mapped/updated`)
+      }
+
+      // For variant-image games, audit how many card_numbers have multiple products
+      // so data gaps are visible in the logs without extra API calls.
+      if (VARIANT_IMAGE_CATEGORY_NAMES.has(game.categoryName)) {
+        try {
+          const { results: variantRows } = await env.DB.prepare(`
+            SELECT p.card_number, COUNT(*) AS variant_count
+            FROM   tcg_products p
+            JOIN   tcg_sets        s ON s.tcgplayer_group_id    = p.tcgplayer_group_id
+            JOIN   tcg_categories  c ON c.tcgplayer_category_id = s.tcgplayer_category_id
+            WHERE  c.name = ?
+            AND    p.card_number IS NOT NULL
+            GROUP  BY s.tcgplayer_group_id, p.card_number
+            HAVING COUNT(*) > 1
+          `).bind(game.categoryName).all()
+
+          const variantGroups        = variantRows?.length ?? 0
+          const totalVariantProducts = (variantRows ?? []).reduce((sum: number, r: any) => sum + (r.variant_count as number), 0)
+
+          console.log(
+            `[SetMapping] ${game.categoryName} variant audit:`,
+            `${variantGroups} card_numbers with multiple products`,
+            `(${totalVariantProducts} total variant product rows)`,
+            variantGroups > 0 ? '— run backfillVariantImages to correct image URLs' : '— no variant correction needed'
+          )
+        } catch (auditErr) {
+          console.warn(`[SetMapping] ${game.categoryName} variant audit failed:`, auditErr)
+        }
       }
 
       // Pace requests across games
