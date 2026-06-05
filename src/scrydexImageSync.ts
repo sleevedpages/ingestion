@@ -67,12 +67,15 @@ export async function syncScrydexImages(env: Env, game?: string): Promise<SyncRe
         JOIN   tcg_categories c ON s.tcgplayer_category_id = c.tcgplayer_category_id
         WHERE  s.skrydex_set_id IS NOT NULL
         AND    c.name = ?
-        AND EXISTS (
-          SELECT 1 FROM tcg_products p2
-          WHERE  p2.tcgplayer_group_id = s.tcgplayer_group_id
-          AND   (p2.image_url IS NULL
-                 OR p2.image_url = ''
-                 OR p2.image_url NOT LIKE 'https://images.sleevedpages.com%')
+        AND (
+          c.name IN ('One Piece Card Game', 'Gundam Card Game')
+          OR EXISTS (
+            SELECT 1 FROM tcg_products p2
+            WHERE  p2.tcgplayer_group_id = s.tcgplayer_group_id
+            AND   (p2.image_url IS NULL
+                   OR p2.image_url = ''
+                   OR p2.image_url NOT LIKE 'https://images.sleevedpages.com%')
+          )
         )
         ORDER BY s.id ASC
       `).bind(game)
@@ -82,12 +85,15 @@ export async function syncScrydexImages(env: Env, game?: string): Promise<SyncRe
         FROM   tcg_sets s
         JOIN   tcg_categories c ON s.tcgplayer_category_id = c.tcgplayer_category_id
         WHERE  s.skrydex_set_id IS NOT NULL
-        AND EXISTS (
-          SELECT 1 FROM tcg_products p2
-          WHERE  p2.tcgplayer_group_id = s.tcgplayer_group_id
-          AND   (p2.image_url IS NULL
-                 OR p2.image_url = ''
-                 OR p2.image_url NOT LIKE 'https://images.sleevedpages.com%')
+        AND (
+          c.name IN ('One Piece Card Game', 'Gundam Card Game')
+          OR EXISTS (
+            SELECT 1 FROM tcg_products p2
+            WHERE  p2.tcgplayer_group_id = s.tcgplayer_group_id
+            AND   (p2.image_url IS NULL
+                   OR p2.image_url = ''
+                   OR p2.image_url NOT LIKE 'https://images.sleevedpages.com%')
+          )
         )
         ORDER BY s.id ASC
       `)
@@ -133,15 +139,14 @@ export async function syncScrydexImages(env: Env, game?: string): Promise<SyncRe
             const tcgProductId = tcgMarket?.product_id ? parseInt(tcgMarket.product_id, 10) : null
 
             if (tcgProductId) {
-              // Primary path: explicit product_id match — correct image for this exact variant
+              // Primary path: explicit product_id match — always overwrite so the correct
+              // per-variant image replaces any previously mirrored base-art placeholder
               setMatched++
               updates.push(
                 env.DB.prepare(`
                   UPDATE tcg_products
-                  SET    image_url = ?
+                  SET    image_url = ?, image_source = 'scrydex'
                   WHERE  tcgplayer_product_id = ?
-                  AND   (image_url IS NULL
-                         OR image_url NOT LIKE 'https://images.sleevedpages.com%')
                 `).bind(imageUrl, tcgProductId)
               )
             } else if (card.number) {
@@ -151,7 +156,7 @@ export async function syncScrydexImages(env: Env, game?: string): Promise<SyncRe
               updates.push(
                 env.DB.prepare(`
                   UPDATE tcg_products
-                  SET    image_url = ?
+                  SET    image_url = ?, image_source = 'scrydex'
                   WHERE  tcgplayer_group_id = ?
                   AND    LOWER(card_number) = LOWER(?)
                   AND   (image_url IS NULL
