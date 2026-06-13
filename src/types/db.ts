@@ -19,7 +19,7 @@ export interface TcgSetRow {
   published_on: Date | null;
   modified_on: string | null;
   is_supplemental: boolean;
-  skrydex_set_id: string | null;
+  scrydex_set_id: string | null;
   synced_at: Date;
 }
 
@@ -56,7 +56,7 @@ export interface ImageMirrorLogRow {
   processed: number;
   mirrored: number;
   failed: number;
-  skrydex_hits: number;
+  scrydex_hits: number;
   tcgplayer_hits: number;
   duration_ms: number | null;
   created_at: string;

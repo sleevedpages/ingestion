@@ -1,8 +1,8 @@
 /**
- * Mapping from TCGPlayer set names to Skrydex set IDs.
- * Skrydex CDN: https://images.scrydex.com/pokemon/{setId}-{formattedNumber}/large
+ * Mapping from TCGPlayer set names to Scrydex set IDs.
+ * Scrydex CDN: https://images.scrydex.com/pokemon/{setId}-{formattedNumber}/large
  *
- * Derived from Skrydex's public set listing. Keys are the canonical set names
+ * Derived from Scrydex's public set listing. Keys are the canonical set names
  * as stored in tcg_sets.name (TCGPlayer naming convention).
  */
 
@@ -188,16 +188,16 @@ export const POKEMON_SET_MAP: Record<string, string> = {
   'Sword & Shield - Trainer Gallery':  'tg',
 }
 
-/** Reverse map: Skrydex ID → TCGPlayer set name */
-export const SKRYDEX_TO_SET_NAME: Record<string, string> = Object.fromEntries(
+/** Reverse map: Scrydex ID → TCGPlayer set name */
+export const SCRYDEX_TO_SET_NAME: Record<string, string> = Object.fromEntries(
   Object.entries(POKEMON_SET_MAP).map(([name, id]) => [id, name])
 )
 
 /**
- * Returns the Skrydex set ID for a given TCGPlayer set name, or null if unknown.
+ * Returns the Scrydex set ID for a given TCGPlayer set name, or null if unknown.
  * Matching is case-insensitive and accent-normalized (é → e).
  */
-export function getSkrydexSetId(setName: string): string | null {
+export function getScrydexSetId(setName: string): string | null {
   const normalise = (s: string) =>
     s
       .toLowerCase()

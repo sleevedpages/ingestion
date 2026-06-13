@@ -46,7 +46,7 @@ async function main() {
   let batchNum       = 0
   let totalProcessed = 0
   let totalMirrored  = 0
-  let totalSkrydex   = 0
+  let totalScrydex   = 0
   let totalTcgplayer = 0
   let totalFailed    = 0
   const jobStart     = Date.now()
@@ -81,20 +81,20 @@ async function main() {
 
     totalProcessed += res.processed    ?? 0
     totalMirrored  += res.mirrored     ?? 0
-    totalSkrydex   += res.skrydex_hits ?? 0
+    totalScrydex   += res.scrydex_hits ?? 0
     totalTcgplayer += res.tcgplayer_hits ?? 0
     totalFailed    += res.failed       ?? 0
 
     const batchElapsed = Date.now() - batchStart
-    const skrydexPct   = res.mirrored > 0
-      ? Math.round((res.skrydex_hits / res.mirrored) * 100)
+    const scrydexPct   = res.mirrored > 0
+      ? Math.round((res.scrydex_hits / res.mirrored) * 100)
       : 0
 
     process.stdout.write(
       `  Batch ${pad(batchNum, 4)}  ` +
       `${pad(fmt(totalMirrored), 7)} mirrored  ` +
       `${bar(res.mirrored, res.processed, 20)}  ` +
-      `skrydex ${pad(skrydexPct, 3)}%  ` +
+      `scrydex ${pad(scrydexPct, 3)}%  ` +
       `${res.failed > 0 ? `⚠ ${res.failed} failed  ` : ''}` +
       `${elapsed(batchElapsed)}\n`
     )
@@ -116,7 +116,7 @@ async function main() {
   console.log(`\n  Batches processed : ${fmt(batchNum)}`)
   console.log(`  Cards processed   : ${fmt(totalProcessed)}`)
   console.log(`  Successfully mirrored`)
-  console.log(`    Skrydex         : ${fmt(totalSkrydex)}`)
+  console.log(`    Scrydex         : ${fmt(totalScrydex)}`)
   console.log(`    TCGPlayer       : ${fmt(totalTcgplayer)}`)
   console.log(`    Total           : ${fmt(totalMirrored)}`)
   if (totalFailed > 0)

@@ -31,9 +31,19 @@ bucket_name = "sleeved-pages-images"
 # Cron schedule:
 #   0 6 * * *    — daily TCGPlayer data sync
 #   0 3 * * SUN  — weekly image mirror + Scrydex set mapping
-#   */10 * * * * — every 10 min: process pending Scrydex webhook log rows
+#   0 4 * * *    — DAILY Scrydex webhook drain (was */10; see below)
+#
+# COST CONTROL (2026-06): the price-webhook drain moved from every-10-min to ONCE DAILY.
+# A day's redundant change-notifications for a volatile expansion are collapsed into ONE
+# fetch per expansion (deduped in scrydexProcessor). This directly attacks the measured
+# cost concentration (Pokémon = 3,426 /cards calls, ~80% of usage) without throttling any
+# game. 04:00 UTC is off-peak and clear of the 06:00 TCG sync.
+#
+# ⚠️ FRESHNESS COUPLING: SCRYDEX_PRICE_FRESHNESS_HOURS (default 20h) MUST stay < 24h or
+# each daily run no-ops against its own prior run and prices silently freeze. Do NOT raise
+# it to ≥24h while this is a daily cron. (scrydexProcessor.freshnessSafeForDrain guards/warns.)
 [triggers]
-crons = ["0 6 * * *", "0 3 * * SUN", "*/10 * * * *"]
+crons = ["0 6 * * *", "0 3 * * SUN", "0 4 * * *"]
 
 [vars]
 TCGCSV_BASE_URL = "https://tcgcsv.com"

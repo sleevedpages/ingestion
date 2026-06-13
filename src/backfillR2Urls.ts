@@ -14,7 +14,16 @@
 
 import type { Env } from './worker.js'
 import { uploadCardImage } from './image-mirror.js'
-import { scrydexFetch, ScrydexCreditLimitError } from './lib/scrydexClient.js'
+import { r2ImageUpsert, sourceUrlUpsertByProductId } from './lib/productImages.js'
+import { ScrydexCreditLimitError } from './lib/scrydexClient.js'
+import { fetchAllExpansionCards, ScrydexCardsError } from './lib/scrydexCards.js'
+import {
+  collectVariantEntries,
+  fetchExistingProducts,
+  planVariantWrites,
+  variantFinish,
+  type VariantEntry,
+} from './lib/variantCapture.js'
 
 const R2_PUBLIC_BASE = 'https://images.sleevedpages.com'
 const EXTENSIONS     = ['jpg', 'png', 'webp'] as const
@@ -29,7 +38,6 @@ const GAME_SLUG_BY_CATEGORY_NAME: Record<string, string> = {
 }
 
 interface ProductRow {
-  id:                   number
   tcgplayer_product_id: number
   category_name:        string
 }
@@ -49,22 +57,23 @@ export interface BackfillResult {
 }
 
 export async function backfillR2ImageUrls(env: Env): Promise<BackfillResult> {
+  // Canonical (Session D): products without an R2 image yet (no product_images row,
+  // or a row with r2_url NULL). For each we probe R2 by tcgplayer_product_id and, if
+  // a mirrored object exists, record its r2_url (preserving any existing source).
   const { results } = await env.DB.prepare(`
     SELECT
-      p.id,
       p.tcgplayer_product_id,
-      c.name AS category_name
-    FROM  tcg_products    p
-    JOIN  tcg_sets        s ON s.tcgplayer_group_id    = p.tcgplayer_group_id
-    JOIN  tcg_categories  c ON c.tcgplayer_category_id = s.tcgplayer_category_id
-    WHERE p.image_url IS NOT NULL
-      AND p.image_url != ''
-      AND p.image_url NOT LIKE 'https://images.sleevedpages.com%'
+      g.name AS category_name
+    FROM  products        p
+    JOIN  sets            s ON s.id = p.set_id
+    JOIN  canonical_games g ON g.id = s.game_id
+    LEFT JOIN product_images pi ON pi.product_id = p.id
+    WHERE pi.r2_url IS NULL
   `).all<ProductRow>()
 
   const rows      = results ?? []
   const gameStats = new Map<string, GameSummary>()
-  const toUpdate: { id: number; url: string }[] = []
+  const toUpdate: { tcgProductId: number; url: string }[] = []
 
   // Check R2 existence concurrently in chunks of CONCURRENCY
   for (let i = 0; i < rows.length; i += CONCURRENCY) {
@@ -89,7 +98,7 @@ export async function backfillR2ImageUrls(env: Env): Promise<BackfillResult> {
       const stats = gameStats.get(game)!
       stats.checked++
       if (url) {
-        toUpdate.push({ id: row.id, url })
+        toUpdate.push({ tcgProductId: row.tcgplayer_product_id, url })
         stats.updated++
       } else {
         stats.skipped++
@@ -97,10 +106,11 @@ export async function backfillR2ImageUrls(env: Env): Promise<BackfillResult> {
     }
   }
 
-  // Batch-write DB updates (100 statements per D1 batch to stay within limits)
+  // Batch-write product_images upserts (100 statements per D1 batch). Source is
+  // unknown for a generic R2 backfill, so it is preserved (only r2_url/mirrored_at set).
   if (toUpdate.length > 0) {
-    const statements = toUpdate.map(({ id, url }) =>
-      env.DB.prepare(`UPDATE tcg_products SET image_url = ? WHERE id = ?`).bind(url, id)
+    const statements = toUpdate.map(({ tcgProductId, url }) =>
+      r2ImageUpsert(env.DB, tcgProductId, url, null)
     )
     for (let i = 0; i < statements.length; i += 100) {
       await env.DB.batch(statements.slice(i, i + 100))
@@ -128,152 +138,201 @@ export async function backfillR2ImageUrls(env: Env): Promise<BackfillResult> {
 // ─── Variant product seeding ─────────────────────────────────────────────────
 
 export interface SeedVariantResult {
-  inserted: number
-  skipped:  number
+  inserted:   number
+  skipped:    number
+  conflicted: number
+}
+
+// Canonical seed upsert: mint a per-variant products row (or fill structured fields on
+// an existing one). Preserve-on-conflict — name/number/rarity/set_id are NOT clobbered,
+// and the structured fields COALESCE so a populated value is never nulled.
+const SEED_INSERT_SQL = `
+  INSERT INTO products
+    (tcgplayer_product_id, set_id, name, number, rarity, product_kind,
+     variant_kind, finish, scrydex_card_id)
+  VALUES (?, ?, ?, ?, ?, 'card', ?, ?, ?)
+  ON CONFLICT (tcgplayer_product_id) DO UPDATE SET
+    variant_kind    = COALESCE(excluded.variant_kind, products.variant_kind),
+    finish          = COALESCE(excluded.finish, products.finish),
+    scrydex_card_id = COALESCE(excluded.scrydex_card_id, products.scrydex_card_id)`
+
+interface BaseRow { set_id: number; name: string; number: string | null; rarity: string | null }
+
+/**
+ * Batch-resolve base product rows by printed card code, GAME-WIDE, in ONE query per 90
+ * keys. Returns a map keyed on LOWER(products.number) (the full printed code is globally
+ * unique within a game, e.g. 'GD04-001'). Callers look up by `card.id` (the full printed
+ * code) first, then `card.number`. Game-wide (not group-scoped) so a single fetch of a
+ * shared expansion resolves every card to its real set — no per-set re-iteration.
+ */
+async function fetchBasesByNumber(
+  db:     D1Database,
+  gameId: number,
+  keys:   string[],
+): Promise<Map<string, BaseRow>> {
+  const map = new Map<string, BaseRow>()
+  const uniq = [...new Set(keys.map(k => k.toLowerCase()))]
+  // D1 caps bound parameters at 100 per statement; this query also binds gameId (+1).
+  for (let i = 0; i < uniq.length; i += 90) {
+    const chunk = uniq.slice(i, i + 90)
+    const placeholders = chunk.map(() => '?').join(',')
+    const { results } = await db.prepare(`
+      SELECT p.number, p.set_id, p.name, p.rarity
+      FROM   products p
+      JOIN   sets     s ON p.set_id = s.id
+      WHERE  s.game_id = ?
+      AND    LOWER(p.number) IN (${placeholders})
+    `).bind(gameId, ...chunk).all<BaseRow & { number: string }>()
+    for (const r of results ?? []) {
+      if (r.number) map.set(String(r.number).toLowerCase(), r)
+    }
+  }
+  return map
 }
 
 /**
- * Seeds missing alt art rows in tcg_products from Scrydex marketplace data.
+ * Seeds missing alt-art rows in canonical `products` from Scrydex marketplace data.
+ *
+ * SESSION D-bis: repointed off the frozen tcg_products onto canonical `products` — this
+ * is now the LAST tcg_* writer to move, so after this no worker path writes tcg_*.
  *
  * For One Piece and Gundam, TCGCSV only ingests one product row per card number.
  * Scrydex knows each variant's unique tcgplayer_product_id via marketplace data.
- * This function creates the missing per-variant rows so that scrydexImageSync and
- * backfillVariantImages can later assign the correct image to each row.
+ * This function mints the missing per-variant `products` rows (cloned from the base
+ * card's set_id/name/number/rarity) AND captures the structured variant fields
+ * (scrydex_card_id <- data.id, variant_kind <- variant.name, finish) + the variant's
+ * distinct image, so scrydexImageSync / backfillVariantImages can later refine them.
+ *
+ * The SAME conflict detection as the capture path applies: a seed insert that would
+ * collide on tcgplayer_product_id with a DIFFERENT card (cross-product) — or an
+ * intra-payload duplicate product_id — routes to variant_ingest_conflicts and does NOT
+ * clobber. Preserve-on-conflict for the structured fields (COALESCE — never null a set value).
  *
  * @param env  Worker bindings
- * @param game Optional tcg_categories.name filter (e.g. 'One Piece Card Game').
+ * @param game Optional canonical_games.name filter (e.g. 'One Piece Card Game').
  *             When omitted, all VARIANT_IMAGE_CATEGORY_NAMES games are processed.
  */
 export async function seedVariantProducts(env: Env, game?: string): Promise<SeedVariantResult> {
-  const result: SeedVariantResult = { inserted: 0, skipped: 0 }
+  const result: SeedVariantResult = { inserted: 0, skipped: 0, conflicted: 0 }
 
   const categoryNames = game ? [game] : VARIANT_IMAGE_CATEGORY_NAMES
   const inClause = categoryNames.map(() => '?').join(', ')
 
-  const { results: sets } = await env.DB.prepare(`
-    SELECT s.id, s.name, s.skrydex_set_id, s.tcgplayer_group_id, c.name AS game,
-           c.tcgplayer_category_id
-    FROM   tcg_sets        s
-    JOIN   tcg_categories  c ON c.tcgplayer_category_id = s.tcgplayer_category_id
-    WHERE  s.skrydex_set_id IS NOT NULL
-    AND    c.name IN (${inClause})
-    ORDER  BY c.name, s.id ASC
+  // Iterate DISTINCT expansions, not distinct sets: many canonical sets share one
+  // scrydex_expansion_id (non-unique expansion ids / manual mappings), and base rows are
+  // resolved game-wide, so fetching + processing each expansion ONCE covers every set
+  // that shares it. (Per-set iteration re-fetched + re-scanned the same data ~80×,
+  // wasting credits and blowing the waitUntil budget.)
+  const { results: expansions } = await env.DB.prepare(`
+    SELECT g.id AS game_id, g.name AS game, s.scrydex_expansion_id AS scrydex_set_id
+    FROM   sets            s
+    JOIN   canonical_games g ON g.id = s.game_id
+    WHERE  s.scrydex_expansion_id IS NOT NULL
+    AND    g.name IN (${inClause})
+    GROUP  BY g.id, s.scrydex_expansion_id
+    ORDER  BY g.name
   `).bind(...categoryNames).all()
 
-  outer: for (const set of (sets ?? []) as any[]) {
-    const gameName = set.game as string
+  // Resumability: skip expansions already seeded in a prior run (marked in
+  // scrydex_expansion_freshness with price_type='seed'). Each expansion is marked AFTER
+  // its writes succeed, so a waitUntil-cancelled run loses no progress — just re-run the
+  // endpoint until it reports everything skipped. (To force a re-seed, delete the 'seed'
+  // rows for those expansions.)
+  const { results: seededRows } = await env.DB.prepare(
+    "SELECT scrydex_expansion_id FROM scrydex_expansion_freshness WHERE price_type = 'seed'"
+  ).all()
+  const alreadySeeded = new Set((seededRows ?? []).map((r: any) => String(r.scrydex_expansion_id)))
+
+  outer: for (const exp of (expansions ?? []) as any[]) {
+    const gameName = exp.game as string
     const gameSlug = GAME_SLUG_BY_CATEGORY_NAME[gameName]
     if (!gameSlug) continue
-
-    let setInserted = 0, setSkipped = 0
+    if (alreadySeeded.has(String(exp.scrydex_set_id))) continue
 
     try {
-      const res = await scrydexFetch(
-        env,
-        `/${gameSlug}/v1/cards`,
-        'seedVariantProducts',
-        { params: { expansion: set.skrydex_set_id, limit: '500' } },
-      )
+      const { cards } = await fetchAllExpansionCards(env, gameSlug, exp.scrydex_set_id, 'seedVariantProducts')
 
-      if (!res.ok) {
-        console.warn(`[SeedVariants] ${set.name} fetch failed: ${res.status}`)
-        continue
-      }
+      const entries = collectVariantEntries(cards, null)
 
-      const data  = await res.json() as { data?: unknown[] }
-      const cards = (data.data ?? []) as any[]
+      // Batch-load base rows GAME-WIDE in one query per 90 keys (keyed on the printed card
+      // code). For One Piece / Gundam the printed code (e.g. 'GD04-001') lives in Scrydex
+      // `card.id`; `card.number` is the bare form. products.number stores the full code,
+      // so we resolve the base by card.id first, then fall back to card.number.
+      const baseKeys = entries.flatMap(e => [e.cardId, e.number]).filter((k): k is string => !!k)
+      const basesByNumber = await fetchBasesByNumber(env.DB, exp.game_id, baseKeys)
+      const lookupBase = (entry: VariantEntry): BaseRow | null =>
+        (entry.cardId && basesByNumber.get(entry.cardId.toLowerCase())) ||
+        (entry.number && basesByNumber.get(entry.number.toLowerCase())) ||
+        null
 
-      const toInsert: D1PreparedStatement[] = []
+      // Pre-fetch existing products in ONE query (cross-product collision detection).
+      const existing = await fetchExistingProducts(env.DB, entries.map(e => e.tcgProductId))
 
-      for (const card of cards) {
-        if (!card.number) continue
+      const cleanWrite = (entry: VariantEntry): D1PreparedStatement[] => {
+        const base = lookupBase(entry)
+        if (!base) return []   // no base row to clone from → skip
 
-        // Find the base row for this card_number in this set
-        const base = await env.DB.prepare(
-          `SELECT * FROM tcg_products WHERE tcgplayer_group_id = ? AND LOWER(card_number) = LOWER(?) LIMIT 1`
-        ).bind(set.tcgplayer_group_id, card.number).first<Record<string, unknown>>()
-
-        for (const variant of (card.variants ?? []) as any[]) {
-          const tcgMarket    = (variant.marketplaces ?? []).find((m: any) => m.name === 'tcgplayer')
-          const tcgProductId = tcgMarket?.product_id ? parseInt(tcgMarket.product_id, 10) : null
-
-          if (!tcgProductId) {
-            setSkipped++
-            continue
-          }
-
-          // Check whether this product_id already exists
-          const exists = await env.DB.prepare(
-            `SELECT tcgplayer_product_id FROM tcg_products WHERE tcgplayer_product_id = ?`
-          ).bind(tcgProductId).first()
-
-          if (exists) {
-            setSkipped++
-            continue
-          }
-
-          if (!base) {
-            setSkipped++
-            continue
-          }
-
-          // Build variant name — append suffix when it's not the 'normal' variant
-          const variantSuffix = variant.name && variant.name !== 'normal'
-            ? ` (${variant.name})`
-            : ''
-          const variantName = `${base.name}${variantSuffix}`
-
-          // Use variant front image if available
-          const variantImages: any[] = variant.images ?? []
-          const frontImage = variantImages.find((i: any) => i.type === 'front')
-          const imageUrl   = frontImage?.large ?? frontImage?.medium ?? null
-
-          toInsert.push(
-            env.DB.prepare(`
-              INSERT INTO tcg_products
-                (tcgplayer_product_id, tcgplayer_group_id, tcgplayer_category_id,
-                 name, clean_name, card_number, rarity, image_url, image_source, modified_on)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `).bind(
-              tcgProductId,
-              base.tcgplayer_group_id,
-              base.tcgplayer_category_id,
-              variantName,
-              base.clean_name ?? null,
-              base.card_number ?? null,
-              base.rarity ?? null,
-              imageUrl,
-              imageUrl ? 'scrydex' : null,
-              base.modified_on ?? null,
-            )
-          )
-          setInserted++
+        const suffix = entry.variantName && entry.variantName !== 'normal'
+          ? ` (${entry.variantName})` : ''
+        const stmts: D1PreparedStatement[] = [
+          env.DB.prepare(SEED_INSERT_SQL).bind(
+            entry.tcgProductId,
+            base.set_id,
+            `${base.name}${suffix}`,
+            base.number ?? null,
+            base.rarity ?? null,
+            entry.variantName,
+            variantFinish(entry.variantName),
+            entry.cardId,
+          ),
+        ]
+        if (entry.imageUrl) {
+          stmts.push(sourceUrlUpsertByProductId(env.DB, entry.tcgProductId, entry.imageUrl, 'scrydex'))
         }
+        return stmts
       }
 
-      // Batch inserts in chunks of 100
-      for (let i = 0; i < toInsert.length; i += 100) {
-        await env.DB.batch(toInsert.slice(i, i + 100))
+      const plan = planVariantWrites(env.DB, entries, existing, cleanWrite)
+
+      // Batch in chunks of 100. Each card's seed-insert precedes its image upsert in the
+      // array, and D1 batches run sequentially, so the product exists before its image
+      // upsert's INSERT…SELECT resolves it.
+      for (let i = 0; i < plan.statements.length; i += 100) {
+        await env.DB.batch(plan.statements.slice(i, i + 100))
       }
 
-      result.inserted += setInserted
-      result.skipped  += setSkipped
+      result.inserted   += plan.captured
+      result.skipped    += plan.skipped
+      result.conflicted += plan.conflicted
 
-      console.log(
-        `[SeedVariants] ${set.name}: inserted=${setInserted} skipped=${setSkipped}`,
-      )
+      // Mark this expansion seeded so a subsequent run skips it (resumability).
+      await env.DB.prepare(`
+        INSERT INTO scrydex_expansion_freshness (scrydex_expansion_id, price_type, last_updated)
+        VALUES (?, 'seed', unixepoch())
+        ON CONFLICT (scrydex_expansion_id, price_type) DO UPDATE SET last_updated = excluded.last_updated
+      `).bind(exp.scrydex_set_id).run()
 
-      await new Promise(r => setTimeout(r, 100))
+      if (plan.captured > 0 || plan.conflicted > 0) {
+        console.log(
+          `[SeedVariants] ${exp.game} / ${exp.scrydex_set_id}: seeded=${plan.captured} skipped=${plan.skipped} conflicts=${plan.conflicted}`,
+        )
+      }
+
+      await new Promise(r => setTimeout(r, 100))   // pace Scrydex between expansions
     } catch (err) {
       if (err instanceof ScrydexCreditLimitError) {
         console.warn('[SeedVariants] Credit limit guard triggered — stopping')
         break outer
       }
-      console.error(`[SeedVariants] Error on ${set.name}:`, err)
+      if (err instanceof ScrydexCardsError && err.status === 403) {
+        console.error('[SeedVariants] 403 (CREDIT_CAP_HIT) — circuit breaker, stopping run')
+        break outer
+      }
+      console.error(`[SeedVariants] Error on expansion ${exp.scrydex_set_id}:`, err)
     }
   }
 
-  console.log(`[SeedVariants] Complete: inserted=${result.inserted} skipped=${result.skipped}`)
+  console.log(`[SeedVariants] Complete: seeded=${result.inserted} skipped=${result.skipped} conflicts=${result.conflicted}`)
   return result
 }
 
@@ -338,12 +397,12 @@ export async function backfillVariantImages(env: Env, game?: string): Promise<Va
   const inClause = categoryNames.map(() => '?').join(', ')
 
   const { results: sets } = await env.DB.prepare(`
-    SELECT s.id, s.name, s.skrydex_set_id, s.tcgplayer_group_id, c.name AS game
-    FROM   tcg_sets        s
-    JOIN   tcg_categories  c ON c.tcgplayer_category_id = s.tcgplayer_category_id
-    WHERE  s.skrydex_set_id IS NOT NULL
-    AND    c.name IN (${inClause})
-    ORDER  BY c.name, s.id ASC
+    SELECT s.id, s.name, s.scrydex_expansion_id AS scrydex_set_id, s.tcgplayer_group_id, g.name AS game
+    FROM   sets            s
+    JOIN   canonical_games g ON g.id = s.game_id
+    WHERE  s.scrydex_expansion_id IS NOT NULL
+    AND    g.name IN (${inClause})
+    ORDER  BY g.name, s.id ASC
   `).bind(...categoryNames).all()
 
   const gameStats = new Map<string, VariantGameSummary>()
@@ -359,20 +418,7 @@ export async function backfillVariantImages(env: Env, game?: string): Promise<Va
     const stats = gameStats.get(gameName)!
 
     try {
-      const res = await scrydexFetch(
-        env,
-        `/${gameSlug}/v1/cards`,
-        'backfillVariantImages',
-        { params: { expansion: set.skrydex_set_id, limit: '500' } },
-      )
-
-      if (!res.ok) {
-        console.warn(`[VariantBackfill] ${set.name} fetch failed: ${res.status}`)
-        continue
-      }
-
-      const data  = await res.json() as { data?: unknown[] }
-      const cards = (data.data ?? []) as any[]
+      const { cards } = await fetchAllExpansionCards(env, gameSlug, set.scrydex_set_id, 'backfillVariantImages')
 
       let setProcessed = 0, setCorrected = 0, setSkipped = 0, setFailed = 0
 
@@ -390,9 +436,9 @@ export async function backfillVariantImages(env: Env, game?: string): Promise<Va
             continue
           }
 
-          // Verify this product_id exists in our DB before fetching bytes
+          // Verify this product exists in canonical `products` before fetching bytes
           const exists = await env.DB.prepare(
-            `SELECT tcgplayer_product_id FROM tcg_products WHERE tcgplayer_product_id = ?`
+            `SELECT tcgplayer_product_id FROM products WHERE tcgplayer_product_id = ?`
           ).bind(tcgProductId).first<{ tcgplayer_product_id: number }>()
 
           if (!exists) {
@@ -415,7 +461,7 @@ export async function backfillVariantImages(env: Env, game?: string): Promise<Va
               tcgProductId,
               fetched.buffer,
               fetched.contentType,
-              'skrydex',
+              'scrydex',
             )
             setCorrected++
           } catch (e) {
@@ -444,6 +490,10 @@ export async function backfillVariantImages(env: Env, game?: string): Promise<Va
     } catch (err) {
       if (err instanceof ScrydexCreditLimitError) {
         console.warn('[VariantBackfill] Credit limit guard triggered — stopping')
+        break outer
+      }
+      if (err instanceof ScrydexCardsError && err.status === 403) {
+        console.error('[VariantBackfill] 403 (CREDIT_CAP_HIT) — circuit breaker, stopping run')
         break outer
       }
       console.error(`[VariantBackfill] Error on ${set.name}:`, err)

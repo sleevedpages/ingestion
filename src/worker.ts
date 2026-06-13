@@ -1,6 +1,6 @@
 import { runIngestion, processGroupMessage, type IngestionConfig, type SyncGroupMessage } from './ingestion/index.js';
 import { runMirrorJob, getPendingCards, uploadCardImage } from './image-mirror.js';
-import { processPendingWebhooks } from './scrydexProcessor.js';
+import { processPendingWebhooks, refreshCardPrices } from './scrydexProcessor.js';
 import { syncScrydexSetMappings } from './scrydexSetMapping.js';
 import { syncScrydexImages } from './scrydexImageSync.js';
 import { cleanupScrydexApiLog } from './lib/scrydexClient.js';
@@ -23,8 +23,9 @@ export interface Env {
   // Shared secret for admin-triggered HTTP endpoints
   INGESTION_WORKER_SECRET?: string;
   // Credit-control env vars (see scrydexProcessor.ts for details)
-  SCRYDEX_PRICE_FRESHNESS_HOURS?: string;  // default 20 — freshness window before re-fetching an expansion
-  SCRYDEX_PRICE_GAMES?: string;            // comma-separated slug allowlist, e.g. 'pokemon,onepiece'
+  SCRYDEX_PRICE_FRESHNESS_HOURS?: string;  // default 20 — freshness window before re-fetching an expansion (MUST stay <24h, the daily drain interval)
+  SCRYDEX_PRICE_GAMES?: string;            // comma-separated slug allowlist, e.g. 'pokemon,onepiece' — deliberately UNSET in prod
+  SCRYDEX_DRAIN_MAX_FETCHES?: string;      // default 1500 — cap on Scrydex page-calls per daily drain invocation (waitUntil safety)
 }
 
 function buildConfig(env: Env): IngestionConfig {
@@ -109,6 +110,19 @@ export default {
         );
         return json({ ok: true, message: game ? `Scrydex image sync started for ${game}` : 'Scrydex image sync started' });
       }
+
+      // Vendor on-demand single-card refresh — BLOCKING (returns the fresh result).
+      // The Content app gates this (vendor access + ownership + 1/hour rate limit)
+      // before proxying; here we just do the credit-guarded fetch + upsert.
+      if (pathname === '/scrydex/refresh-card') {
+        const body = await request.json().catch(() => ({})) as { product_id?: number | string };
+        const productId = Number(body.product_id);
+        if (!Number.isInteger(productId) || productId < 1) {
+          return json({ ok: false, error: 'product_id (canonical products.id) is required' }, 400);
+        }
+        const result = await refreshCardPrices(env, productId);
+        return json(result, result.ok ? 200 : 502);
+      }
     }
 
     // POST /admin/sync-variant-images — re-mirror variant-specific images per game
@@ -183,8 +197,8 @@ export default {
     if (pathname === '/mirror/pending' && request.method === 'GET') {
       const qs          = new URL(request.url).searchParams;
       const limit       = Math.min(200, Math.max(1, parseInt(qs.get('limit') ?? '50', 10)));
-      const skrydexOnly = qs.get('skrydex_only') === '1';
-      const cards       = await getPendingCards(env.DB, limit, skrydexOnly);
+      const scrydexOnly = qs.get('scrydex_only') === '1';
+      const cards       = await getPendingCards(env.DB, limit, scrydexOnly);
       return json({ ok: true, cards, has_more: cards.length === limit });
     }
 
@@ -197,7 +211,7 @@ export default {
           tcgplayer_product_id: number;
           imageBase64:          string;
           contentType:          string;
-          source:               'skrydex' | 'tcgplayer';
+          source:               'scrydex' | 'tcgplayer';
         };
 
         // Decode base64 → ArrayBuffer
@@ -252,8 +266,10 @@ export default {
         );
         break;
 
-      case '*/10 * * * *':
-        // Every 10 min: drain pending Scrydex webhook log rows
+      case '0 4 * * *':
+        // DAILY: drain pending Scrydex webhook log rows (was */10 — see wrangler.toml
+        // cost-control note). The drain dedups a day's notifications to one fetch per
+        // distinct expansion. Freshness (20h) < this 24h interval, so prices still advance.
         if (env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID) {
           ctx.waitUntil(
             processPendingWebhooks(env).catch((err) =>

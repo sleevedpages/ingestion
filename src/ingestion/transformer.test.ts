@@ -6,6 +6,7 @@ import {
   transformProduct,
   transformPrice,
   transformGroupData,
+  bumpTcgplayerImageRes,
 } from './transformer.js';
 import type { TcgGroup, TcgProduct, TcgPrice } from '../types/tcgcsv.js';
 import type { ResolvedCategory } from './categories.js';
@@ -157,6 +158,61 @@ describe('transformProduct', () => {
     const product = makeProduct();
     const row = transformProduct(product, NOW);
     expect(row.extended_data).toEqual(product.extendedData);
+  });
+
+  it('bumps a TCGPlayer CDN _200w image url to _in_1000x1000', () => {
+    const row = transformProduct(makeProduct({
+      imageUrl: 'https://tcgplayer-cdn.tcgplayer.com/product/243522_200w.jpg',
+    }), NOW);
+    expect(row.image_url).toBe(
+      'https://tcgplayer-cdn.tcgplayer.com/product/243522_in_1000x1000.jpg'
+    );
+  });
+
+  it('leaves a non-TCGPlayer image url untouched', () => {
+    const row = transformProduct(makeProduct({
+      imageUrl: 'https://images.scrydex.com/pokemon/base1-58/large',
+    }), NOW);
+    expect(row.image_url).toBe('https://images.scrydex.com/pokemon/base1-58/large');
+  });
+
+  it('stores null image_url when the product has no image', () => {
+    const row = transformProduct(makeProduct({ imageUrl: undefined as unknown as string }), NOW);
+    expect(row.image_url).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bumpTcgplayerImageRes
+// ---------------------------------------------------------------------------
+
+describe('bumpTcgplayerImageRes', () => {
+  it('rewrites the _200w token to _in_1000x1000 on tcgplayer-cdn urls', () => {
+    expect(
+      bumpTcgplayerImageRes('https://tcgplayer-cdn.tcgplayer.com/product/100_200w.jpg')
+    ).toBe('https://tcgplayer-cdn.tcgplayer.com/product/100_in_1000x1000.jpg');
+  });
+
+  it('preserves a query string after the extension', () => {
+    expect(
+      bumpTcgplayerImageRes('https://tcgplayer-cdn.tcgplayer.com/product/100_200w.jpg?v=2')
+    ).toBe('https://tcgplayer-cdn.tcgplayer.com/product/100_in_1000x1000.jpg?v=2');
+  });
+
+  it('returns non-tcgplayer hosts unchanged', () => {
+    expect(bumpTcgplayerImageRes('https://images.scrydex.com/x_200w.jpg'))
+      .toBe('https://images.scrydex.com/x_200w.jpg');
+  });
+
+  it('returns null/empty input as null', () => {
+    expect(bumpTcgplayerImageRes(null)).toBeNull();
+    expect(bumpTcgplayerImageRes(undefined)).toBeNull();
+    expect(bumpTcgplayerImageRes('')).toBeNull();
+  });
+
+  it('is idempotent — an already-bumped url is left unchanged', () => {
+    const url = 'https://tcgplayer-cdn.tcgplayer.com/product/100_in_1000x1000.jpg';
+    expect(bumpTcgplayerImageRes(url)).toBe(url);
   });
 });
 

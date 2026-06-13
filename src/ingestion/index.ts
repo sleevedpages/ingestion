@@ -9,6 +9,7 @@ import {
   upsertCategory,
   upsertSetsBatch,
   upsertProducts,
+  upsertProductSourceImages,
   upsertPrices,
   createSyncLog,
   updateSyncLog,
@@ -324,10 +325,14 @@ async function processGroupInline(
     return { productsUpserted: productRows.length, pricesUpserted: priceRows.length };
   }
 
-  const [productsUpserted, pricesUpserted] = await Promise.all([
-    upsertProducts(config.db, productRows),
-    upsertPrices(config.db, priceRows),
-  ]);
+  // Canonical write order matters: prices and product_images both resolve products.id
+  // via sub-select, so products MUST be written first (the old tcg_* tables stored the
+  // external id directly and could run in parallel — canonical cannot).
+  const productsUpserted = await upsertProducts(config.db, productRows);
+  // Relocate the TCGPlayer original image url into product_images.source_url (the old
+  // tcg_products.image_url write) so the R2 mirror has a source to fetch.
+  await upsertProductSourceImages(config.db, productRows);
+  const pricesUpserted = await upsertPrices(config.db, priceRows);
 
   return { productsUpserted, pricesUpserted };
 }

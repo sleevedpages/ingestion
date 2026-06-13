@@ -16,30 +16,42 @@
  *     NOTE: tcg_products has NO set_id column — must join via tcgplayer_group_id
  *     Use card.images[front].large — same image for normal, foil, reverse holo variants
  *
- * Cost: 1 credit per set (only sets with skrydex_set_id populated).
+ * Cost: 1 credit per set (only sets with scrydex_set_id populated).
  */
 
 import type { Env } from './worker.js'
-import { scrydexFetch, ScrydexCreditLimitError } from './lib/scrydexClient.js'
+import { ScrydexCreditLimitError } from './lib/scrydexClient.js'
+import { fetchAllExpansionCards, ScrydexCardsError } from './lib/scrydexCards.js'
+import { sourceUrlUpsertByProductId, sourceUrlUpsertByGroupNumber } from './lib/productImages.js'
+import {
+  collectVariantEntries,
+  fetchExistingProducts,
+  planVariantWrites,
+  captureUpdate,
+  frontImageLarge,
+  tcgProductIdOf,
+} from './lib/variantCapture.js'
 
 // Games where each variant has a unique product_id + its own image
 const VARIANT_IMAGE_GAMES = new Set(['onepiece', 'gundam'])
 
 const GAME_SLUG_BY_CATEGORY: Record<string, string> = {
-  'Pokemon':             'pokemon',
-  'Magic':               'magicthegathering',
+  'Pokemon': 'pokemon',
+  'Magic': 'magicthegathering',
   'One Piece Card Game': 'onepiece',
-  'Gundam Card Game':    'gundam',
-  'Lorcana':             'lorcana',
-  'Riftbound':           'riftbound',
+  'Gundam Card Game': 'gundam',
+  'Lorcana': 'lorcana',
+  'Riftbound': 'riftbound',
 }
 
 interface SyncResult {
-  setsProcessed:   number
-  imagesUpdated:   number
-  creditsUsed:     number
+  setsProcessed: number
+  imagesUpdated: number
+  creditsUsed: number
   variantsMatched: number
   variantsUnmatched: number
+  variantsCaptured: number    // variant rows that got scrydex_card_id/variant_kind/finish + image
+  variantsConflicted: number  // variants routed to variant_ingest_conflicts (not written)
 }
 
 /**
@@ -47,10 +59,10 @@ interface SyncResult {
  *
  * @param env  Worker bindings
  * @param game Optional tcg_categories.name filter (e.g. 'One Piece Card Game').
- *             When omitted, all games with skrydex_set_id mappings are processed.
+ *             When omitted, all games with scrydex_set_id mappings are processed.
  */
 export async function syncScrydexImages(env: Env, game?: string): Promise<SyncResult> {
-  const result: SyncResult = { setsProcessed: 0, imagesUpdated: 0, creditsUsed: 0, variantsMatched: 0, variantsUnmatched: 0 }
+  const result: SyncResult = { setsProcessed: 0, imagesUpdated: 0, creditsUsed: 0, variantsMatched: 0, variantsUnmatched: 0, variantsCaptured: 0, variantsConflicted: 0 }
 
   // Select tcgplayer_group_id so we can use it directly in the UPDATE
   // (tcg_products joins to tcg_sets via tcgplayer_group_id, NOT an internal set_id)
@@ -59,40 +71,41 @@ export async function syncScrydexImages(env: Env, game?: string): Promise<SyncRe
   // set is skipped — saving 1 credit per already-synced set per weekly run.
   // With 352 mapped sets in production, this drops the weekly cost from ~352
   // credits to near-zero once the initial sync + R2 backfill are complete.
+  // Canonical (Session D): sets/canonical_games; the "set still has products needing
+  // an image URL" pre-filter checks product_images.r2_url (a product with no R2 image).
+  // `s.scrydex_expansion_id AS scrydex_set_id` keeps the downstream field name stable.
   const setsStmt = game
     ? env.DB.prepare(`
-        SELECT s.id, s.name, s.abbreviation, s.skrydex_set_id,
-               s.tcgplayer_group_id, c.name AS game
-        FROM   tcg_sets s
-        JOIN   tcg_categories c ON s.tcgplayer_category_id = c.tcgplayer_category_id
-        WHERE  s.skrydex_set_id IS NOT NULL
-        AND    c.name = ?
+        SELECT s.id, s.name, s.code AS set_code, s.scrydex_expansion_id AS scrydex_set_id,
+               s.tcgplayer_group_id, g.name AS game
+        FROM   sets s
+        JOIN   canonical_games g ON g.id = s.game_id
+        WHERE  s.scrydex_expansion_id IS NOT NULL
+        AND    g.name = ?
         AND (
-          c.name IN ('One Piece Card Game', 'Gundam Card Game')
+          g.name IN ('One Piece Card Game', 'Gundam Card Game')
           OR EXISTS (
-            SELECT 1 FROM tcg_products p2
-            WHERE  p2.tcgplayer_group_id = s.tcgplayer_group_id
-            AND   (p2.image_url IS NULL
-                   OR p2.image_url = ''
-                   OR p2.image_url NOT LIKE 'https://images.sleevedpages.com%')
+            SELECT 1 FROM products p2
+            LEFT JOIN product_images pi2 ON pi2.product_id = p2.id
+            WHERE  p2.set_id = s.id
+            AND    pi2.r2_url IS NULL
           )
         )
         ORDER BY s.id ASC
       `).bind(game)
     : env.DB.prepare(`
-        SELECT s.id, s.name, s.abbreviation, s.skrydex_set_id,
-               s.tcgplayer_group_id, c.name AS game
-        FROM   tcg_sets s
-        JOIN   tcg_categories c ON s.tcgplayer_category_id = c.tcgplayer_category_id
-        WHERE  s.skrydex_set_id IS NOT NULL
+        SELECT s.id, s.name, s.code AS set_code, s.scrydex_expansion_id AS scrydex_set_id,
+               s.tcgplayer_group_id, g.name AS game
+        FROM   sets s
+        JOIN   canonical_games g ON g.id = s.game_id
+        WHERE  s.scrydex_expansion_id IS NOT NULL
         AND (
-          c.name IN ('One Piece Card Game', 'Gundam Card Game')
+          g.name IN ('One Piece Card Game', 'Gundam Card Game')
           OR EXISTS (
-            SELECT 1 FROM tcg_products p2
-            WHERE  p2.tcgplayer_group_id = s.tcgplayer_group_id
-            AND   (p2.image_url IS NULL
-                   OR p2.image_url = ''
-                   OR p2.image_url NOT LIKE 'https://images.sleevedpages.com%')
+            SELECT 1 FROM products p2
+            LEFT JOIN product_images pi2 ON pi2.product_id = p2.id
+            WHERE  p2.set_id = s.id
+            AND    pi2.r2_url IS NULL
           )
         )
         ORDER BY s.id ASC
@@ -100,77 +113,84 @@ export async function syncScrydexImages(env: Env, game?: string): Promise<SyncRe
 
   const { results: sets } = await setsStmt.all()
 
+  // Many canonical sets share one scrydex_expansion_id — cache each expansion's /cards
+  // response by scrydex_set_id so it is fetched at most once per run (saves credits +
+  // avoids the waitUntil budget blowout from re-fetching the same data dozens of times).
+  const cardsCache = new Map<string, any[]>()
+  // Variant capture keys on the GLOBAL tcgplayer_product_id, so an expansion only needs
+  // to be captured once even if many sets share it — track which we've already done to
+  // avoid re-writing the same products 40× (and blowing the waitUntil budget).
+  const capturedExpansions = new Set<string>()
+
   for (const set of sets as any[]) {
     const gameName = set.game as string
     const gameSlug = GAME_SLUG_BY_CATEGORY[gameName]
     if (!gameSlug) continue
 
     try {
-      const res = await scrydexFetch(
-        env,
-        `/${gameSlug}/v1/cards`,
-        'syncScrydexImages',
-        { params: { expansion: set.skrydex_set_id, limit: '500' } },
-      )
-      result.creditsUsed++
-
-      if (!res.ok) {
-        console.warn(`[ImageSync] ${set.name} failed: ${res.status}`)
-        continue
+      const cacheKey = String(set.scrydex_set_id)
+      let cards = cardsCache.get(cacheKey)
+      if (!cards) {
+        const { cards: fetched, requests } = await fetchAllExpansionCards(
+          env, gameSlug, set.scrydex_set_id, 'syncScrydexImages',
+        )
+        result.creditsUsed += requests
+        cards = fetched
+        cardsCache.set(cacheKey, cards)
+        await new Promise(r => setTimeout(r, 100))   // pace Scrydex only on a real fetch
       }
 
-      const data  = await res.json() as { data?: unknown[] }
-      const cards = (data.data ?? []) as any[]
       const updates: D1PreparedStatement[] = []
 
       if (VARIANT_IMAGE_GAMES.has(gameSlug)) {
-        // ── One Piece / Gundam: match each variant by unique TCGPlayer product_id ──
-        let setMatched = 0, setUnmatched = 0
+        // Skip if another set already captured this (shared) expansion — capture is
+        // global by product_id, so re-doing it writes the same rows again for nothing.
+        if (capturedExpansions.has(cacheKey)) continue
+        capturedExpansions.add(cacheKey)
+        // ── One Piece / Gundam: per-variant capture + conflict routing ──
+        // Each variant is its own TCGPlayer product. For every NON-colliding variant
+        // we (a) capture scrydex_card_id (data.id) / variant_kind (variant.name) /
+        // finish onto its product, and (b) write its DISTINCT front image keyed on the
+        // product_id bridge (the variant-image-pull fix — was keyed on shared
+        // card_number). Colliding variants (intra-payload dup product_id OR
+        // cross-product) route to variant_ingest_conflicts and write nothing.
+        const entries = collectVariantEntries(cards, set.set_code ?? null)
+        const existing = await fetchExistingProducts(env.DB, entries.map(e => e.tcgProductId))
+
+        const plan = planVariantWrites(env.DB, entries, existing, (entry) => {
+          const stmts: D1PreparedStatement[] = [captureUpdate(env.DB, entry)]
+          if (entry.imageUrl) {
+            stmts.push(sourceUrlUpsertByProductId(env.DB, entry.tcgProductId, entry.imageUrl, 'scrydex'))
+          }
+          return stmts
+        })
+        updates.push(...plan.statements)
+
+        // Fallback: variants with NO marketplace entry (no product_id) can't be
+        // captured or conflict-checked — keep them imaged by card_number so they
+        // aren't left blank. (Image only; no structured capture.)
+        let setUnmatched = 0
         for (const card of cards) {
           for (const variant of (card.variants ?? []) as any[]) {
-            const variantImages: any[] = variant.images ?? []
-            if (!variantImages.length) continue
-
-            const frontImage = variantImages.find((i: any) => i.type === 'front')
-            const imageUrl   = frontImage?.large ?? null
-            if (!imageUrl) continue
-
-            const tcgMarket    = (variant.marketplaces ?? []).find((m: any) => m.name === 'tcgplayer')
-            const tcgProductId = tcgMarket?.product_id ? parseInt(tcgMarket.product_id, 10) : null
-
-            if (tcgProductId) {
-              // Primary path: explicit product_id match — always overwrite so the correct
-              // per-variant image replaces any previously mirrored base-art placeholder
-              setMatched++
-              updates.push(
-                env.DB.prepare(`
-                  UPDATE tcg_products
-                  SET    image_url = ?, image_source = 'scrydex'
-                  WHERE  tcgplayer_product_id = ?
-                `).bind(imageUrl, tcgProductId)
-              )
-            } else if (card.number) {
-              // Fallback: no marketplace entry for this variant — fall back to card_number match
-              // so we don't leave these rows without any image at all
-              setUnmatched++
-              updates.push(
-                env.DB.prepare(`
-                  UPDATE tcg_products
-                  SET    image_url = ?, image_source = 'scrydex'
-                  WHERE  tcgplayer_group_id = ?
-                  AND    LOWER(card_number) = LOWER(?)
-                  AND   (image_url IS NULL
-                         OR image_url NOT LIKE 'https://images.sleevedpages.com%')
-                `).bind(imageUrl, set.tcgplayer_group_id, card.number)
-              )
-            }
+            if (tcgProductIdOf(variant) !== null) continue
+            const imageUrl = frontImageLarge(variant)
+            if (!imageUrl || !card.number) continue
+            setUnmatched++
+            updates.push(
+              sourceUrlUpsertByGroupNumber(env.DB, set.tcgplayer_group_id, card.number, imageUrl, 'scrydex')
+            )
           }
         }
 
-        result.variantsMatched   += setMatched
-        result.variantsUnmatched += setUnmatched
-        if (setUnmatched > 0) {
-          console.log(`[ImageSync] ${set.name}: ${setMatched} variants matched by product_id, ${setUnmatched} fell back to card_number`)
+        result.variantsMatched    += plan.captured
+        result.variantsCaptured   += plan.captured
+        result.variantsConflicted += plan.conflicted
+        result.variantsUnmatched  += setUnmatched
+        if (plan.conflicted > 0 || setUnmatched > 0) {
+          console.log(
+            `[ImageSync] ${set.name}: ${plan.captured} captured,`,
+            `${plan.conflicted} conflicts logged, ${setUnmatched} no-marketplace fallbacks`
+          )
         }
       } else {
         // ── All other games: card-level images, match by card_number + group_id ──
@@ -178,18 +198,14 @@ export async function syncScrydexImages(env: Env, game?: string): Promise<SyncRe
         for (const card of cards) {
           const cardImages: any[] = card.images ?? []
           const frontImage = cardImages.find((i: any) => i.type === 'front')
-          const imageUrl   = frontImage?.large ?? null
+          const imageUrl = frontImage?.large ?? null
           if (!imageUrl || !card.number) continue
 
+          // Card-level (all other games): write the Scrydex CDN url as source_url for
+          // every product sharing this group+number. source is left untouched (NULL on
+          // first write) — only the R2 mirror sets a definitive source.
           updates.push(
-            env.DB.prepare(`
-              UPDATE tcg_products
-              SET    image_url = ?
-              WHERE  tcgplayer_group_id = ?
-              AND    LOWER(card_number) = LOWER(?)
-              AND   (image_url IS NULL
-                     OR image_url NOT LIKE 'https://images.sleevedpages.com%')
-            `).bind(imageUrl, set.tcgplayer_group_id, card.number)
+            sourceUrlUpsertByGroupNumber(env.DB, set.tcgplayer_group_id, card.number, imageUrl, null)
           )
         }
       }
@@ -202,11 +218,16 @@ export async function syncScrydexImages(env: Env, game?: string): Promise<SyncRe
       result.imagesUpdated += updates.length
       result.setsProcessed++
 
-      console.log(`[ImageSync] ${set.name}: ${updates.length} image URLs updated`)
-      await new Promise(r => setTimeout(r, 100))
+      if (updates.length > 0) {
+        console.log(`[ImageSync] ${set.name}: ${updates.length} image URLs updated`)
+      }
     } catch (err) {
       if (err instanceof ScrydexCreditLimitError) {
         console.warn('[ImageSync] Credit limit guard triggered — stopping set processing')
+        break
+      }
+      if (err instanceof ScrydexCardsError && err.status === 403) {
+        console.error('[ImageSync] 403 (CREDIT_CAP_HIT) — circuit breaker, stopping run')
         break
       }
       console.error(`[ImageSync] Error on ${set.name}:`, err)
@@ -216,7 +237,8 @@ export async function syncScrydexImages(env: Env, game?: string): Promise<SyncRe
   console.log(
     `[ImageSync] Complete — sets:${result.setsProcessed}`,
     `images:${result.imagesUpdated} credits:${result.creditsUsed}`,
-    `variantsMatched:${result.variantsMatched} variantsUnmatched:${result.variantsUnmatched}`
+    `variantsCaptured:${result.variantsCaptured} variantsConflicted:${result.variantsConflicted}`,
+    `variantsUnmatched:${result.variantsUnmatched}`
   )
   return result
 }

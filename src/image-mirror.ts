@@ -2,7 +2,7 @@
  * image-mirror.ts
  *
  * Mirrors card images into R2:
- *  - Pokémon cards: tries Skrydex CDN first (free, high-res), falls back to TCGPlayer
+ *  - Pokémon cards: tries Scrydex CDN first (free, high-res), falls back to TCGPlayer
  *  - All other games: uses TCGPlayer image_url directly
  *
  * Stores images at: cards/{tcgplayer_product_id}.{ext}
@@ -14,7 +14,8 @@
  *  - HTTP POST /mirror for manual trigger
  */
 
-import { buildSkrydexImageUrl, buildSkrydexImageUrlFromSetName } from './lib/skrydexUrl.js';
+import { buildScrydexImageUrl, buildScrydexImageUrlFromSetName } from './lib/scrydexUrl.js';
+import { writeR2Image } from './lib/productImages.js';
 import { logger } from './ingestion/logger.js';
 
 const BATCH_SIZE = 100;     // cards fetched from DB per invocation
@@ -33,7 +34,7 @@ interface CardRow {
   image_source: string | null;
   card_number: string | null;
   set_name: string | null;
-  skrydex_set_id: string | null;
+  scrydex_set_id: string | null;
   category_name: string | null;
 }
 
@@ -41,7 +42,7 @@ interface MirrorStats {
   processed: number;
   mirrored: number;
   failed: number;
-  skrydex_hits: number;
+  scrydex_hits: number;
   tcgplayer_hits: number;
 }
 
@@ -58,7 +59,7 @@ async function fetchImage(url: string): Promise<{ buffer: ArrayBuffer; contentTy
     const res = await fetch(url, {
       headers: {
         // TCGPlayer CDN uses hotlink protection that checks Referer.
-        // Skrydex is fine without it, but the header doesn't hurt either.
+        // Scrydex is fine without it, but the header doesn't hurt either.
         'Referer':    'https://www.tcgplayer.com/',
         'User-Agent': 'Mozilla/5.0 (compatible; SleevedPages/1.0)',
       },
@@ -77,6 +78,11 @@ async function fetchImage(url: string): Promise<{ buffer: ArrayBuffer; contentTy
     // Guard against Scrydex placeholder images (card back returned for unknown URLs).
     // The placeholder is ~181 KB; real card scans should be larger.
     // Threshold set to 300 KB — placeholder is ~181 KB, real cards are ~400 KB+.
+    //
+    // Guard intentionally rejects small TCGPlayer images from R2 — TCGPlayer high-res
+    // (`_in_1000x1000`) is watermarked on alts, so TCGPlayer cards render from
+    // `source_url` (CDN), not R2. Do not scope this guard to 'fix' TCGPlayer
+    // mirroring — it's deliberate.
     if (buffer.byteLength < 300_000) {
       logger.debug('Image too small — likely Scrydex placeholder', { url, bytes: buffer.byteLength });
       return null;
@@ -98,13 +104,13 @@ function extFromContentType(ct: string): string {
 
 /** Processes a single card: fetches image and stores in R2. Returns source used.
  *  When sourceImageUrl is provided it is used directly as the mirror source (variant backfill path),
- *  skipping both the Pokémon Skrydex CDN attempt and the tcg_products.image_url lookup. */
+ *  skipping both the Pokémon Scrydex CDN attempt and the tcg_products.image_url lookup. */
 async function mirrorCard(
   card: CardRow,
   bucket: R2Bucket,
   db: D1Database,
   sourceImageUrl?: string
-): Promise<'skrydex' | 'tcgplayer' | 'failed'> {
+): Promise<'scrydex' | 'tcgplayer' | 'failed'> {
   // Fast path: caller supplies a specific source URL (e.g. per-variant Scrydex CDN URL)
   if (sourceImageUrl) {
     const fetched = await fetchImage(sourceImageUrl);
@@ -116,10 +122,8 @@ async function mirrorCard(
         httpMetadata: { contentType: fetched.contentType, cacheControl: 'public, max-age=31536000' },
       });
       const r2Url = `${R2_PUBLIC_BASE}/${key}`;
-      await db.prepare(
-        `UPDATE tcg_products SET image_url = ?, image_source = 'skrydex' WHERE tcgplayer_product_id = ?`
-      ).bind(r2Url, card.tcgplayer_product_id).run();
-      return 'skrydex';
+      await writeR2Image(db, card.tcgplayer_product_id, r2Url, 'scrydex');
+      return 'scrydex';
     } catch (e) {
       logger.warn('R2 put failed (variant source URL)', { key, error: String(e) });
       return 'failed';
@@ -129,16 +133,16 @@ async function mirrorCard(
   const isPoke = isPokemon(card.category_name);
 
   let imageUrl: string | null = null;
-  let source: 'skrydex' | 'tcgplayer' | null = null;
+  let source: 'scrydex' | 'tcgplayer' | null = null;
 
-  // Attempt 1: Skrydex CDN (Pokémon only)
-  //  - Tries skrydex_set_id first, then falls back to set-name lookup
+  // Attempt 1: Scrydex CDN (Pokémon only)
+  //  - Tries scrydex_set_id first, then falls back to set-name lookup
   if (isPoke && card.card_number) {
     let scrydexUrl: string | null = null;
 
-    scrydexUrl = card.skrydex_set_id
-      ? buildSkrydexImageUrl(card.skrydex_set_id, card.card_number)
-      : (card.set_name ? buildSkrydexImageUrlFromSetName(card.set_name, card.card_number) : null);
+    scrydexUrl = card.scrydex_set_id
+      ? buildScrydexImageUrl(card.scrydex_set_id, card.card_number)
+      : (card.set_name ? buildScrydexImageUrlFromSetName(card.set_name, card.card_number) : null);
 
     if (scrydexUrl) {
       const fetched = await fetchImage(scrydexUrl);
@@ -153,10 +157,8 @@ async function mirrorCard(
             },
           });
           const r2Url = `${R2_PUBLIC_BASE}/cards/${card.tcgplayer_product_id}.${ext}`;
-          await db.prepare(
-            `UPDATE tcg_products SET image_url = ?, image_source = 'skrydex' WHERE tcgplayer_product_id = ?`
-          ).bind(r2Url, card.tcgplayer_product_id).run();
-          return 'skrydex';
+          await writeR2Image(db, card.tcgplayer_product_id, r2Url, 'scrydex');
+          return 'scrydex';
         } catch (e) {
           logger.warn('R2 put failed (scrydex)', { key, error: String(e) });
           // fall through to TCGPlayer
@@ -207,9 +209,7 @@ async function mirrorCard(
   }
 
   const r2Url = `${R2_PUBLIC_BASE}/${key}`;
-  await db.prepare(
-    `UPDATE tcg_products SET image_url = ?, image_source = 'tcgplayer' WHERE tcgplayer_product_id = ?`
-  ).bind(r2Url, card.tcgplayer_product_id).run();
+  await writeR2Image(db, card.tcgplayer_product_id, r2Url, 'tcgplayer');
 
   return source;
 }
@@ -224,38 +224,44 @@ export interface PendingCardRow {
   image_url:            string | null;
   card_number:          string | null;
   set_name:             string | null;
-  skrydex_set_id:       string | null;
+  scrydex_set_id:       string | null;
   category_name:        string | null;
 }
 
 /** Returns the next `limit` cards that still need mirroring.
- *  Pass `skrydexOnly = true` to restrict to Pokémon cards with a Skrydex set
+ *  Pass `scrydexOnly = true` to restrict to Pokémon cards with a Scrydex set
  *  mapping — useful to prioritise high-res images before TCGPlayer fallbacks. */
 export async function getPendingCards(
   db: D1Database,
   limit = 50,
-  skrydexOnly = false,
+  scrydexOnly = false,
 ): Promise<PendingCardRow[]> {
-  const extra = skrydexOnly
-    ? `AND s.skrydex_set_id IS NOT NULL
-       AND LOWER(REPLACE(c.name, 'é', 'e')) LIKE '%pokemon%'`
+  // Canonical (Session D): image state lives in product_images. "Needs mirroring" =
+  // never mirrored (no row / r2_url NULL with no source set) OR a TCGPlayer mirror
+  // that a Scrydex mapping can now upgrade. A source='scrydex' row with r2_url NULL
+  // (the One Piece/Gundam CDN-as-final case) is intentionally NOT eligible — this
+  // mirrors the old `image_source IS NULL OR (image_source='tcgplayer' AND ...)` rule.
+  const extra = scrydexOnly
+    ? `AND s.scrydex_expansion_id IS NOT NULL
+       AND LOWER(REPLACE(g.name, 'é', 'e')) LIKE '%pokemon%'`
     : '';
 
   const { results } = await db.prepare(`
     SELECT
       p.tcgplayer_product_id,
-      p.image_url,
-      p.card_number,
-      s.name          AS set_name,
-      s.skrydex_set_id,
-      c.name          AS category_name
-    FROM  tcg_products    p
-    JOIN  tcg_sets        s ON s.tcgplayer_group_id    = p.tcgplayer_group_id
-    JOIN  tcg_categories  c ON c.tcgplayer_category_id = s.tcgplayer_category_id
-    WHERE p.card_number IS NOT NULL
+      pi.source_url           AS image_url,
+      p.number                AS card_number,
+      s.name                  AS set_name,
+      s.scrydex_expansion_id  AS scrydex_set_id,
+      g.name                  AS category_name
+    FROM  products        p
+    JOIN  sets            s ON s.id = p.set_id
+    JOIN  canonical_games g ON g.id = s.game_id
+    LEFT JOIN product_images pi ON pi.product_id = p.id
+    WHERE p.number IS NOT NULL
       AND (
-        p.image_source IS NULL
-        OR (p.image_source = 'tcgplayer' AND s.skrydex_set_id IS NOT NULL)
+        (pi.r2_url IS NULL AND (pi.product_id IS NULL OR pi.source IS NULL))
+        OR (pi.source = 'tcgplayer' AND s.scrydex_expansion_id IS NOT NULL)
       )
       ${extra}
     LIMIT ?
@@ -273,7 +279,7 @@ export async function uploadCardImage(
   productId:   number,
   buffer:      ArrayBuffer,
   contentType: string,
-  source:      'skrydex' | 'tcgplayer',
+  source:      'scrydex' | 'tcgplayer',
 ): Promise<string> {
   const ext = extFromContentType(contentType);
   const key = `cards/${productId}.${ext}`;
@@ -284,9 +290,7 @@ export async function uploadCardImage(
     },
   });
   const r2Url = `${R2_PUBLIC_BASE}/${key}`;
-  await env.DB.prepare(
-    `UPDATE tcg_products SET image_url = ?, image_source = ? WHERE tcgplayer_product_id = ?`
-  ).bind(r2Url, source, productId).run();
+  await writeR2Image(env.DB, productId, r2Url, source);
   return r2Url;
 }
 
@@ -294,7 +298,7 @@ export interface MirrorJobResult {
   processed: number;
   mirrored: number;
   failed: number;
-  skrydex_hits: number;
+  scrydex_hits: number;
   tcgplayer_hits: number;
   duration_ms: number;
   has_more: boolean;  // true if more cards remain after this invocation's limit
@@ -305,7 +309,7 @@ export async function runMirrorJob(
   maxBatches = 1   // 1 for HTTP requests (fast response); Infinity for cron (run until done)
 ): Promise<MirrorJobResult> {
   const start = Date.now();
-  const stats: MirrorStats = { processed: 0, mirrored: 0, failed: 0, skrydex_hits: 0, tcgplayer_hits: 0 };
+  const stats: MirrorStats = { processed: 0, mirrored: 0, failed: 0, scrydex_hits: 0, tcgplayer_hits: 0 };
 
   logger.info('Image mirror job started', { maxBatches });
 
@@ -317,21 +321,22 @@ export async function runMirrorJob(
     const { results: batch } = await env.DB.prepare(`
       SELECT
         p.tcgplayer_product_id,
-        p.image_url,
-        p.card_number,
-        p.image_source,
-        s.name          AS set_name,
-        s.skrydex_set_id,
-        c.name          AS category_name
-      FROM  tcg_products    p
-      JOIN  tcg_sets        s ON s.tcgplayer_group_id    = p.tcgplayer_group_id
-      JOIN  tcg_categories  c ON c.tcgplayer_category_id = s.tcgplayer_category_id
-      WHERE p.card_number IS NOT NULL
+        pi.source_url           AS image_url,
+        p.number                AS card_number,
+        pi.source               AS image_source,
+        s.name                  AS set_name,
+        s.scrydex_expansion_id  AS scrydex_set_id,
+        g.name                  AS category_name
+      FROM  products        p
+      JOIN  sets            s ON s.id = p.set_id
+      JOIN  canonical_games g ON g.id = s.game_id
+      LEFT JOIN product_images pi ON pi.product_id = p.id
+      WHERE p.number IS NOT NULL
         AND (
-          -- Never mirrored yet
-          p.image_source IS NULL
-          -- Previously mirrored from TCGPlayer but a Skrydex mapping is now available
-          OR (p.image_source = 'tcgplayer' AND s.skrydex_set_id IS NOT NULL)
+          -- Never mirrored yet (no image row, or a row with no r2_url and no source set)
+          (pi.r2_url IS NULL AND (pi.product_id IS NULL OR pi.source IS NULL))
+          -- Previously mirrored from TCGPlayer but a Scrydex mapping is now available
+          OR (pi.source = 'tcgplayer' AND s.scrydex_expansion_id IS NOT NULL)
         )
       LIMIT ${BATCH_SIZE} OFFSET ?
     `).bind(offset).all<CardRow>();
@@ -352,7 +357,7 @@ export async function runMirrorJob(
           stats.failed++;
         } else {
           stats.mirrored++;
-          if (result === 'skrydex') stats.skrydex_hits++;
+          if (result === 'scrydex') stats.scrydex_hits++;
           else stats.tcgplayer_hits++;
         }
       }
@@ -389,13 +394,13 @@ export async function runMirrorJob(
 
   // Write log row
   await env.DB.prepare(`
-    INSERT INTO image_mirror_log (processed, mirrored, failed, skrydex_hits, tcgplayer_hits, duration_ms)
+    INSERT INTO image_mirror_log (processed, mirrored, failed, scrydex_hits, tcgplayer_hits, duration_ms)
     VALUES (?, ?, ?, ?, ?, ?)
   `).bind(
     stats.processed,
     stats.mirrored,
     stats.failed,
-    stats.skrydex_hits,
+    stats.scrydex_hits,
     stats.tcgplayer_hits,
     duration_ms,
   ).run();

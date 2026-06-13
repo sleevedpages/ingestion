@@ -1,7 +1,7 @@
 import type { TcgGroup, TcgProduct, TcgPrice } from '../types/tcgcsv.js';
 import type { TcgCategoryRow, TcgSetRow, TcgProductRow, TcgPriceRow } from '../types/db.js';
 import type { ResolvedCategory } from './categories.js';
-import { getSkrydexSetId } from '../lib/skrydexSets.js';
+import { getScrydexSetId } from '../lib/scrydexSets.js';
 
 function getExtendedValue(product: TcgProduct, fieldName: string): string | null {
   return (
@@ -9,6 +9,29 @@ function getExtendedValue(product: TcgProduct, fieldName: string): string | null
       (f) => f.name.toLowerCase() === fieldName.toLowerCase()
     )?.value ?? null
   );
+}
+
+/**
+ * Bump a TCGPlayer CDN card-image url from the low-res `_200w` thumbnail to the
+ * operator-verified `_in_1000x1000` high-res form, e.g.
+ *   https://tcgplayer-cdn.tcgplayer.com/product/243522_200w.jpg
+ *     -> https://tcgplayer-cdn.tcgplayer.com/product/243522_in_1000x1000.jpg
+ *
+ * This is the *fallback* image (product_images.source_url) — the only image source
+ * for TCGPlayer-only games (One Piece, Gundam) that have no Scrydex coverage. The
+ * `_in_1000x1000` variant returns HTTP 200 with a real image; `_1000x1000` (without
+ * the `_in_` infix) is access-denied — do NOT use it. TCGPlayer's high-res alt-art /
+ * variant images carry a "SAMPLE" watermark; that is a TCGPlayer artifact, not a bug,
+ * and a watermarked 1000x1000 still beats a clean 200px thumbnail. These images are
+ * deliberately NOT mirrored into R2 (see the size-guard comment in image-mirror.ts).
+ *
+ * Only rewrites tcgplayer-cdn.tcgplayer.com urls; any other host (e.g. the Scrydex
+ * CDN) and any non-`_200w` form is returned unchanged.
+ */
+export function bumpTcgplayerImageRes(url: string | null | undefined): string | null {
+  if (!url) return null;
+  if (!url.includes('tcgplayer-cdn.tcgplayer.com')) return url;
+  return url.replace(/_200w(\.[A-Za-z0-9]+)/, '_in_1000x1000$1');
 }
 
 /**
@@ -51,7 +74,7 @@ export function transformGroup(
     published_on:  group.publishedOn ? new Date(group.publishedOn) : null,
     modified_on:   group.modifiedOn ?? null,
     is_supplemental: group.isSupplemental,
-    skrydex_set_id: getSkrydexSetId(group.name),
+    scrydex_set_id: getScrydexSetId(group.name),
     synced_at:     now,
   };
 }
@@ -66,7 +89,7 @@ export function transformProduct(
     tcgplayer_category_id: product.categoryId,
     name:          product.name,
     clean_name:    product.cleanName ?? null,
-    image_url:     product.imageUrl ?? null,
+    image_url:     bumpTcgplayerImageRes(product.imageUrl),
     tcgplayer_url: product.url ?? null,
     modified_on:   product.modifiedOn ?? null,
     image_count:   product.imageCount ?? null,

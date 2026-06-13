@@ -1,9 +1,9 @@
-import { getSkrydexSetId } from './skrydexSets.js';
+import { getScrydexSetId } from './scrydexSets.js';
 
 // ─── Pokémon ─────────────────────────────────────────────────────────────────
 
 /**
- * Formats a TCGPlayer card_number for use in a Pokémon Skrydex URL.
+ * Formats a TCGPlayer card_number for use in a Pokémon Scrydex URL.
  *
  * Rules:
  *  - Strip "/total" suffix  (e.g. "025/165" → "025")
@@ -15,7 +15,7 @@ import { getSkrydexSetId } from './skrydexSets.js';
  *  - Pure numeric cards: strip leading zeros
  *      e.g. "025" → "25",  "001" → "1"
  */
-export function formatSkrydexCardNumber(cardNumber: string): string {
+export function formatScrydexCardNumber(cardNumber: string): string {
   if (!cardNumber) return cardNumber
 
   const base = cardNumber.split('/')[0].trim()
@@ -26,7 +26,7 @@ export function formatSkrydexCardNumber(cardNumber: string): string {
   if (galleryMatch) {
     const prefix = galleryMatch[1].toUpperCase()
     const digits = galleryMatch[2]
-    // Only TG and GG use 2-digit padding on Skrydex.
+    // Only TG and GG use 2-digit padding on Scrydex.
     // RC (Radiant Collection), SV, PR and others use the raw number.
     const padded = (prefix === 'TG' || prefix === 'GG') && digits.length < 2
       ? digits.padStart(2, '0')
@@ -43,29 +43,29 @@ export function formatSkrydexCardNumber(cardNumber: string): string {
 }
 
 /**
- * Builds the Skrydex image URL for a Pokémon card.
+ * Builds the Scrydex image URL for a Pokémon card.
  * Returns null if either argument is falsy.
  */
-export function buildSkrydexImageUrl(
-  skrydexSetId: string,
+export function buildScrydexImageUrl(
+  scrydexSetId: string,
   cardNumber: string
 ): string | null {
-  if (!skrydexSetId || !cardNumber) return null
-  const num = formatSkrydexCardNumber(cardNumber)
-  return `https://images.scrydex.com/pokemon/${skrydexSetId}-${num}/large`
+  if (!scrydexSetId || !cardNumber) return null
+  const num = formatScrydexCardNumber(cardNumber)
+  return `https://images.scrydex.com/pokemon/${scrydexSetId}-${num}/large`
 }
 
 /**
- * Convenience: resolves skrydexSetId from the TCGPlayer set name first.
+ * Convenience: resolves scrydexSetId from the TCGPlayer set name first.
  * Returns null if the set name is not in our map.
  */
-export function buildSkrydexImageUrlFromSetName(
+export function buildScrydexImageUrlFromSetName(
   setName: string,
   cardNumber: string
 ): string | null {
-  const setId = getSkrydexSetId(setName)
+  const setId = getScrydexSetId(setName)
   if (!setId) return null
-  return buildSkrydexImageUrl(setId, cardNumber)
+  return buildScrydexImageUrl(setId, cardNumber)
 }
 
 // One Piece Scrydex support is pending — alternate card versions use unique

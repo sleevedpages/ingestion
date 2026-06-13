@@ -5,6 +5,7 @@ import type {
   TcgPriceRow,
   SyncStatus,
 } from '../types/db.js';
+import { sourceUrlUpsertByProductId } from '../lib/productImages.js';
 
 // D1 batch() is limited to 100 statements per call
 const BATCH_SIZE = 100;
@@ -21,9 +22,29 @@ function iso(d: Date): string {
   return d.toISOString();
 }
 
+// Canonical prices.fetched_at is unix epoch seconds (the old tcg_prices.synced_at was ISO text).
+function unix(d: Date): number {
+  return Math.floor(d.getTime() / 1000);
+}
+
+// ===========================================================================
+// CANONICAL WRITERS (Session D)
 // ---------------------------------------------------------------------------
-// Category
+// The worker now writes the canonical model (canonical_games / sets / products /
+// prices) instead of the old tcg_* tables. Each canonical table mints its own
+// AUTOINCREMENT `id`; FKs are resolved by sub-select on the external UNIQUE keys
+// (tcgplayer_category_id / tcgplayer_group_id / tcgplayer_product_id). The old
+// tcg_* tables are intentionally left in place (rollback path; dropped in the
+// final rebuild session). See Ingestion/INGESTION_AUDIT.md §2 / §8a.
+// ===========================================================================
+
 // ---------------------------------------------------------------------------
+// Category -> canonical_games  (W1; resolve/mint by tcgplayer_category_id)
+// ---------------------------------------------------------------------------
+// Drops display_name/modified_on/image_url/seo_text/is_direct_brand (no canonical
+// home). Does NOT write card_back_url — that column is owned by the app `games`
+// table, not TCGCSV. is_active uses the table default (1) on insert and is
+// preserved on conflict.
 
 export async function upsertCategory(
   db: D1Database,
@@ -31,29 +52,12 @@ export async function upsertCategory(
 ): Promise<void> {
   await db
     .prepare(
-      `INSERT INTO tcg_categories
-         (tcgplayer_category_id, name, display_name, modified_on,
-          image_url, seo_text, is_direct_brand, synced_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO canonical_games (name, tcgplayer_category_id)
+       VALUES (?, ?)
        ON CONFLICT (tcgplayer_category_id) DO UPDATE SET
-         name           = excluded.name,
-         display_name   = excluded.display_name,
-         modified_on    = excluded.modified_on,
-         image_url      = excluded.image_url,
-         seo_text       = excluded.seo_text,
-         is_direct_brand = excluded.is_direct_brand,
-         synced_at      = excluded.synced_at`
+         name = excluded.name`
     )
-    .bind(
-      row.tcgplayer_category_id,
-      row.name,
-      row.display_name,
-      row.modified_on,
-      row.image_url,
-      row.seo_text,
-      row.is_direct_brand,
-      iso(row.synced_at)
-    )
+    .bind(row.name, row.tcgplayer_category_id)
     .run();
 }
 
@@ -61,32 +65,34 @@ export async function upsertCategory(
 // Set
 // ---------------------------------------------------------------------------
 
+// Set -> sets  (W2; resolve/mint by tcgplayer_group_id)
+// game_id resolves canonical_games.id from the category (the orchestrator upserts
+// canonical_games before any set, so the sub-select always resolves).
+// code<-abbreviation, release_date<-published_on, scrydex_expansion_id<-scrydex_set_id.
+// Replicates the preserve-on-conflict COALESCE for scrydex_expansion_id so a
+// manually/weekly-set mapping (W12) is never clobbered by a null from TCGCSV.
+// Drops modified_on / is_supplemental (no canonical home).
 const SET_SQL = `
-  INSERT INTO tcg_sets
-    (tcgplayer_group_id, tcgplayer_category_id, name, abbreviation,
-     published_on, modified_on, is_supplemental, skrydex_set_id, synced_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO sets
+    (game_id, name, code, release_date, tcgplayer_group_id, scrydex_expansion_id)
+  VALUES (
+    (SELECT id FROM canonical_games WHERE tcgplayer_category_id = ?),
+    ?, ?, ?, ?, ?)
   ON CONFLICT (tcgplayer_group_id) DO UPDATE SET
-    tcgplayer_category_id = excluded.tcgplayer_category_id,
-    name                  = excluded.name,
-    abbreviation          = excluded.abbreviation,
-    published_on          = excluded.published_on,
-    modified_on           = excluded.modified_on,
-    is_supplemental       = excluded.is_supplemental,
-    skrydex_set_id        = COALESCE(tcg_sets.skrydex_set_id, excluded.skrydex_set_id),
-    synced_at             = excluded.synced_at`;
+    game_id              = excluded.game_id,
+    name                 = excluded.name,
+    code                 = excluded.code,
+    release_date         = excluded.release_date,
+    scrydex_expansion_id = COALESCE(sets.scrydex_expansion_id, excluded.scrydex_expansion_id)`;
 
 function bindSet(db: D1Database, row: TcgSetRow) {
   return db.prepare(SET_SQL).bind(
-    row.tcgplayer_group_id,
     row.tcgplayer_category_id,
     row.name,
     row.abbreviation,
     row.published_on ? iso(row.published_on) : null,
-    row.modified_on,
-    row.is_supplemental ? 1 : 0,
-    row.skrydex_set_id ?? null,
-    iso(row.synced_at)
+    row.tcgplayer_group_id,
+    row.scrydex_set_id ?? null
   );
 }
 
@@ -108,32 +114,35 @@ export async function upsertSetsBatch(
 // Products — bulk upsert via batch()
 // ---------------------------------------------------------------------------
 
+// Product -> products  (W3; resolve/mint by tcgplayer_product_id)
+// set_id resolves sets.id from the group (sets are batch-upserted before any
+// group's products run). number<-card_number; product_kind derived from isCard()
+// (a card has a Number or Rarity -> here: card_number or rarity present).
+// Leaves variant_kind / finish / scrydex_card_id untouched (NULL — Session D-bis).
+// products carries no image column: the TCGPlayer original image url is relocated to
+// product_images.source_url by upsertProductSourceImages() (called right after this in
+// processGroupInline). Drops clean_name / tcgplayer_url / modified_on / image_count /
+// presale_info / extended_data (no canonical home).
 const PRODUCT_SQL = `
-  INSERT INTO tcg_products
-    (tcgplayer_product_id, tcgplayer_group_id, tcgplayer_category_id,
-     name, clean_name, image_url, tcgplayer_url, modified_on, image_count,
-     presale_info, card_number, rarity, extended_data, synced_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO products
+    (set_id, name, number, rarity, product_kind, tcgplayer_product_id)
+  VALUES (
+    (SELECT id FROM sets WHERE tcgplayer_group_id = ?),
+    ?, ?, ?, ?, ?)
   ON CONFLICT (tcgplayer_product_id) DO UPDATE SET
-    tcgplayer_group_id    = excluded.tcgplayer_group_id,
-    tcgplayer_category_id = excluded.tcgplayer_category_id,
-    name                  = excluded.name,
-    clean_name            = excluded.clean_name,
-    -- Preserve the R2-mirrored URL if one has been stored; only update from
-    -- TCGPlayer when the image has never been mirrored (image_source IS NULL).
-    image_url             = CASE
-                              WHEN tcg_products.image_source IS NOT NULL
-                              THEN tcg_products.image_url
-                              ELSE excluded.image_url
-                            END,
-    tcgplayer_url         = excluded.tcgplayer_url,
-    modified_on           = excluded.modified_on,
-    image_count           = excluded.image_count,
-    presale_info          = excluded.presale_info,
-    card_number           = excluded.card_number,
-    rarity                = excluded.rarity,
-    extended_data         = excluded.extended_data,
-    synced_at             = excluded.synced_at`;
+    set_id       = excluded.set_id,
+    name         = excluded.name,
+    number       = excluded.number,
+    rarity       = excluded.rarity,
+    product_kind = excluded.product_kind`;
+
+// Derive product_kind without re-reading extendedData: transformProduct already
+// extracted card_number (extendedData "Number") and rarity (extendedData "Rarity"),
+// and isCard() == (has Number OR Rarity). So a row with either field present is a
+// 'card'; everything else (sealed product, accessories) is 'sealed'.
+function productKind(row: TcgProductRow): 'card' | 'sealed' {
+  return row.card_number != null || row.rarity != null ? 'card' : 'sealed';
+}
 
 export async function upsertProducts(
   db: D1Database,
@@ -144,20 +153,12 @@ export async function upsertProducts(
     await db.batch(
       batch.map((r) =>
         db.prepare(PRODUCT_SQL).bind(
-          r.tcgplayer_product_id,
           r.tcgplayer_group_id,
-          r.tcgplayer_category_id,
           r.name,
-          r.clean_name,
-          r.image_url,
-          r.tcgplayer_url,
-          r.modified_on,
-          r.image_count,
-          r.presale_info,
           r.card_number,
           r.rarity,
-          JSON.stringify(r.extended_data),
-          iso(r.synced_at)
+          productKind(r),
+          r.tcgplayer_product_id
         )
       )
     );
@@ -165,22 +166,52 @@ export async function upsertProducts(
   return rows.length;
 }
 
+// TCGCSV product image -> product_images.source_url  (relocates the old
+// tcg_products.image_url write — canonical `products` has no image column).
+// This is the TCGPlayer ORIGINAL CDN url; the R2 mirror later fetches it and writes
+// product_images.r2_url. `source` is left NULL here (pre-mirror) so the row stays
+// mirror-eligible (the re-mirror predicate treats r2_url NULL + source NULL as
+// "never mirrored"). The merge-upsert never touches r2_url, so an already-mirrored
+// row keeps its R2 url + source. MUST run AFTER upsertProducts (resolves products.id
+// by tcgplayer_product_id via INSERT ... SELECT — an unresolved product writes 0 rows).
+export async function upsertProductSourceImages(
+  db: D1Database,
+  rows: TcgProductRow[]
+): Promise<void> {
+  const withImage = rows.filter((r) => r.image_url);
+  if (withImage.length === 0) return;
+  for (const batch of chunk(withImage, BATCH_SIZE)) {
+    await db.batch(
+      batch.map((r) =>
+        sourceUrlUpsertByProductId(db, r.tcgplayer_product_id, r.image_url as string, null)
+      )
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Prices — bulk upsert via batch()
 // ---------------------------------------------------------------------------
 
+// Price -> prices  (W4; source='tcgplayer'; resolve product_id by tcgplayer_product_id)
+// finish<-sub_type_name; condition/grade NULL (TCGPlayer market prices are not
+// per-condition); value<-market_price (canonical value is market-only — low/mid/
+// high/direct_low are dropped). fetched_at<-synced_at as unix epoch.
+// Conflict target is the uq_prices_identity expression index
+// (product_id, source, COALESCE(condition,''), COALESCE(finish,''), COALESCE(grade,'')).
+// REQUIRES products for these rows to already exist (the orchestrator/consumer now
+// upserts products BEFORE prices — see processGroupInline). A NULL product_id from
+// an unresolved sub-select would violate the NOT NULL FK; the sequencing guarantees it.
 const PRICE_SQL = `
-  INSERT INTO tcg_prices
-    (tcgplayer_product_id, sub_type_name, low_price, mid_price,
-     high_price, market_price, direct_low_price, synced_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  ON CONFLICT (tcgplayer_product_id, sub_type_name) DO UPDATE SET
-    low_price        = excluded.low_price,
-    mid_price        = excluded.mid_price,
-    high_price       = excluded.high_price,
-    market_price     = excluded.market_price,
-    direct_low_price = excluded.direct_low_price,
-    synced_at        = excluded.synced_at`;
+  INSERT INTO prices
+    (product_id, source, condition, finish, grade, value, fetched_at)
+  VALUES (
+    (SELECT id FROM products WHERE tcgplayer_product_id = ?),
+    'tcgplayer', NULL, ?, NULL, ?, ?)
+  ON CONFLICT (product_id, source, COALESCE(condition,''), COALESCE(finish,''), COALESCE(grade,''))
+  DO UPDATE SET
+    value      = excluded.value,
+    fetched_at = excluded.fetched_at`;
 
 export async function upsertPrices(
   db: D1Database,
@@ -193,12 +224,8 @@ export async function upsertPrices(
         db.prepare(PRICE_SQL).bind(
           r.tcgplayer_product_id,
           r.sub_type_name,
-          r.low_price,
-          r.mid_price,
-          r.high_price,
           r.market_price,
-          r.direct_low_price,
-          iso(r.synced_at)
+          unix(r.synced_at)
         )
       )
     );

@@ -3,10 +3,10 @@
  *
  * Runs weekly alongside the image mirror job (Sunday 3 AM UTC).
  * Fetches Scrydex's expansion list for each supported game and updates
- * `tcg_sets.skrydex_set_id` for any sets not yet mapped.
+ * `tcg_sets.scrydex_set_id` for any sets not yet mapped.
  *
  * This enables:
- * - Price matching in scrydexProcessor (matches on skrydex_set_id OR abbreviation)
+ * - Price matching in scrydexProcessor (matches on scrydex_set_id OR abbreviation)
  * - Image mirroring for non-Pokémon games once Scrydex CDN support is added
  *
  * Cost: 1 credit per game (6 games = 6 credits per weekly run).
@@ -78,13 +78,14 @@ export async function syncScrydexSetMappings(env: Env): Promise<SyncResult> {
         }
       }
 
-      // Fetch our tcg_sets for this game
+      // Fetch our canonical sets for this game (Session D: sets/canonical_games).
+      // Aliases keep the downstream field names (abbreviation / scrydex_set_id) stable.
       const gameWord = game.categoryName.split(' ')[0]
       const { results: ourSets } = await env.DB.prepare(`
-        SELECT s.id, s.name, s.abbreviation, s.skrydex_set_id
-        FROM   tcg_sets s
-        JOIN   tcg_categories c ON s.tcgplayer_category_id = c.tcgplayer_category_id
-        WHERE  LOWER(c.name) LIKE LOWER(?)
+        SELECT s.id, s.name, s.code AS abbreviation, s.scrydex_expansion_id AS scrydex_set_id
+        FROM   sets s
+        JOIN   canonical_games g ON g.id = s.game_id
+        WHERE  LOWER(g.name) LIKE LOWER(?)
       `).bind(`%${gameWord}%`).all()
 
       const updates: D1PreparedStatement[] = []
@@ -99,12 +100,12 @@ export async function syncScrydexSetMappings(env: Env): Promise<SyncResult> {
           scrydexId = byName.get(norm)
         }
 
-        if (scrydexId && scrydexId !== set.skrydex_set_id) {
+        if (scrydexId && scrydexId !== set.scrydex_set_id) {
           updates.push(
-            env.DB.prepare('UPDATE tcg_sets SET skrydex_set_id = ? WHERE id = ?')
+            env.DB.prepare('UPDATE sets SET scrydex_expansion_id = ? WHERE id = ?')
               .bind(scrydexId, set.id)
           )
-          if (set.skrydex_set_id) {
+          if (set.scrydex_set_id) {
             result.updated++
           } else {
             result.mapped++
@@ -128,13 +129,13 @@ export async function syncScrydexSetMappings(env: Env): Promise<SyncResult> {
       if (VARIANT_IMAGE_CATEGORY_NAMES.has(game.categoryName)) {
         try {
           const { results: variantRows } = await env.DB.prepare(`
-            SELECT p.card_number, COUNT(*) AS variant_count
-            FROM   tcg_products p
-            JOIN   tcg_sets        s ON s.tcgplayer_group_id    = p.tcgplayer_group_id
-            JOIN   tcg_categories  c ON c.tcgplayer_category_id = s.tcgplayer_category_id
-            WHERE  c.name = ?
-            AND    p.card_number IS NOT NULL
-            GROUP  BY s.tcgplayer_group_id, p.card_number
+            SELECT p.number AS card_number, COUNT(*) AS variant_count
+            FROM   products p
+            JOIN   sets            s ON s.id = p.set_id
+            JOIN   canonical_games g ON g.id = s.game_id
+            WHERE  g.name = ?
+            AND    p.number IS NOT NULL
+            GROUP  BY s.id, p.number
             HAVING COUNT(*) > 1
           `).bind(game.categoryName).all()
 
