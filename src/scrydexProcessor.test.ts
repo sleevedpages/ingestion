@@ -300,3 +300,74 @@ describe('ScrydexFetchError', () => {
     expect(e.name).toBe('ScrydexFetchError')
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Structured audit line (Part B, §4 #8) — one machine-parseable JSON record per run
+// carrying the credit-consumption fields (rows_in, distinct_expansions, fetches_made,
+// fetches_skipped_fresh, …) so a drain is measurable from logs.
+// ─────────────────────────────────────────────────────────────────────────────
+function findAuditLine(spy: ReturnType<typeof vi.spyOn>): any | null {
+  for (const call of spy.mock.calls) {
+    const arg = call[0]
+    if (typeof arg !== 'string') continue
+    try { const o = JSON.parse(arg); if (o?.log === 'scrydex_drain_audit') return o } catch { /* not json */ }
+  }
+  return null
+}
+
+describe('processPendingWebhooks — structured drain audit log', () => {
+  it('emits the audit fields and quantifies the dedup collapse (5 rows / 1 expansion → 1 fetch)', async () => {
+    const card = {
+      number: '25',
+      variants: [{
+        name: 'normal',
+        marketplaces: [{ name: 'tcgplayer', product_id: '999' }],
+        prices: [{ type: 'raw', condition: 'NM', market: 1.5, trends: {} }],
+      }],
+    }
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ data: [card] }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    const rows = [1, 2, 3, 4, 5].map(id => ({ id, event_name: 'pokemon.prices.raw', expansion_ids_json: '["exp1"]' }))
+    const db = makeFakeDB({
+      first: webhookFirstRouter,
+      all: (sql) => sql.includes("status = 'pending'") ? rows : [],
+    })
+    await processPendingWebhooks({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any)
+
+    const audit = findAuditLine(logSpy)
+    expect(audit).not.toBeNull()
+    expect(audit.rows_in).toBe(5)
+    expect(audit.distinct_expansions).toBe(1)
+    expect(audit.fetches_made).toBe(1)
+    expect(audit.fetches_skipped_fresh).toBe(0)
+    expect(audit.expansions_fetched).toBe(1)
+    expect(audit.rows_completed).toBe(5)
+    expect(audit.rows_left_pending).toBe(0)
+    expect(audit.circuit_broken).toBe(false)
+    // Per-game credit velocity: the single Pokémon expansion fetch = 1 credit.
+    expect(audit.credits_by_game).toEqual({ pokemon: 1 })
+  })
+
+  it('reports fresh-skips with no fetch in the audit line', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    const db = makeFakeDB({
+      first: (sql) => sql.includes('scrydex_expansion_freshness') ? { 1: 1 } : webhookFirstRouter(sql),
+      all: pendingAll,
+    })
+    await processPendingWebhooks({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any)
+
+    const audit = findAuditLine(logSpy)
+    expect(audit).not.toBeNull()
+    expect(audit.distinct_expansions).toBe(1)
+    expect(audit.fetches_made).toBe(0)
+    expect(audit.fetches_skipped_fresh).toBe(1)
+    expect(audit.expansions_fetched).toBe(0)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+})

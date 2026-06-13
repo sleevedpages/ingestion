@@ -161,7 +161,7 @@ export function extractTrends(trends: unknown): CanonicalTrends {
  * expansion + priceType written within maxAgeSeconds. (Session D: reads the
  * dedicated side table instead of the dropped scrydex_prices columns.)
  */
-async function isExpansionFresh(
+export async function isExpansionFresh(
   db:            D1Database,
   expansionId:   string,
   priceType:     string,
@@ -178,7 +178,7 @@ async function isExpansionFresh(
 }
 
 /** Records a successful expansion upsert in the freshness side table. */
-async function markExpansionFresh(
+export async function markExpansionFresh(
   db:          D1Database,
   expansionId: string,
   priceType:   string,
@@ -322,9 +322,12 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
   }
 
   // ── Process distinct expansions (one fetch each) ──────────────────────────────
-  let totalFetches = 0
-  let skippedFresh = 0
+  let totalFetches = 0            // Scrydex page-calls (= credits) made this run
+  let skippedFresh = 0            // expansions inside the freshness window (no API call)
+  let expansionsFetched = 0       // distinct expansions we actually fetched live
   let circuitBroken = false
+  // Per-game credit velocity (page-calls) — confirms which game dominates a run.
+  const creditsByGame: Record<string, number> = {}
 
   for (const [key, wi] of workItems) {
     if (circuitBroken) break
@@ -342,6 +345,8 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
     try {
       const { cards, requests } = await fetchExpansionCards(env, wi.gameSlug, wi.expansionId, true)
       totalFetches += requests
+      expansionsFetched++
+      creditsByGame[wi.gameSlug] = (creditsByGame[wi.gameSlug] ?? 0) + requests
 
       const allUpserts: D1PreparedStatement[] = []
       for (const card of cards) {
@@ -379,6 +384,26 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
     `[ScrydexProcessor] daily drain complete — ${totalFetches} fetches, ${skippedFresh} fresh-skipped, ` +
     `${leftoverRows} rows left pending` + (circuitBroken ? ' (circuit-broken)' : '')
   )
+
+  // Structured audit line (Part B, §4 #8) — one machine-parseable JSON record per run so
+  // credit consumption is measurable from `wrangler tail` / Logpush without scraping prose.
+  // `rows_in` vs `distinct_expansions` quantifies the dedup collapse; `fetches_made`
+  // (page-calls = credits) vs `fetches_skipped_fresh` shows the freshness savings;
+  // `credits_by_game` confirms the measured Pokémon concentration.
+  console.log(JSON.stringify({
+    log:                   'scrydex_drain_audit',
+    rows_in:               pending.results.length,
+    distinct_expansions:   workItems.size,
+    expansions_fetched:    expansionsFetched,
+    fetches_made:          totalFetches,
+    fetches_skipped_fresh: skippedFresh,
+    rows_completed:        pending.results.length - leftoverRows,
+    rows_left_pending:     leftoverRows,
+    circuit_broken:        circuitBroken,
+    max_fetches:           maxFetches,
+    freshness_hours:       freshnessHours,
+    credits_by_game:       creditsByGame,
+  }))
 }
 
 // ─── Scrydex API ──────────────────────────────────────────────────────────────

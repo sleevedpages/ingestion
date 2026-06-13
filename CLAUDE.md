@@ -121,6 +121,7 @@ The `0 3 * * SUN` and `0 4 * * *` (Scrydex) crons are not registered in the UAT 
 | `POST` | `/scrydex/process` | `x-worker-secret` | Process pending webhook log rows |
 | `POST` | `/scrydex/sync-sets` | `x-worker-secret` | Pull Scrydex expansion catalog → update `scrydex_set_id` |
 | `POST` | `/scrydex/sync-images` | `x-worker-secret` | Write Scrydex image URLs + capture variant fields to canonical `products`/`product_images` |
+| `POST` | `/scrydex/sync-set` | `x-worker-secret` | **Blocking** per-set sync — body `{ setId \| scrydexExpansionId, force? }`; fetches that set's expansion ONCE and writes canonical prices (raw+graded) + images for it; credit-guarded; skips when both price types are fresh (unless `force`); marks the expansion fresh on success; returns `{ ok, skipped?, cardsFetched, pricesUpserted, imagesUpdated, variantsMatched, variantsConflicted, requests }`. See **Per-Set Sync** below. |
 | `POST` | `/scrydex/refresh-card` | `x-worker-secret` | **Blocking** vendor on-demand refresh — body `{ product_id }`; fetches the expansion but upserts raw+graded prices for **only the target card** (matched by `tcgplayer_product_id`/number), does NOT mark the expansion fresh; returns `{ ok, pricesUpserted, requests }` |
 
 Scrydex endpoints are called from the Admin panel via Content app proxy (`POST /api/admin/scrydex/trigger`). Direct calls require `x-worker-secret: <INGESTION_WORKER_SECRET>` header.
@@ -331,7 +332,66 @@ panel (`/api/admin/variant-conflicts`), where reassigning a conflict applies its
 | `POST` | `/scrydex/process` | Process pending webhook log rows |
 | `POST` | `/scrydex/sync-sets` | Pull Scrydex expansion catalog → update `scrydex_set_id` |
 | `POST` | `/scrydex/sync-images` | Write Scrydex image URLs + capture variant fields to canonical `products`/`product_images`; route collisions to `variant_ingest_conflicts` |
+| `POST` | `/scrydex/sync-set` | **Blocking** per-set sync (cards + prices + images for one expansion); see **Per-Set Sync** |
 | `POST` | `/admin/seed-variant-products` | Mint per-variant canonical `products` rows (+ capture + images + conflict routing) |
+
+### Per-Set Sync (`src/scrydexSyncSet.ts` — `POST /scrydex/sync-set`)
+
+On-demand sync of a **single set** (cards + prices + images for that set's Scrydex
+expansion) so the operator can bulk-update one set without a full-game sync. **Blocking** —
+returns the result counts so the Admin UI can show them.
+
+- **Input:** `{ setId | scrydexExpansionId, force? }`. `setId` = canonical `sets.id`;
+  `scrydexExpansionId` = `sets.scrydex_expansion_id` (e.g. `sv08`, `OP09`). When several
+  canonical sets share one expansion id, the lowest `sets.id` is resolved — the single
+  expansion fetch covers them all.
+- **Reuses the existing machinery (no new fetch/writer logic):** `fetchAllExpansionCards()`
+  (q=expansion.id + page/pageSize) for ONE paginated fetch; `buildPriceUpserts()` for
+  canonical `prices` (raw + graded, source='scrydex', R1 product_id → R2 number fallback);
+  the `variantCapture` + `productImages` helpers for canonical `products` capture +
+  `product_images` (OP/Gundam per-variant capture + conflict routing; all other games
+  card-level image by group+number). **CANONICAL ONLY** — no `tcg_*` writes (those tables
+  were DROPPED in migration 0066).
+- **Credit-guarded** (via `scrydexFetch`'s monthly guard) + 403 circuit breaker. Respects
+  `SCRYDEX_MONTHLY_LIMIT`.
+- **Freshness / resumability:** skips when BOTH `raw` and `graded` are inside the freshness
+  window (`scrydex_expansion_freshness`), unless `force:true`. Marks the expansion fresh for
+  **both** price types on success, so the next daily drain dedups it away.
+- **Returns:** `{ ok, skipped?, setId, setName, scrydexExpansionId, game, cardsFetched,
+  pricesUpserted, imagesUpdated, variantsMatched, variantsConflicted, variantsUnmatched,
+  requests }`. Emits a structured `{"log":"scrydex_sync_set",…}` line.
+- **Admin UI:** Content **Admin → Image Audit → "Sync a Single Set"** (game → set picker;
+  only sets with a Scrydex expansion are listed; a Force checkbox). Proxied admin-only via
+  Content `POST /api/admin/scrydex/sync-set` (`data.userId === ADMIN_USER_ID` +
+  `INGESTION_WORKER_SECRET`).
+- **Local invocation** (direct, requires the secret):
+  ```bash
+  curl -X POST "$INGESTION_WORKER_URL/scrydex/sync-set" \
+    -H "x-worker-secret: $INGESTION_WORKER_SECRET" -H 'content-type: application/json' \
+    -d '{"scrydexExpansionId":"sv08","force":true}'
+  # or by canonical set id:  -d '{"setId":5}'
+  ```
+- Tests: `src/scrydexSyncSet.test.ts` (happy path → canonical writes + freshness marked;
+  set-not-found; fresh-skip; force bypass; credit-guard short-circuit).
+
+### Drain credit audit (`processPendingWebhooks` — §4 #8, measure-first)
+
+The daily drain emits a structured audit line each run for credit observability (parse from
+`wrangler tail` / Logpush):
+```json
+{"log":"scrydex_drain_audit","rows_in":N,"distinct_expansions":M,"expansions_fetched":F,
+ "fetches_made":C,"fetches_skipped_fresh":S,"rows_completed":...,"rows_left_pending":...,
+ "circuit_broken":false,"max_fetches":1500,"freshness_hours":20,"credits_by_game":{"pokemon":C}}
+```
+`rows_in` vs `distinct_expansions` quantifies the **dedup collapse** (M webhook rows → 1 fetch
+per distinct `(gameSlug, priceType, expansion)`); `fetches_made` (page-calls = credits) vs
+`fetches_skipped_fresh` shows the freshness savings; `credits_by_game` confirms the measured
+Pokémon concentration. The `SCRYDEX_DRAIN_MAX_FETCHES` bound and the `freshnessSafeForDrain()`
+<24h invariant were **audited and confirmed correct** (no code change needed beyond the log).
+**Measured velocity** (pre-existing analysis): card-fetch calls were dominated by **Pokémon
+(~3,426, ~80%)** before the daily batch; with daily dedup a run's `fetches_made` is bounded by
+the number of distinct volatile expansions, not webhook volume — read the live per-run figure
+from `credits_by_game` in the audit line.
 
 ## Environment Variables
 | Var | Default | Purpose |

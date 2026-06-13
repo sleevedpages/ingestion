@@ -1,6 +1,7 @@
 import { runIngestion, processGroupMessage, type IngestionConfig, type SyncGroupMessage } from './ingestion/index.js';
 import { runMirrorJob, getPendingCards, uploadCardImage } from './image-mirror.js';
 import { processPendingWebhooks, refreshCardPrices } from './scrydexProcessor.js';
+import { syncSingleSet } from './scrydexSyncSet.js';
 import { syncScrydexSetMappings } from './scrydexSetMapping.js';
 import { syncScrydexImages } from './scrydexImageSync.js';
 import { cleanupScrydexApiLog } from './lib/scrydexClient.js';
@@ -109,6 +110,24 @@ export default {
           )
         );
         return json({ ok: true, message: game ? `Scrydex image sync started for ${game}` : 'Scrydex image sync started' });
+      }
+
+      // Per-set Scrydex sync — BLOCKING (returns inserted/updated/variant counts so the
+      // admin UI can show the result). Body: { setId | scrydexExpansionId, force? }.
+      // One expansion fetch + canonical price/image writes; credit-guarded; marks the
+      // expansion fresh on success (resumable). See scrydexSyncSet.ts.
+      if (pathname === '/scrydex/sync-set') {
+        const body = await request.json().catch(() => ({})) as { setId?: number | string; scrydexExpansionId?: string; force?: boolean };
+        const setId = body.setId != null && body.setId !== '' ? Number(body.setId) : undefined;
+        const scrydexExpansionId = body.scrydexExpansionId ? String(body.scrydexExpansionId) : undefined;
+        if (setId == null && !scrydexExpansionId) {
+          return json({ ok: false, error: 'setId or scrydexExpansionId is required' }, 400);
+        }
+        if (setId != null && !Number.isInteger(setId)) {
+          return json({ ok: false, error: 'setId must be an integer' }, 400);
+        }
+        const result = await syncSingleSet(env, { setId, scrydexExpansionId, force: !!body.force });
+        return json(result, result.ok ? 200 : 502);
       }
 
       // Vendor on-demand single-card refresh — BLOCKING (returns the fresh result).
