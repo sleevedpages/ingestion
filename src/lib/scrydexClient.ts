@@ -12,6 +12,7 @@ import type { Env } from '../worker.js'
 
 const SCRYDEX_BASE             = 'https://api.scrydex.com'
 const DEFAULT_MONTHLY_LIMIT    = 5000
+const VISION_CREDITS           = 5   // Scrydex Vision is a premium endpoint — 5 credits/request
 
 export class ScrydexCreditLimitError extends Error {
   constructor() {
@@ -117,6 +118,81 @@ export async function scrydexFetch(
   } catch {
     // non-blocking — a logging failure must never prevent the response from returning
   }
+
+  return response
+}
+
+/**
+ * Scrydex Vision — identify a card from an image (POST /vision/v1/cards/identify).
+ *
+ * A premium endpoint billed at VISION_CREDITS (5) credits/request, so it goes through
+ * the SAME monthly credit guard + scrydex_api_log accounting as every other Scrydex
+ * call (the documented single entry point). Sends multipart/form-data (image + optional
+ * comma-separated `games` scope). Returns the raw Response so the caller can apply its
+ * own 403/circuit-breaker handling and parse the body.
+ *
+ * @param env   Worker bindings (DB, SCRYDEX_API_KEY, SCRYDEX_TEAM_ID, SCRYDEX_MONTHLY_LIMIT?)
+ * @param image The card image as a Blob/File
+ * @param games Optional comma-separated TCG scope, e.g. 'pokemon' (improves speed/accuracy)
+ * @throws ScrydexCreditLimitError when the monthly guard blocks the call
+ */
+export async function scrydexVisionIdentify(
+  env:   Env,
+  image: Blob,
+  games?: string,
+): Promise<Response> {
+  const endpoint = '/vision/v1/cards/identify'
+  const jobName  = 'visionIdentify'
+
+  const monthlyLimit   = env.SCRYDEX_MONTHLY_LIMIT ? parseInt(env.SCRYDEX_MONTHLY_LIMIT, 10) : DEFAULT_MONTHLY_LIMIT
+  const guardThreshold = monthlyLimit - 500
+
+  // ── Monthly credit guard (Vision costs 5; guard on current usage) ───────────
+  let currentUsage = 0
+  try {
+    currentUsage = await getMonthlyCreditsUsed(env.DB)
+  } catch {
+    // DB read failure → allow the call; don't block on a monitoring error
+  }
+  if (currentUsage >= guardThreshold) {
+    try {
+      await logCall(env.DB, endpoint, jobName, 'blocked', null, 0, 'Monthly credit guard triggered')
+    } catch { /* non-blocking */ }
+    throw new ScrydexCreditLimitError()
+  }
+
+  // ── Build multipart body — do NOT set Content-Type; fetch sets the boundary ──
+  const form = new FormData()
+  form.append('image', image, 'card.jpg')
+  if (games) form.append('games', games)
+
+  let response: Response
+  try {
+    response = await fetch(`${SCRYDEX_BASE}${endpoint}`, {
+      method: 'POST',
+      headers: {
+        'X-Api-Key': env.SCRYDEX_API_KEY!,
+        'X-Team-ID': env.SCRYDEX_TEAM_ID!,
+        'Accept':    'application/json',
+      },
+      body: form,
+    })
+  } catch (err) {
+    try {
+      await logCall(env.DB, endpoint, jobName, 'error', null, VISION_CREDITS, String(err))
+    } catch { /* non-blocking */ }
+    throw err
+  }
+
+  try {
+    await logCall(
+      env.DB, endpoint, jobName,
+      response.ok ? 'success' : 'error',
+      response.status,
+      VISION_CREDITS,
+      response.ok ? null : `HTTP ${response.status}`,
+    )
+  } catch { /* non-blocking */ }
 
   return response
 }

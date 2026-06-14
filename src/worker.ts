@@ -4,7 +4,7 @@ import { processPendingWebhooks, refreshCardPrices } from './scrydexProcessor.js
 import { syncSingleSet } from './scrydexSyncSet.js';
 import { syncScrydexSetMappings } from './scrydexSetMapping.js';
 import { syncScrydexImages } from './scrydexImageSync.js';
-import { cleanupScrydexApiLog } from './lib/scrydexClient.js';
+import { cleanupScrydexApiLog, scrydexVisionIdentify, ScrydexCreditLimitError } from './lib/scrydexClient.js';
 import { backfillR2ImageUrls, backfillVariantImages, seedVariantProducts } from './backfillR2Urls.js';
 import { logger } from './ingestion/logger.js';
 
@@ -128,6 +128,45 @@ export default {
         }
         const result = await syncSingleSet(env, { setId, scrydexExpansionId, force: !!body.force });
         return json(result, result.ok ? 200 : 502);
+      }
+
+      // Scrydex Vision — identify a card from an image. BLOCKING (returns matches).
+      // multipart/form-data: `image` (file) + optional `games` (csv scope). The Content
+      // app proxies here admin-only; this centralises the key, credit guard, and the
+      // 5-credit scrydex_api_log debit. 403 (credit cap / forbidden) → 502 with a flag so
+      // the caller can fall back to Claude.
+      if (pathname === '/scrydex/vision-identify') {
+        const form = await request.formData().catch(() => null);
+        const imageEntry = form?.get('image');
+        const games = (form?.get('games') as string) || undefined;
+        if (!imageEntry || typeof imageEntry === 'string') {
+          return json({ ok: false, error: 'image file is required' }, 400);
+        }
+        const image = imageEntry as unknown as Blob;
+        if (image.size > 20 * 1024 * 1024) {
+          return json({ ok: false, error: 'image too large (max 20MB)' }, 413);
+        }
+        try {
+          const res = await scrydexVisionIdentify(env, image, games);
+          if (res.status === 403) {
+            return json({ ok: false, error: 'Scrydex 403 (credit cap / forbidden)', status: 403 }, 502);
+          }
+          if (!res.ok) {
+            return json({ ok: false, error: `Scrydex ${res.status}`, status: res.status }, 502);
+          }
+          const data = await res.json().catch(() => ({})) as { data?: { analysis?: unknown; matches?: unknown[] } };
+          return json({
+            ok:       true,
+            analysis: data?.data?.analysis ?? null,
+            matches:  data?.data?.matches ?? [],
+          });
+        } catch (err) {
+          if (err instanceof ScrydexCreditLimitError) {
+            return json({ ok: false, error: 'Scrydex credit guard triggered' }, 502);
+          }
+          logger.error('Vision identify failed', { error: String(err) });
+          return json({ ok: false, error: String(err) }, 502);
+        }
       }
 
       // Vendor on-demand single-card refresh — BLOCKING (returns the fresh result).
