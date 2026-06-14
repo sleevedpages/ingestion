@@ -5,6 +5,7 @@ import { syncSingleSet } from './scrydexSyncSet.js';
 import { syncScrydexSetMappings } from './scrydexSetMapping.js';
 import { syncScrydexImages } from './scrydexImageSync.js';
 import { cleanupScrydexApiLog, scrydexVisionIdentify, ScrydexCreditLimitError } from './lib/scrydexClient.js';
+import { fetchTcggoGradedPrices } from './lib/tcggoClient.js';
 import { backfillR2ImageUrls, backfillVariantImages, seedVariantProducts } from './backfillR2Urls.js';
 import { logger } from './ingestion/logger.js';
 
@@ -23,6 +24,9 @@ export interface Env {
   SCRYDEX_MONTHLY_LIMIT?: string;
   // Shared secret for admin-triggered HTTP endpoints
   INGESTION_WORKER_SECRET?: string;
+  // tcggo (pokemon-tcg-api.p.rapidapi.com) RapidAPI key — graded eBay-sold medians
+  // (admin-only demo path; key lives here, never in the Content app)
+  TCGGO_RAPIDAPI_KEY?: string;
   // Credit-control env vars (see scrydexProcessor.ts for details)
   SCRYDEX_PRICE_FRESHNESS_HOURS?: string;  // default 20 — freshness window before re-fetching an expansion (MUST stay <24h, the daily drain interval)
   SCRYDEX_PRICE_GAMES?: string;            // comma-separated slug allowlist, e.g. 'pokemon,onepiece' — deliberately UNSET in prod
@@ -69,6 +73,32 @@ export default {
         )
       );
       return json({ ok: true, message: 'Sync started' });
+    }
+
+    // ── tcggo graded prices (require x-worker-secret; GET) ──────────────────────
+    // Returns eBay-sold graded medians for a TCGPlayer product id. The Content app
+    // proxies this ADMIN-ONLY and KV-caches it 24h to protect the free-tier quota.
+    // No Scrydex key needed — this uses TCGGO_RAPIDAPI_KEY (the RapidAPI key lives
+    // here, never in the Content app).
+    if (pathname === '/tcggo/graded-prices' && request.method === 'GET') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      if (!env.TCGGO_RAPIDAPI_KEY) {
+        return json({ ok: false, error: 'TCGGO_RAPIDAPI_KEY not configured' }, 503);
+      }
+      const tcgplayerId = new URL(request.url).searchParams.get('tcgplayerId');
+      if (!tcgplayerId) {
+        return json({ ok: false, error: 'tcgplayerId is required' }, 400);
+      }
+      try {
+        const result = await fetchTcggoGradedPrices(env, tcgplayerId);
+        return json({ ok: true, ...result });
+      } catch (err) {
+        logger.error('tcggo graded fetch failed', { error: String(err), tcgplayerId });
+        return json({ ok: false, error: String(err) }, 502);
+      }
     }
 
     // ── Scrydex manual trigger endpoints (require x-worker-secret header) ────────
