@@ -79,6 +79,26 @@ describe('pickBestPcMatch', () => {
     ], card)
     expect(m?.id).toBe('b')
   })
+
+  // Regression: One Piece card whose franchise words ("ONE PIECE") live in the
+  // console-name, with a hyphenated set-prefixed number (was rejected → price null).
+  const opCard = {
+    name: 'Monkey.D.Luffy (010) (Dodgers x ONE PIECE)',
+    setName: 'One Piece Extra Booster Anime 25th Collection',
+    number: 'EB02-010',
+  }
+  it('matches an OP card via the combined product+console haystack + compact number', () => {
+    const m = pickBestPcMatch([
+      { id: '183900', 'product-name': 'Monkey.D.Luffy [Dodgers] EB02-010', 'console-name': 'One Piece Extra Booster Anime 25th Collection' },
+    ], opCard)
+    expect(m?.id).toBe('183900')
+  })
+  it('discriminates art variants — rejects a non-"Dodgers" print of the same number', () => {
+    const m = pickBestPcMatch([
+      { id: 'x', 'product-name': 'Monkey.D.Luffy EB02-010', 'console-name': 'One Piece Extra Booster Anime 25th Collection' },
+    ], opCard)
+    expect(m).toBeNull() // 'dodgers' token absent from the haystack → nameHit fails
+  })
 })
 
 // ── Integration: resolve → fetch → decode ───────────────────────────────────
@@ -137,13 +157,13 @@ describe('fetchPriceChartingGraded', () => {
     expect(res.console).toBe('Pokemon Obsidian Flames')
     expect(res.salesVolume).toBe(33)
     expect(res.pcId).toBe('6910')
-    expect(await env.SLEEVEDPAGES_KV.get('pc_id:7')).toBe('6910')   // id cached
+    expect(await env.SLEEVEDPAGES_KV.get('pc_id_v2:7')).toBe('6910')   // id cached
     expect(fetchMock).toHaveBeenCalledTimes(2)                       // search + product
   })
 
   it('uses a cached id + cached product without any API call', async () => {
     const env = baseEnv()
-    await env.SLEEVEDPAGES_KV.put('pc_id:7', '6910')
+    await env.SLEEVEDPAGES_KV.put('pc_id_v2:7', '6910')
     await env.SLEEVEDPAGES_KV.put('pc_product:6910', JSON.stringify({ 'manual-only-price': 50000, 'product-name': 'X' }))
     const fetchMock = vi.fn()
     vi.stubGlobal('fetch', fetchMock)
@@ -155,7 +175,7 @@ describe('fetchPriceChartingGraded', () => {
 
   it('honours the negative-cache sentinel (no validated match) without re-searching', async () => {
     const env = baseEnv()
-    await env.SLEEVEDPAGES_KV.put('pc_id:7', 'none')
+    await env.SLEEVEDPAGES_KV.put('pc_id_v2:7', 'none')
     const fetchMock = vi.fn()
     vi.stubGlobal('fetch', fetchMock)
     const res = await fetchPriceChartingGraded(env as any, { canonicalProductId: 7, company: 'PSA', grade: '10' })

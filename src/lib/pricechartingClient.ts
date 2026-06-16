@@ -26,7 +26,9 @@ import type { Env } from '../worker.js'
 const PC_BASE = 'https://www.pricecharting.com'
 
 /** KV key prefixes + TTLs. */
-const PC_ID_PREFIX       = 'pc_id:'          // resolved PriceCharting id per canonical product
+// v2: matcher fix (combined product+console haystack, compact number) abandons stale
+// v1 negative-cache 'none' entries so previously-rejected cards re-resolve on deploy.
+const PC_ID_PREFIX       = 'pc_id_v2:'       // resolved PriceCharting id per canonical product
 const PC_ID_TTL          = 60 * 60 * 24 * 30 // 30 days
 const PC_ID_NONE         = 'none'            // negative-cache sentinel (no validated match)
 const PC_ID_NONE_TTL     = 60 * 60 * 24 * 7  // 7 days — recover if catalogue improves
@@ -80,6 +82,9 @@ export function pickGradedPrice(prices: Record<string, unknown> | null, company:
 function norm(s: unknown): string {
   return String(s ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
 }
+function compact(s: unknown): string {
+  return String(s ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '')
+}
 function cleanNumber(n: unknown): string {
   return String(n ?? '').split('/')[0].replace(/^0+/, '').toLowerCase().trim()
 }
@@ -89,16 +94,22 @@ interface CardMeta { name?: string | null; setName?: string | null; number?: str
 
 /**
  * Pick + VALIDATE the best PriceCharting search match for a canonical card. PURE.
- * Scoring: name tokens all present in product-name (+2); card number present as a
- * token (+3); a set token present in console-name (+2). Must score ≥ 4 (name +
- * number, or name + set) — weak matches are REJECTED rather than mispriced.
+ *
+ * Matches name + number against the COMBINED product-name + console-name "haystack"
+ * (PriceCharting keeps franchise/set words like "One Piece" in the console-name while
+ * our canonical name may carry them inline, e.g. "Monkey.D.Luffy (010) (Dodgers x ONE
+ * PIECE)"). All name tokens must appear in the haystack (this also discriminates art
+ * variants — a non-"Dodgers" print lacks the "dodgers" token); corroboration (number
+ * OR set) is required so a name-only hit never misprices. Numbers match as an
+ * alphanumeric-compact substring so hyphenated set-prefixed numbers ("EB02-010") match.
+ * Score: name (+2), compact number (+3), set token in console (+2); accept at ≥ 4.
  */
 export function pickBestPcMatch(products: PcSearchProduct[] | undefined, card: CardMeta): (PcSearchProduct & { _score: number }) | null {
   if (!Array.isArray(products) || products.length === 0) return null
   const cardName = norm(card?.name)
   if (!cardName) return null
-  const setName = norm(card?.setName)
-  const number  = cleanNumber(card?.number)
+  const setName    = norm(card?.setName)
+  const numCompact = compact(cleanNumber(card?.number))
 
   const nameTokens = cardName.split(' ').filter(t => t.length >= 3)
   const setTokens  = setName.split(' ').filter(t => t.length >= 3)
@@ -108,12 +119,14 @@ export function pickBestPcMatch(products: PcSearchProduct[] | undefined, card: C
   for (const p of products) {
     const pName = norm(p?.['product-name'])
     if (!pName) continue
-    const pNameTokens = pName.split(' ')
-    const pConsole = norm(p?.['console-name'])
+    const pConsole   = norm(p?.['console-name'])
+    const hay        = `${pName} ${pConsole}`.trim()
+    const hayCompact = compact(hay)
 
-    if (!nameTokens.every(t => pName.includes(t))) continue
-    const numHit = number ? pNameTokens.some(t => t.replace(/^0+/, '') === number) : false
+    if (!nameTokens.every(t => hay.includes(t))) continue
+    const numHit = numCompact ? hayCompact.includes(numCompact) : false
     const setHit = setTokens.length > 0 && setTokens.some(t => pConsole.includes(t))
+    if (!numHit && !setHit) continue
 
     let score = 2
     if (numHit) score += 3
