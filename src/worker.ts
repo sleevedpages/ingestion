@@ -7,6 +7,8 @@ import { syncScrydexImages } from './scrydexImageSync.js';
 import { cleanupScrydexApiLog, scrydexVisionIdentify, ScrydexCreditLimitError } from './lib/scrydexClient.js';
 import { fetchTcggoGradedPrices, searchTcggoArtists, fetchAllArtistCards } from './lib/tcggoClient.js';
 import { fetchPriceChartingGraded } from './lib/pricechartingClient.js';
+import { ingestPriceChartingCategory } from './pricechartingIngest.js';
+import { PRICECHARTING_CATEGORIES, type PriceChartingCategory } from './lib/pricechartingCsv.js';
 import { backfillR2ImageUrls, backfillVariantImages, seedVariantProducts } from './backfillR2Urls.js';
 import { logger } from './ingestion/logger.js';
 
@@ -29,8 +31,12 @@ export interface Env {
   // (admin-only demo path; key lives here, never in the Content app)
   TCGGO_RAPIDAPI_KEY?: string;
   // PriceCharting API token — PRIMARY admin graded-price source (operator sets it;
-  // lives here, never in the Content app). See lib/pricechartingClient.ts.
+  // lives here, never in the Content app). Also powers the daily CSV bulk-ingest
+  // (src/pricechartingIngest.ts). See lib/pricechartingClient.ts.
   PRICECHARTING_TOKEN?: string;
+  // PriceCharting CSV bulk-ingest tuning (optional — sane defaults in pricechartingIngest.ts)
+  PC_INGEST_MAX_ROWS?: string;   // rows processed per cron run (window); default 25000
+  PC_INGEST_FUZZY_MAX?: string;  // bounded fuzzy lookups per run; default 400
   // Shared KV namespace (the Content app's SLEEVEDPAGES_KV) — caches resolved
   // PriceCharting ids (pc_id:*) and raw product responses (pc_product:*).
   SLEEVEDPAGES_KV?: KVNamespace;
@@ -181,6 +187,31 @@ export default {
         return json({ ok: true, ...result });
       } catch (err) {
         logger.error('pricecharting graded fetch failed', { error: String(err), canonicalProductId });
+        return json({ ok: false, error: String(err) }, 502);
+      }
+    }
+
+    // POST /pricecharting/ingest — manual trigger for the CSV bulk-ingest of ONE
+    // category. Body { category, force? }. Same job the daily cron runs (one category
+    // per run). Admin-secret gated; the token lives in PRICECHARTING_TOKEN.
+    if (pathname === '/pricecharting/ingest' && request.method === 'POST') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      if (!env.PRICECHARTING_TOKEN) {
+        return json({ ok: false, error: 'PRICECHARTING_TOKEN not configured' }, 503);
+      }
+      const body = await request.json().catch(() => null) as { category?: string; force?: boolean } | null;
+      const category = (body?.category ?? '').trim() as PriceChartingCategory;
+      if (!PRICECHARTING_CATEGORIES.includes(category)) {
+        return json({ ok: false, error: `category must be one of ${PRICECHARTING_CATEGORIES.join(', ')}` }, 400);
+      }
+      try {
+        const counts = await ingestPriceChartingCategory(env, category, { force: !!body?.force });
+        return json({ ok: true, ...counts });
+      } catch (err) {
+        logger.error('pricecharting csv ingest failed', { error: String(err), category });
         return json({ ok: false, error: String(err) }, 502);
       }
     }
@@ -446,6 +477,23 @@ export default {
           ctx.waitUntil(
             processPendingWebhooks(env).catch((err) =>
               logger.error('Scrydex webhook processing failed', { error: String(err) })
+            )
+          );
+        }
+        break;
+
+      case '0 5 * * *':
+        // DAILY: PriceCharting CSV bulk-ingest — ONE category per run, rotated by day, so
+        // the source's ~1-per-10-min download rate limit is respected trivially (the CSVs
+        // only regenerate ~once/24h anyway). Each run processes a bounded, resumable window
+        // (KV cursor), so a large category spans several runs. The four categories cycle
+        // every 4 days; spaced from the 04:00 Scrydex drain. Prod only (UAT cron list omits it).
+        if (env.PRICECHARTING_TOKEN) {
+          const dayIdx = Math.floor(Date.now() / 86_400_000) % PRICECHARTING_CATEGORIES.length;
+          const category = PRICECHARTING_CATEGORIES[dayIdx];
+          ctx.waitUntil(
+            ingestPriceChartingCategory(env, category).catch((err) =>
+              logger.error('PriceCharting CSV ingest failed', { error: String(err), category })
             )
           );
         }

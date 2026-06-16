@@ -102,6 +102,7 @@ db/migrations/
 | `0 6 * * *` | Daily TCG data sync (categories → sets → products → prices) |
 | `0 3 * * SUN` | Weekly: `syncScrydexSetMappings` → `syncScrydexImages` → `runMirrorJob` (Infinity batches) → `scrydex_api_log` cleanup (90-day retention) |
 | `0 4 * * *` | **DAILY** Scrydex webhook drain → upsert canonical `prices` (dedup by expansion; 20h freshness). **Was `*/10`** — moved to daily for cost control (2026-06; see Price Processing). |
+| `0 5 * * *` | **DAILY** PriceCharting CSV bulk-ingest — ONE category/run, rotated by day (4-day cycle). Upserts canonical `prices` (source='pricecharting') for the 4 games. See **PriceCharting CSV Bulk-Ingest**. Prod only. |
 
 **UAT** (`[env.preview.triggers]` in `wrangler.toml`) — **Scrydex crons are permanently absent**:
 | Cron | Job |
@@ -124,6 +125,7 @@ The `0 3 * * SUN` and `0 4 * * *` (Scrydex) crons are not registered in the UAT 
 | `POST` | `/scrydex/sync-set` | `x-worker-secret` | **Blocking** per-set sync — body `{ setId \| scrydexExpansionId, force? }`; fetches that set's expansion ONCE and writes canonical prices (raw+graded) + images for it; credit-guarded; skips when both price types are fresh (unless `force`); marks the expansion fresh on success; returns `{ ok, skipped?, cardsFetched, pricesUpserted, imagesUpdated, variantsMatched, variantsConflicted, requests }`. See **Per-Set Sync** below. |
 | `POST` | `/scrydex/refresh-card` | `x-worker-secret` | **Blocking** vendor on-demand refresh — body `{ product_id }`; fetches the expansion but upserts raw+graded prices for **only the target card** (matched by `tcgplayer_product_id`/number), does NOT mark the expansion fresh; returns `{ ok, pricesUpserted, requests }` |
 | `POST` | `/scrydex/vision-identify` | `x-worker-secret` | **Blocking** Scrydex Vision card identify (§4 #7) — `multipart/form-data` `image` + optional `games` (csv). Calls `scrydexVisionIdentify()` (credit guard + **5-credit** `scrydex_api_log` debit); returns `{ ok, analysis, matches }` (403/cap → 502 `{ok:false,status:403}` so the caller falls back to Claude). Content proxies this **admin-only** for the scanner. |
+| `POST` | `/pricecharting/ingest` | `x-worker-secret` | **CSV BULK-INGEST** (2026-06-16). Body `{ category, force? }` (`category` ∈ pokemon-cards\|magic-cards\|yugioh-cards\|one-piece-cards). Same job the `0 5 * * *` cron runs for one category. Streams the per-game price-guide CSV, matches each row to a canonical product (tcg-id first → validated fuzzy fallback), persists the map (`pricecharting_products`), and upserts canonical `prices` (source='pricecharting'). Resumable (KV cursor `pc_ingest_cursor:{category}`); returns counts `{ ok, matchedTcgId, matchedFuzzy, alreadyMatched, unmatched, sealedRows, sealedMatched, pricesUpserted, windowStart, windowEnd, wrapped, totalRows }`. Needs `PRICECHARTING_TOKEN`. See **PriceCharting CSV Bulk-Ingest**. |
 | `GET` | `/pricecharting/graded?canonicalProductId=&company=&grade=` | `x-worker-secret` | **PRIMARY admin graded source** (2026-06-15). Needs **`PRICECHARTING_TOKEN`**. Resolves the canonical product → a PriceCharting id (search `/api/products?q=<name> <set>` + **validate** the best match + KV-cache `pc_id:{id}` long-TTL; raw `/api/product` cached `pc_product:{pcId}` 24h), decodes the (company,grade) tier, returns `{ ok, price, key, productName, console, salesVolume }` (price INTEGER PENNIES ÷100; `price:null` = unsupported/no-match). Rate limit 1 req/sec (sleeps between search+product). `src/lib/pricechartingClient.ts`. Content proxies **admin-only** + KV-caches 24h. |
 | `GET` | `/tcggo/graded-prices?tcgplayerId=...` | `x-worker-secret` | **SECONDARY graded fallback** (demoted 2026-06-15 — was primary). tcggo (RapidAPI `pokemon-tcg-api.p.rapidapi.com`) eBay-sold graded medians. Needs **`TCGGO_RAPIDAPI_KEY`** (NOT Scrydex). Calls `/cards?tcgplayer_id=...`, reads `prices.ebay.graded[company][grade]` → `{ ok, tcgplayerId, graded:{psa,bgs,cgc}|null, source:'tcggo' }`. `src/lib/tcggoClient.ts`. Content proxies **admin-only** + KV-caches 24h. |
 | `GET` | `/tcggo/artists?search=&page=` | `x-worker-secret` | **Artist Templates tool** (2026-06-15). Lists/searches tcggo artists → `{ ok, artists:[{id,name,slug,cards_count}], page }`. Content proxies admin-only + KV-caches briefly. |
@@ -385,6 +387,65 @@ returns the result counts so the Admin UI can show them.
 - Tests: `src/scrydexSyncSet.test.ts` (happy path → canonical writes + freshness marked;
   set-not-found; fresh-skip; force bypass; credit-guard short-circuit).
 
+## PriceCharting CSV Bulk-Ingest (2026-06-16) — the all-users graded backbone for 4 games
+
+The production graded+ungraded price backbone for the **4 games we ingest** (Pokémon, Magic,
+Yu-Gi-Oh, One Piece). It **supersedes the on-demand PriceCharting API path FOR THESE 4 GAMES**;
+the on-demand `/pricecharting/graded` (admin-only) stays the live fallback for OTHER games.
+
+- **Source (operator-confirmed):** `GET https://www.pricecharting.com/price-guide/download-custom?t={PRICECHARTING_TOKEN}&category={cat}`
+  for `cat` ∈ `pokemon-cards`, `magic-cards`, `yugioh-cards`, `one-piece-cards`. Returns CSV (~88k
+  rows/game). The CSV regenerates ~once/24h and the download is rate-limited (~1 per 10 min) → we pull
+  on the **daily `0 5 * * *` cron, ONE category per run, rotated by day** (4-day cycle). Manual:
+  `POST /pricecharting/ingest { category, force? }`.
+- **Format: TAB-separated** (operator-confirmed) with **unquoted thousands commas** in the dollar fields
+  (`$2,200.00`) and trailing spaces. The parser **auto-detects the delimiter** from the header
+  (`detectDelimiter` — tab vs comma) so a comma split never shreds a priced row; `parseDollarsToCents`
+  strips `$`/`,`/space. `tcg-id` = the TCGPlayer product id; `genre`="Sealed Product" flags sealed.
+- **CSV prices are DOLLAR strings** ("$46.47", "$2,200.00") — parse → integer cents (exact) → store
+  **dollars** in canonical `prices.value` (matches the scrydex/tcgplayer rows the serving reads;
+  `value` is dollars, NOT cents, despite the /api JSON returning pennies).
+- **Decode map (shared, identical to the API path):** `src/lib/pricechartingCsv.ts` builds its
+  CSV-column→grade-label list from `pricechartingClient.ts` `GRADE_KEY_LABEL` + `LOOSE_KEY`, so a card
+  decodes the same whichever path priced it. `loose-price` → ungraded/market (condition NULL, finish
+  'normal', grade NULL); `cib`→'Grade 7 / 7.5'; `new`→'Grade 8 / 8.5'; `graded-price`→'Grade 9';
+  `box-only`→'Grade 9.5'; `manual-only`→'PSA 10'; `bgs-10`→'BGS 10'; `condition-17`→'CGC 10';
+  `condition-18`→'SGC 10'. (No TAG/ACE; sub-10 grades are company-agnostic — same caveats as the API.)
+- **Matching (`src/pricechartingIngest.ts`):**
+  - **PRIMARY — tcg-id** (`tcg-id` ≈73% populated; it is the TCGPlayer product id): batched
+    `products.tcgplayer_product_id IN (…)` (chunks of 90), **validated** by name-token overlap
+    (`validateTcgIdMatch`) so a wrong/stale id never misprices. tcgplayer_product_id is globally
+    unique → no game scoping needed.
+  - **FALLBACK — validated fuzzy** (no/failed tcg-id): scope candidate canonical products by game
+    (`canonical_games.tcgplayer_category_id`) + card number, score name+number (`pickBestCanonicalMatch`),
+    accept at ≥5 (name + number) — **reject weak matches rather than misprice**. Bounded per run
+    (`PC_INGEST_FUZZY_MAX`, default 400); the bulk comes from tcg-id.
+  - **Persisted mapping** → `pricecharting_products` (pc_id ↔ canonical product id) so re-ingests are
+    **incremental** (matched pc_ids skip the fuzzy work; prices still re-upsert = the daily refresh).
+    **Unmatched rows are RECORDED** (`canonical_product_id IS NULL`), never silently dropped — the
+    catalogue-gap signal (count/list per game). `sales-volume` is captured per pc_id (vendor liquidity).
+- **Sealed rows** (genre = "Sealed Product"): matched like any row; written with **ONLY the ungraded /
+  market row** (sealed product has no graded tiers). Where a sealed row can't be matched it is counted
+  unmatched (not dropped).
+- **Write path:** idempotent upsert into canonical `prices` (`source='pricecharting'`), one row per
+  (product, grade/company) — `ON CONFLICT (product_id, source, COALESCE(condition,''),
+  COALESCE(finish,''), COALESCE(grade,''))`. Re-runs update value+fetched_at, never duplicate.
+- **Scale/resumability:** the CSV is **streamed** (never buffered whole); each run processes a bounded
+  window (`PC_INGEST_MAX_ROWS`, default 25000) from a KV cursor (`pc_ingest_cursor:{category}`, advanced
+  each run, reset at EOF), so a large category spans several runs. D1 writes are batched (≤90
+  statements/batch). Logs `{"log":"pricecharting_csv_ingest", …}` with matched/fuzzy/unmatched/sealed
+  counts per run.
+- **Migration:** `Content/migrations/0070_pricecharting_map.sql` (the `pricecharting_products` map +
+  unmatched log + sales-volume — chosen over KV because 350k rows need queryable unmatched counts +
+  incremental skip; the existing `pc_id_v2:*`/`pc_product:*` KV keys remain the on-demand API path's id
+  cache, a separate concern). The `prices` write needs no migration (schema already has source/grade/etc).
+- **Serving:** Content `getGradedPrices` now reads `prices` where `source IN ('scrydex','pricecharting')`
+  → the Content "Graded Prices" section serves these to **ALL users** for the 4 games (no admin gate, no
+  per-call cost). PriceCharting rows exist ONLY for the 4 ingested games, so their presence IS the gate.
+- **Tests (+30 → 136):** `src/pricechartingCsv.test.ts` (delimiter detection, the real One Piece
+  EB02-010 tab row, parse, decode map, sealed, matchers) + `src/pricechartingIngest.test.ts` (tcg-id
+  primary, fuzzy fallback, weak rejection, unmatched counted, idempotent re-run, sealed write).
+
 ### Drain credit audit (`processPendingWebhooks` — §4 #8, measure-first)
 
 The daily drain emits a structured audit line each run for credit observability (parse from
@@ -416,7 +477,9 @@ from `credits_by_game` in the audit line.
 | `SCRYDEX_TEAM_ID` | — | Scrydex team ID — required alongside API key |
 | `SCRYDEX_MONTHLY_LIMIT` | `50000` | Monthly Scrydex credit cap (upgraded tier). Guard blocks calls when usage ≥ `SCRYDEX_MONTHLY_LIMIT - 500`. Set the same value in the Content app env vars. |
 | `INGESTION_WORKER_SECRET` | — | Shared secret for admin-triggered HTTP endpoints (`/scrydex/*`, `/tcggo/*`) |
-| `PRICECHARTING_TOKEN` | — | PriceCharting API token — **PRIMARY admin graded-price source** (2026-06-15). Powers `GET /pricecharting/graded`. Set via `wrangler secret put PRICECHARTING_TOKEN` (preview + prod). Absent → the endpoint 503s and the Content source chain falls back to tcggo. Token lives here only — never in the Content app or responses. |
+| `PRICECHARTING_TOKEN` | — | PriceCharting API token. Powers (a) the admin graded-price source `GET /pricecharting/graded` (2026-06-15) and (b) the **daily CSV bulk-ingest** for the 4 games (`POST /pricecharting/ingest` + `0 5 * * *` cron, 2026-06-16). Set via `wrangler secret put PRICECHARTING_TOKEN` (preview + prod). Absent → both 503 and the cron no-ops. Token lives here only — never in the Content app, logs, or responses. |
+| `PC_INGEST_MAX_ROWS` | `25000` | CSV rows processed per bulk-ingest cron run (the resumable window). Lower it if a run approaches the `waitUntil` budget; a category just takes more runs to cycle. |
+| `PC_INGEST_FUZZY_MAX` | `400` | Bounded fuzzy lookups per bulk-ingest run (tcg-id carries the bulk). Unmatched rows are retried on later runs. |
 | `TCGGO_RAPIDAPI_KEY` | — | RapidAPI key for tcggo (`pokemon-tcg-api.p.rapidapi.com`). Now powers (a) the **SECONDARY** graded fallback `GET /tcggo/graded-prices` and (b) the **Artist Templates** ingestion tool (`GET /tcggo/artists*`). Set via `wrangler secret put TCGGO_RAPIDAPI_KEY`. Absent → those endpoints 503. Free tier 100 req/day — Content KV-caches; artist pulls are admin-triggered + bounded. |
 | `SLEEVEDPAGES_KV` (binding) | — | Shared KV namespace (the Content app's `SLEEVEDPAGES_KV`, same id). Caches PriceCharting ids (`pc_id:*`) + raw product responses (`pc_product:*`). Bound in `wrangler.toml` (prod + preview). |
 | `SCRYDEX_PRICE_FRESHNESS_HOURS` | `20` | Freshness window for the daily drain. **MUST stay < 24h** (the drain interval) or prices silently freeze — see the FRESHNESS↔DRAIN coupling invariant. Skips a re-fetch if `scrydex_expansion_freshness` has a recent row. |
@@ -443,6 +506,7 @@ from `credits_by_game` in the audit line.
 | `scrydex_webhook_log` | Pending→processing→complete/error webhook queue (**drained ONCE DAILY** `0 4 * * *`, deduped by expansion — cost control 2026-06) |
 | `scrydex_api_log` | One row per outbound Scrydex API call — credit guard + admin dashboard. 90-day retention. |
 | `variant_ingest_conflicts` | Session D-bis (mig 0065): Scrydex variant collisions (intra-payload dup product_id / cross-product) routed for admin review instead of corrupting `products`. Deduped on `(scrydex_card_id, tcgplayer_product_id, variant_name)`. |
+| `pricecharting_products` | 2026-06-16 (Content mig 0070): PriceCharting CSV bulk-ingest map. `pc_id` (PK) ↔ `canonical_product_id` (NULL = unmatched/catalogue-gap), `game_category`, `match_method` ('tcg-id'\|'fuzzy'), `tcg_id`, `console_name`/`product_name`, `is_sealed`, `sales_volume`, `matched_at`, `last_seen_at`. Persisted so re-ingests are incremental + unmatched is reviewable. See **PriceCharting CSV Bulk-Ingest**. |
 
 The old `tcg_categories` / `tcg_sets` / `tcg_products` / `tcg_prices` / `scrydex_prices` tables are
 **frozen** (no longer written or read) and kept only as the rollback path until the final session.

@@ -40,6 +40,14 @@ id      = "d8b69df87a0143b699e8dc75d286cdcb"
 #   0 6 * * *    — daily TCGPlayer data sync
 #   0 3 * * SUN  — weekly image mirror + Scrydex set mapping
 #   0 4 * * *    — DAILY Scrydex webhook drain (was */10; see below)
+#   0 5 * * *    — DAILY PriceCharting CSV bulk-ingest (ONE category/run, rotated by day)
+#
+# PRICECHARTING CSV INGEST (post-show): pulls the per-game price-guide CSV for the 4 games
+# (pokemon/magic/yugioh/one-piece-cards) and upserts canonical `prices` (source='pricecharting')
+# so graded+ungraded pricing is served to ALL users for those games. One category per daily run,
+# rotated (Date-based index) — respects the source's ~1-per-10-min download rate limit (CSVs only
+# regenerate ~once/24h). 05:00 UTC is clear of the 04:00 Scrydex drain and 06:00 TCG sync. The
+# token is the PRICECHARTING_TOKEN worker secret. Migration 0070 creates the pc-id↔canonical map.
 #
 # COST CONTROL (2026-06): the price-webhook drain moved from every-10-min to ONCE DAILY.
 # A day's redundant change-notifications for a volatile expansion are collapsed into ONE
@@ -51,7 +59,7 @@ id      = "d8b69df87a0143b699e8dc75d286cdcb"
 # each daily run no-ops against its own prior run and prices silently freeze. Do NOT raise
 # it to ≥24h while this is a daily cron. (scrydexProcessor.freshnessSafeForDrain guards/warns.)
 [triggers]
-crons = ["0 6 * * *", "0 3 * * SUN", "0 4 * * *"]
+crons = ["0 6 * * *", "0 3 * * SUN", "0 4 * * *", "0 5 * * *"]
 
 [vars]
 TCGCSV_BASE_URL = "https://tcgcsv.com"

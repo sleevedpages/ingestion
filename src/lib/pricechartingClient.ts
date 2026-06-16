@@ -46,6 +46,27 @@ export const GRADE_TEN_KEY_BY_COMPANY: Record<string, string> = {
   SGC: 'condition-18-price',
 }
 
+/** Ungraded reference key (loose / market). Not a graded tier. */
+export const LOOSE_KEY = 'loose-price'
+
+/**
+ * Human label for a decoded price-guide key. This is the SINGLE source of truth for
+ * the grade-tier label both the on-demand API path and the CSV bulk-ingest write —
+ * the CSV ingest reuses these exact keys (`src/lib/pricechartingCsv.ts`) so a slab's
+ * decoded API value and its persisted CSV `prices.grade` row carry identical labels.
+ * Mirror of Content's functions/lib/pricecharting.js GRADE_KEY_LABEL (kept in step).
+ */
+export const GRADE_KEY_LABEL: Record<string, string> = {
+  'manual-only-price':  'PSA 10',
+  'bgs-10-price':       'BGS 10',
+  'condition-17-price': 'CGC 10',
+  'condition-18-price': 'SGC 10',
+  'box-only-price':     'Grade 9.5',
+  'graded-price':       'Grade 9',
+  'new-price':          'Grade 8 / 8.5',
+  'cib-price':          'Grade 7 / 7.5',
+}
+
 function subTenKey(g: number): string | null {
   if (g === 9.5) return 'box-only-price'
   if (g === 9)   return 'graded-price'
