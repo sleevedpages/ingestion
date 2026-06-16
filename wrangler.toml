@@ -28,6 +28,14 @@ max_concurrent_consumers = 1
 binding     = "IMAGES_BUCKET"
 bucket_name = "sleeved-pages-images"
 
+# Shared KV namespace (the Content app's SLEEVEDPAGES_KV). Caches resolved
+# PriceCharting ids (pc_id:*) and raw /api/product responses (pc_product:*) so each
+# card is searched once and the free-tier rate limit is respected. Same namespace id
+# as Content/wrangler.toml — no new namespace, just a second binding.
+[[kv_namespaces]]
+binding = "SLEEVEDPAGES_KV"
+id      = "d8b69df87a0143b699e8dc75d286cdcb"
+
 # Cron schedule:
 #   0 6 * * *    — daily TCGPlayer data sync
 #   0 3 * * SUN  — weekly image mirror + Scrydex set mapping
@@ -101,6 +109,11 @@ max_concurrent_consumers = 1
 [[env.preview.r2_buckets]]
 binding     = "IMAGES_BUCKET"
 bucket_name = "sleeved-pages-images"
+
+# Shared UAT KV namespace (Content app's preview SLEEVEDPAGES_KV).
+[[env.preview.kv_namespaces]]
+binding = "SLEEVEDPAGES_KV"
+id      = "254b9f281eae41e5a8d8e9d78d8ca98d"
 
 # DISABLED: Scrydex crons (0 3 * * SUN, */10 * * * *) are intentionally absent from
 # the UAT trigger list.  UAT card data is sourced from a weekly prod → UAT sync; running

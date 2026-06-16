@@ -5,7 +5,8 @@ import { syncSingleSet } from './scrydexSyncSet.js';
 import { syncScrydexSetMappings } from './scrydexSetMapping.js';
 import { syncScrydexImages } from './scrydexImageSync.js';
 import { cleanupScrydexApiLog, scrydexVisionIdentify, ScrydexCreditLimitError } from './lib/scrydexClient.js';
-import { fetchTcggoGradedPrices } from './lib/tcggoClient.js';
+import { fetchTcggoGradedPrices, searchTcggoArtists, fetchAllArtistCards } from './lib/tcggoClient.js';
+import { fetchPriceChartingGraded } from './lib/pricechartingClient.js';
 import { backfillR2ImageUrls, backfillVariantImages, seedVariantProducts } from './backfillR2Urls.js';
 import { logger } from './ingestion/logger.js';
 
@@ -27,6 +28,12 @@ export interface Env {
   // tcggo (pokemon-tcg-api.p.rapidapi.com) RapidAPI key — graded eBay-sold medians
   // (admin-only demo path; key lives here, never in the Content app)
   TCGGO_RAPIDAPI_KEY?: string;
+  // PriceCharting API token — PRIMARY admin graded-price source (operator sets it;
+  // lives here, never in the Content app). See lib/pricechartingClient.ts.
+  PRICECHARTING_TOKEN?: string;
+  // Shared KV namespace (the Content app's SLEEVEDPAGES_KV) — caches resolved
+  // PriceCharting ids (pc_id:*) and raw product responses (pc_product:*).
+  SLEEVEDPAGES_KV?: KVNamespace;
   // Credit-control env vars (see scrydexProcessor.ts for details)
   SCRYDEX_PRICE_FRESHNESS_HOURS?: string;  // default 20 — freshness window before re-fetching an expansion (MUST stay <24h, the daily drain interval)
   SCRYDEX_PRICE_GAMES?: string;            // comma-separated slug allowlist, e.g. 'pokemon,onepiece' — deliberately UNSET in prod
@@ -97,6 +104,83 @@ export default {
         return json({ ok: true, ...result });
       } catch (err) {
         logger.error('tcggo graded fetch failed', { error: String(err), tcgplayerId });
+        return json({ ok: false, error: String(err) }, 502);
+      }
+    }
+
+    // ── tcggo artist search (require x-worker-secret; GET) ──────────────────────
+    // Repurposed tcggo: list/search artists so the Content admin can mint an owned
+    // template binder from an artist's card list. Admin-only + KV-cached by Content.
+    if (pathname === '/tcggo/artists' && request.method === 'GET') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      if (!env.TCGGO_RAPIDAPI_KEY) return json({ ok: false, error: 'TCGGO_RAPIDAPI_KEY not configured' }, 503);
+      const u = new URL(request.url);
+      const search = (u.searchParams.get('search') ?? '').trim();
+      const page = Math.max(1, Number(u.searchParams.get('page')) || 1);
+      try {
+        const result = await searchTcggoArtists(env, search, page);
+        return json({ ok: true, ...result });
+      } catch (err) {
+        logger.error('tcggo artist search failed', { error: String(err), search });
+        return json({ ok: false, error: String(err) }, 502);
+      }
+    }
+
+    // ── tcggo artist cards (require x-worker-secret; GET) ───────────────────────
+    // Paginate ALL of an artist's cards (bounded; see fetchAllArtistCards). The
+    // Content admin maps these to canonical products + builds the template.
+    const artistCardsMatch = pathname.match(/^\/tcggo\/artists\/([^/]+)\/cards$/);
+    if (artistCardsMatch && request.method === 'GET') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      if (!env.TCGGO_RAPIDAPI_KEY) return json({ ok: false, error: 'TCGGO_RAPIDAPI_KEY not configured' }, 503);
+      const artistId = decodeURIComponent(artistCardsMatch[1]);
+      const u = new URL(request.url);
+      const ccRaw = Number(u.searchParams.get('cardsCount'));
+      const cardsCount = Number.isFinite(ccRaw) && ccRaw > 0 ? ccRaw : undefined;
+      try {
+        const result = await fetchAllArtistCards(env, artistId, { cardsCount });
+        return json({ ok: true, artistId, count: result.cards.length, ...result });
+      } catch (err) {
+        logger.error('tcggo artist cards failed', { error: String(err), artistId });
+        return json({ ok: false, error: String(err) }, 502);
+      }
+    }
+
+    // ── PriceCharting graded prices (require x-worker-secret; GET) ───────────────
+    // PRIMARY admin graded-price source. Resolves the canonical product → a
+    // PriceCharting id (KV-cached), fetches /api/product, decodes the (company,
+    // grade) tier, and returns { price, key, productName, console, salesVolume }.
+    // The Content app proxies this ADMIN-ONLY and KV-caches it 24h. price:null means
+    // unsupported/no-match — the Content source chain then falls back to tcggo.
+    if (pathname === '/pricecharting/graded' && request.method === 'GET') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      if (!env.PRICECHARTING_TOKEN) {
+        return json({ ok: false, error: 'PRICECHARTING_TOKEN not configured' }, 503);
+      }
+      const url = new URL(request.url);
+      const canonicalProductId = Number(url.searchParams.get('canonicalProductId'));
+      const company = (url.searchParams.get('company') ?? '').trim();
+      const grade   = (url.searchParams.get('grade') ?? '').trim();
+      if (!Number.isInteger(canonicalProductId) || canonicalProductId <= 0) {
+        return json({ ok: false, error: 'canonicalProductId is required' }, 400);
+      }
+      if (!company || !grade) {
+        return json({ ok: false, error: 'company and grade are required' }, 400);
+      }
+      try {
+        const result = await fetchPriceChartingGraded(env, { canonicalProductId, company, grade });
+        return json({ ok: true, ...result });
+      } catch (err) {
+        logger.error('pricecharting graded fetch failed', { error: String(err), canonicalProductId });
         return json({ ok: false, error: String(err) }, 502);
       }
     }
