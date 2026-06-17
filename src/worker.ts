@@ -35,8 +35,9 @@ export interface Env {
   // (src/pricechartingIngest.ts). See lib/pricechartingClient.ts.
   PRICECHARTING_TOKEN?: string;
   // PriceCharting CSV bulk-ingest tuning (optional — sane defaults in pricechartingIngest.ts)
-  PC_INGEST_MAX_ROWS?: string;   // rows processed per cron run (window); default 25000
+  PC_INGEST_MAX_ROWS?: string;   // hard cap on rows collected per run (window); default 25000
   PC_INGEST_FUZZY_MAX?: string;  // bounded fuzzy lookups per run; default 400
+  PC_INGEST_BUDGET_MS?: string;  // wall-time budget per run before stopping + saving the cursor; default 20000
   // Shared KV namespace (the Content app's SLEEVEDPAGES_KV) — caches resolved
   // PriceCharting ids (pc_id:*) and raw product responses (pc_product:*).
   SLEEVEDPAGES_KV?: KVNamespace;

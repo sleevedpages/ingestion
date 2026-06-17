@@ -160,6 +160,28 @@ describe('ingestPriceChartingCategory', () => {
     expect(c2.alreadyMatched).toBeGreaterThanOrEqual(3)  // A, B, D resolved from the map
   })
 
+  it('windows the file across runs — cursor advances, then wraps at EOF (resumable; bounds per-run time)', async () => {
+    const db = makeFakeDb(PRODUCTS); const kv = makeKV()
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(csvStream(buildCsv()), { status: 200 })))
+    // maxRows=2 → each run processes 2 of the 4 data rows.
+    const env = { ...baseEnv(db, kv), PC_INGEST_MAX_ROWS: '2' }
+
+    const r1 = await ingestPriceChartingCategory(env as any, 'pokemon-cards')
+    expect(r1.rowsProcessed).toBe(2)        // A + B
+    expect(r1.wrapped).toBe(false)
+    expect(r1.cursorNext).toBe(2)           // resume offset persisted
+    expect(kv._store.get('pc_ingest_cursor:pokemon-cards')).toBe('2')
+    expect(db._prices.get('7|')).toBe(2200) // A written
+    expect(db._prices.has('20|')).toBe(false) // D not reached yet
+
+    const r2 = await ingestPriceChartingCategory(env as any, 'pokemon-cards')
+    expect(r2.windowStart).toBe(2)          // resumed where run 1 stopped
+    expect(r2.rowsProcessed).toBe(2)        // C + D
+    expect(r2.wrapped).toBe(true)           // reached EOF → fresh pass next time
+    expect(r2.cursorNext).toBe(0)
+    expect(db._prices.get('20|')).toBe(120) // D (sealed) now written
+  })
+
   it('throws on a non-200 CSV download', async () => {
     const db = makeFakeDb(PRODUCTS); const kv = makeKV()
     vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 429 })))

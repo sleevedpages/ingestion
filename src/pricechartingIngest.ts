@@ -50,26 +50,29 @@ const CATEGORY_TCGPLAYER_IDS: Record<string, number[]> = {
 }
 
 const CURSOR_PREFIX = 'pc_ingest_cursor:'
-const DEFAULT_MAX_ROWS  = 25000  // rows processed per run (window) — tune via PC_INGEST_MAX_ROWS
+const DEFAULT_MAX_ROWS  = 25000  // hard cap on rows collected per run — tune via PC_INGEST_MAX_ROWS
 const DEFAULT_FUZZY_MAX = 400    // fuzzy lookups per run (bounded; tcg-id carries the bulk)
+const DEFAULT_BUDGET_MS = 20000  // wall-time budget per run (< the ~60s request cap) — tune via PC_INGEST_BUDGET_MS
+const SUBBATCH = 500             // rows matched + written per inner pass; time budget checked between passes
 const DB_CHUNK = 90              // statements per DB.batch() (well under D1's 100-param/stmt cap)
 
 export interface PcIngestCounts {
   category:        string
-  rowsScanned:     number   // data rows seen this run (whole file streamed)
-  rowsInWindow:    number   // rows actually processed this run
+  rowsCollected:   number   // data rows read into the window this run (bounded by maxRows / EOF)
+  rowsProcessed:   number   // rows actually matched + written before the time budget / window end
   matchedTcgId:    number
   matchedFuzzy:    number
-  alreadyMatched:  number   // resolved from a prior run's persisted mapping
+  alreadyMatched:  number   // resolved from a prior run's persisted mapping (prices refreshed)
   unmatched:       number
   sealedRows:      number
   sealedMatched:   number
   pricesUpserted:  number
   fuzzyAttempts:   number
-  windowStart:     number
-  windowEnd:       number
-  wrapped:         boolean   // window reached EOF → cursor reset to 0
-  totalRows:       number
+  windowStart:     number   // cursor row offset this run started from
+  cursorNext:      number   // cursor row offset saved for the next run (0 when wrapped)
+  wrapped:         boolean   // reached EOF and finished the tail → next run starts a fresh pass
+  budgetHit:       boolean   // stopped early on the wall-time budget (more rows remain)
+  durationMs:      number
 }
 
 interface MatchResolution {
@@ -94,8 +97,8 @@ function chunk<T>(arr: T[], size: number): T[][] {
 async function streamCsv(
   body: ReadableStream<Uint8Array>,
   onHeader: (headerFields: string[]) => void,
-  onRow: (fields: string[], dataRowIndex: number) => void,
-): Promise<void> {
+  onRow: (fields: string[], dataRowIndex: number) => boolean,   // return false to stop reading
+): Promise<{ reachedEof: boolean }> {
   const reader = body.getReader()
   const decoder = new TextDecoder()
   let buf = ''
@@ -103,6 +106,7 @@ async function streamCsv(
   let dataIdx = 0
   let delimiter = ','                   // detected from the header line (tab vs comma)
   let pending: string[] | null = null   // a partial quoted field spanning lines
+  let stop = false
 
   const handleLine = (line: string) => {
     // A field may contain an embedded newline inside quotes; if the parsed line has an
@@ -118,22 +122,25 @@ async function streamCsv(
       onHeader(parseCsvLine(combined, delimiter))
       return
     }
-    onRow(parseCsvLine(combined, delimiter), dataIdx++)
+    if (onRow(parseCsvLine(combined, delimiter), dataIdx++) === false) stop = true
   }
 
   for (;;) {
     const { done, value } = await reader.read()
-    if (done) break
+    if (done) {
+      const tail = buf.replace(/\r$/, '')
+      if (tail.length > 0 || pending) handleLine(tail)
+      return { reachedEof: true }
+    }
     buf += decoder.decode(value, { stream: true })
     let nl: number
     while ((nl = buf.indexOf('\n')) >= 0) {
       const line = buf.slice(0, nl).replace(/\r$/, '')
       buf = buf.slice(nl + 1)
       handleLine(line)
+      if (stop) { await reader.cancel().catch(() => {}); return { reachedEof: false } }
     }
   }
-  const tail = buf.replace(/\r$/, '')
-  if (tail.length > 0 || pending) handleLine(tail)
 }
 
 /**
@@ -266,8 +273,10 @@ export async function ingestPriceChartingCategory(
   if (!env.PRICECHARTING_TOKEN) throw new Error('PRICECHARTING_TOKEN not configured')
   if (!PRICECHARTING_CATEGORIES.includes(category)) throw new Error(`Unknown category: ${category}`)
 
-  const maxRows = env.PC_INGEST_MAX_ROWS ? parseInt(env.PC_INGEST_MAX_ROWS, 10) : DEFAULT_MAX_ROWS
+  const t0 = Date.now()
+  const maxRows  = env.PC_INGEST_MAX_ROWS ? parseInt(env.PC_INGEST_MAX_ROWS, 10) : DEFAULT_MAX_ROWS
   const fuzzyMax = env.PC_INGEST_FUZZY_MAX ? parseInt(env.PC_INGEST_FUZZY_MAX, 10) : DEFAULT_FUZZY_MAX
+  const budgetMs = env.PC_INGEST_BUDGET_MS ? parseInt(env.PC_INGEST_BUDGET_MS, 10) : DEFAULT_BUDGET_MS
   const kv = env.SLEEVEDPAGES_KV
 
   // Resume cursor (row offset). `force` restarts from 0 and re-matches everything.
@@ -281,6 +290,7 @@ export async function ingestPriceChartingCategory(
   const windowEnd = windowStart + maxRows
 
   // ── Stream the CSV; collect only the rows inside [windowStart, windowEnd) ────
+  // (Early-stop at windowEnd so we never download the file's tail past our window.)
   const res = await fetch(buildDownloadUrl(category, env.PRICECHARTING_TOKEN), {
     headers: { Accept: 'text/csv' },
   })
@@ -290,101 +300,106 @@ export async function ingestPriceChartingCategory(
 
   let headerIdx: Record<string, number> = {}
   const window: Array<{ pcId: string; row: PcCsvRow; sealed: boolean }> = []
-  let rowsScanned = 0
 
-  await streamCsv(
+  const { reachedEof } = await streamCsv(
     res.body,
     (h) => { headerIdx = buildHeaderIndex(h) },
     (fields, i) => {
-      rowsScanned = i + 1
-      if (i < windowStart || i >= windowEnd) return
+      if (i < windowStart) return true
+      if (i >= windowEnd) return false           // window full → stop reading the tail
       const row = rowFromFields(fields, headerIdx)
       const pcId = (row['id'] ?? '').trim()
-      if (!pcId) return
-      window.push({ pcId, row, sealed: isSealedRow(row) })
+      if (pcId) window.push({ pcId, row, sealed: isSealedRow(row) })
+      return true
     },
   )
 
-  const totalRows = rowsScanned
-  const sealedRows = window.filter((w) => w.sealed).length
-
-  // ── Incremental skip: which window pc_ids are already matched? ──────────────
-  const alreadyMatched = new Map<string, number>()
-  if (!opts.force && window.length > 0) {
-    for (const ids of chunk(window.map((w) => w.pcId), DB_CHUNK)) {
-      const ph = ids.map(() => '?').join(',')
-      const { results } = await env.DB.prepare(
-        `SELECT pc_id, canonical_product_id FROM pricecharting_products
-         WHERE pc_id IN (${ph}) AND canonical_product_id IS NOT NULL`,
-      ).bind(...ids).all<{ pc_id: string; canonical_product_id: number }>()
-      for (const r of results ?? []) alreadyMatched.set(r.pc_id, r.canonical_product_id)
-    }
-  }
-
-  const { resolutions, matchedTcgId, matchedFuzzy, fuzzyAttempts } =
-    await resolveMatches(env, category, window, alreadyMatched, fuzzyMax)
-
-  // ── Build map + price upserts ───────────────────────────────────────────────
+  // ── Process the window in TIME-BOUNDED sub-batches; advance the cursor by the
+  //    number of rows actually processed (so a budget cut-off loses no progress and
+  //    the response returns counts well under the request-duration cap). ──────────
   const now = Math.floor(Date.now() / 1000)
-  const mapStmts: D1PreparedStatement[] = []
-  const priceStmts: D1PreparedStatement[] = []
-  let unmatched = 0
-  let sealedMatched = 0
+  let processed = 0
+  let matchedTcgId = 0, matchedFuzzy = 0, fuzzyAttempts = 0
+  let unmatched = 0, sealedMatched = 0, sealedRows = 0, alreadyMatchedTotal = 0, pricesUpserted = 0
+  let budgetHit = false
 
-  for (const r of resolutions) {
-    const sales = Number((r.row['sales-volume'] ?? '').trim())
-    const salesVolume = Number.isFinite(sales) && sales > 0 ? Math.round(sales) : null
-    mapStmts.push(
-      env.DB.prepare(MAP_UPSERT_SQL).bind(
-        r.pcId,
-        category,
-        r.productId,
-        r.method,
-        (r.row['tcg-id'] ?? '').trim() || null,
-        (r.row['console-name'] ?? '').trim() || null,
-        (r.row['product-name'] ?? '').trim() || null,
-        r.sealed ? 1 : 0,
-        salesVolume,
-        r.productId != null ? now : null,
-      ),
-    )
+  for (let off = 0; off < window.length; off += SUBBATCH) {
+    const sub = window.slice(off, off + SUBBATCH)
 
-    if (r.productId == null) { unmatched++; continue }
-    if (r.sealed) sealedMatched++
-
-    for (const pr of csvRowToPriceRows(r.row, { isSealed: r.sealed })) {
-      // ungraded → (condition NULL, finish 'normal', grade NULL); graded → (NULL, NULL, label)
-      const finish = pr.grade == null ? 'normal' : null
-      priceStmts.push(
-        env.DB.prepare(PRICE_UPSERT_SQL).bind(r.productId, null, finish, pr.grade, pr.valueDollars),
-      )
+    // Incremental skip: which sub-batch pc_ids are already matched (carry the id forward)?
+    const alreadyMatched = new Map<string, number>()
+    if (!opts.force) {
+      for (const ids of chunk(sub.map((w) => w.pcId), DB_CHUNK)) {
+        const ph = ids.map(() => '?').join(',')
+        const { results } = await env.DB.prepare(
+          `SELECT pc_id, canonical_product_id FROM pricecharting_products
+           WHERE pc_id IN (${ph}) AND canonical_product_id IS NOT NULL`,
+        ).bind(...ids).all<{ pc_id: string; canonical_product_id: number }>()
+        for (const r of results ?? []) alreadyMatched.set(r.pc_id, r.canonical_product_id)
+      }
     }
-  }
+    alreadyMatchedTotal += alreadyMatched.size
 
-  // Batch the writes (≤90 statements/batch).
-  for (const batch of chunk(mapStmts, DB_CHUNK)) await env.DB.batch(batch)
-  for (const batch of chunk(priceStmts, DB_CHUNK)) await env.DB.batch(batch)
+    const remainingFuzzy = Math.max(0, fuzzyMax - fuzzyAttempts)
+    const r = await resolveMatches(env, category, sub, alreadyMatched, remainingFuzzy)
+    matchedTcgId += r.matchedTcgId; matchedFuzzy += r.matchedFuzzy; fuzzyAttempts += r.fuzzyAttempts
+
+    const mapStmts: D1PreparedStatement[] = []
+    const priceStmts: D1PreparedStatement[] = []
+    for (const res2 of r.resolutions) {
+      if (res2.sealed) sealedRows++
+      const sales = Number((res2.row['sales-volume'] ?? '').trim())
+      const salesVolume = Number.isFinite(sales) && sales > 0 ? Math.round(sales) : null
+      mapStmts.push(
+        env.DB.prepare(MAP_UPSERT_SQL).bind(
+          res2.pcId, category, res2.productId, res2.method,
+          (res2.row['tcg-id'] ?? '').trim() || null,
+          (res2.row['console-name'] ?? '').trim() || null,
+          (res2.row['product-name'] ?? '').trim() || null,
+          res2.sealed ? 1 : 0, salesVolume,
+          res2.productId != null ? now : null,
+        ),
+      )
+      if (res2.productId == null) { unmatched++; continue }
+      if (res2.sealed) sealedMatched++
+      for (const pr of csvRowToPriceRows(res2.row, { isSealed: res2.sealed })) {
+        // ungraded → (condition NULL, finish 'normal', grade NULL); graded → (NULL, NULL, label)
+        const finish = pr.grade == null ? 'normal' : null
+        priceStmts.push(env.DB.prepare(PRICE_UPSERT_SQL).bind(res2.productId, null, finish, pr.grade, pr.valueDollars))
+      }
+    }
+    for (const b of chunk(mapStmts, DB_CHUNK)) await env.DB.batch(b)
+    for (const b of chunk(priceStmts, DB_CHUNK)) await env.DB.batch(b)
+    pricesUpserted += priceStmts.length
+
+    processed += sub.length
+    if (Date.now() - t0 > budgetMs) { budgetHit = true; break }
+  }
 
   // ── Advance / wrap the cursor ───────────────────────────────────────────────
-  const wrapped = windowEnd >= totalRows
-  if (kv) await kv.put(cursorKey, String(wrapped ? 0 : windowEnd))
+  // Wrapped only when we read the file's tail (reachedEof, i.e. the window wasn't
+  // capped at maxRows) AND processed every collected row within the budget.
+  const wrapped = reachedEof && processed >= window.length
+  const cursorNext = wrapped ? 0 : windowStart + processed
+  if (kv) await kv.put(cursorKey, String(cursorNext))
 
   const counts: PcIngestCounts = {
     category,
-    rowsScanned,
-    rowsInWindow: window.length,
+    rowsCollected: window.length,
+    rowsProcessed: processed,
     matchedTcgId,
     matchedFuzzy,
-    alreadyMatched: alreadyMatched.size,
+    alreadyMatched: alreadyMatchedTotal,
     unmatched,
     sealedRows,
     sealedMatched,
-    pricesUpserted: priceStmts.length,
+    pricesUpserted,
     fuzzyAttempts,
     windowStart,
-    windowEnd: Math.min(windowEnd, totalRows),
+    cursorNext,
     wrapped,
-    totalRows,
+    budgetHit,
+    durationMs: Date.now() - t0,
   }
   logger.info('pricecharting_csv_ingest', counts as unknown as Record<string, unknown>)
   return counts
