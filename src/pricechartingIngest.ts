@@ -62,7 +62,6 @@ export interface PcIngestCounts {
   rowsProcessed:   number   // rows actually matched + written before the time budget / window end
   matchedTcgId:    number
   matchedFuzzy:    number
-  alreadyMatched:  number   // resolved from a prior run's persisted mapping (prices refreshed)
   unmatched:       number
   sealedRows:      number
   sealedMatched:   number
@@ -143,96 +142,97 @@ async function streamCsv(
   }
 }
 
+interface Prod { id: number; tcgId: number | null; name: string | null; number: string | null }
+export interface ProductIndex {
+  byTcgId:  Map<number, Prod>
+  byNumber: Map<string, Prod[]>   // keyed on cleanNumber(p.number)
+  count:    number
+}
+
 /**
- * Resolve canonical product ids for a window of rows. tcg-id primary (batched + validated),
- * validated fuzzy fallback for the rest (bounded by `fuzzyMax`). Mutates nothing; returns one
- * MatchResolution per row.
+ * Load the game's canonical products into an in-memory index ONCE per run, so every row
+ * matches against memory (pure CPU) instead of a per-row D1 query. This is the fix for the
+ * fuzzy-fallback storm: the early (oldest) PriceCharting rows have no tcg-id and previously
+ * fired one JOIN per row (~135ms each → 54s for 500 rows). Paginated reads keep it to a
+ * handful of round trips regardless of catalogue size.
  */
-async function resolveMatches(
-  env: Env,
-  category: string,
-  rows: Array<{ pcId: string; row: PcCsvRow; sealed: boolean }>,
-  alreadyMatched: Map<string, number>,
-  fuzzyMax: number,
-): Promise<{ resolutions: MatchResolution[]; matchedTcgId: number; matchedFuzzy: number; fuzzyAttempts: number }> {
-  const resolutions: MatchResolution[] = []
-  let matchedTcgId = 0
-  let matchedFuzzy = 0
-  let fuzzyAttempts = 0
-
-  // Rows that still need matching (not resolved from a prior run).
-  const needMatch = rows.filter((r) => !alreadyMatched.has(r.pcId))
-
-  // ── tcg-id primary (batched) ────────────────────────────────────────────────
-  const byTcgId = new Map<number, { pcId: string; row: { pcId: string; row: PcCsvRow; sealed: boolean } }[]>()
-  for (const r of needMatch) {
-    const t = Number((r.row['tcg-id'] ?? '').trim())
-    if (Number.isInteger(t) && t > 0) {
-      if (!byTcgId.has(t)) byTcgId.set(t, [])
-      byTcgId.get(t)!.push({ pcId: r.pcId, row: r })
-    }
-  }
-  const tcgIdToProduct = new Map<number, { id: number; name: string | null }>()
-  for (const ids of chunk([...byTcgId.keys()], DB_CHUNK)) {
-    const placeholders = ids.map(() => '?').join(',')
-    const { results } = await env.DB.prepare(
-      `SELECT id, tcgplayer_product_id, name FROM products WHERE tcgplayer_product_id IN (${placeholders})`,
-    ).bind(...ids).all<{ id: number; tcgplayer_product_id: number; name: string | null }>()
-    for (const p of results ?? []) tcgIdToProduct.set(p.tcgplayer_product_id, { id: p.id, name: p.name })
-  }
-
-  const resolvedPcIds = new Set<string>()
-  for (const [tcgId, entries] of byTcgId) {
-    const prod = tcgIdToProduct.get(tcgId)
-    for (const e of entries) {
-      if (prod && validateTcgIdMatch(e.row.row, { name: prod.name })) {
-        resolutions.push({ pcId: e.pcId, productId: prod.id, method: 'tcg-id', row: e.row.row, sealed: e.row.sealed })
-        resolvedPcIds.add(e.pcId)
-        matchedTcgId++
-      }
-    }
-  }
-
-  // ── validated fuzzy fallback (bounded) ──────────────────────────────────────
+async function loadProductIndex(env: Env, category: string): Promise<ProductIndex> {
   const cats = CATEGORY_TCGPLAYER_IDS[category] ?? []
-  for (const r of needMatch) {
-    if (resolvedPcIds.has(r.pcId)) continue
-    if (fuzzyAttempts >= fuzzyMax || cats.length === 0) break
-    // Extract a number-like token from the CSV product-name for candidate scoping.
-    const numToken = ((r.row['product-name'] ?? '').match(/[a-z]*\d[\w-]*/i)?.[0]) ?? ''
-    const num = cleanNumber(numToken)
-    if (!num) { continue }   // no number to corroborate → leave unmatched (counted)
-    fuzzyAttempts++
-    const ph = cats.map(() => '?').join(',')
+  const byTcgId = new Map<number, Prod>()
+  const byNumber = new Map<string, Prod[]>()
+  let count = 0
+  if (cats.length === 0) return { byTcgId, byNumber, count }
+
+  const ph = cats.map(() => '?').join(',')
+  const PAGE = 5000
+  for (let offset = 0; ; offset += PAGE) {
     const { results } = await env.DB.prepare(
-      `SELECT p.id, p.name, p.number
+      `SELECT p.id, p.tcgplayer_product_id AS tcgId, p.name, p.number
        FROM products p
        JOIN sets s ON s.id = p.set_id
        JOIN canonical_games g ON g.id = s.game_id
        WHERE g.tcgplayer_category_id IN (${ph})
-         AND (LOWER(p.number) = ? OR LOWER(p.number) LIKE ?)
-       LIMIT 25`,
-    ).bind(...cats, num, `${num}/%`).all<{ id: number; name: string | null; number: string | null }>()
-    const productId = pickBestCanonicalMatch(r.row, results ?? [])
-    if (productId != null) {
-      resolutions.push({ pcId: r.pcId, productId, method: 'fuzzy', row: r.row, sealed: r.sealed })
-      resolvedPcIds.add(r.pcId)
-      matchedFuzzy++
+       ORDER BY p.id LIMIT ${PAGE} OFFSET ${offset}`,
+    ).bind(...cats).all<Prod>()
+    const rows = results ?? []
+    for (const p of rows) {
+      count++
+      if (p.tcgId != null) byTcgId.set(Number(p.tcgId), p)
+      const num = cleanNumber(p.number)
+      if (num) {
+        const arr = byNumber.get(num)
+        if (arr) arr.push(p); else byNumber.set(num, [p])
+      }
     }
+    if (rows.length < PAGE) break
   }
+  return { byTcgId, byNumber, count }
+}
 
-  // ── everything else: unmatched (recorded with productId=null) ───────────────
-  for (const r of needMatch) {
-    if (resolvedPcIds.has(r.pcId)) continue
+/**
+ * Match a sub-batch of rows against the in-memory index. PURE (no IO). tcg-id primary
+ * (validated), bounded validated fuzzy fallback for the rest. Returns one MatchResolution
+ * per row plus counts.
+ */
+function matchRows(
+  rows: Array<{ pcId: string; row: PcCsvRow; sealed: boolean }>,
+  index: ProductIndex,
+  fuzzyMax: number,
+): { resolutions: MatchResolution[]; matchedTcgId: number; matchedFuzzy: number; fuzzyAttempts: number } {
+  const resolutions: MatchResolution[] = []
+  let matchedTcgId = 0, matchedFuzzy = 0, fuzzyAttempts = 0
+
+  for (const r of rows) {
+    // ── tcg-id primary (in-memory map lookup + name validation) ────────────────
+    const t = Number((r.row['tcg-id'] ?? '').trim())
+    if (Number.isInteger(t) && t > 0) {
+      const prod = index.byTcgId.get(t)
+      if (prod && validateTcgIdMatch(r.row, { name: prod.name })) {
+        resolutions.push({ pcId: r.pcId, productId: prod.id, method: 'tcg-id', row: r.row, sealed: r.sealed })
+        matchedTcgId++
+        continue
+      }
+    }
+    // ── validated fuzzy fallback (in-memory number index; bounded) ─────────────
+    if (fuzzyAttempts < fuzzyMax) {
+      const numToken = ((r.row['product-name'] ?? '').match(/[a-z]*\d[\w-]*/i)?.[0]) ?? ''
+      const num = cleanNumber(numToken)
+      if (num) {
+        fuzzyAttempts++
+        const candidates = index.byNumber.get(num) ?? []
+        const productId = candidates.length
+          ? pickBestCanonicalMatch(r.row, candidates.map((c) => ({ id: c.id, name: c.name, number: c.number })))
+          : null
+        if (productId != null) {
+          resolutions.push({ pcId: r.pcId, productId, method: 'fuzzy', row: r.row, sealed: r.sealed })
+          matchedFuzzy++
+          continue
+        }
+      }
+    }
+    // ── unmatched (recorded with productId=null — the catalogue-gap signal) ─────
     resolutions.push({ pcId: r.pcId, productId: null, method: null, row: r.row, sealed: r.sealed })
   }
-  // Rows resolved from a prior run carry their persisted product id forward (prices refresh).
-  for (const r of rows) {
-    if (alreadyMatched.has(r.pcId)) {
-      resolutions.push({ pcId: r.pcId, productId: alreadyMatched.get(r.pcId)!, method: null, row: r.row, sealed: r.sealed })
-    }
-  }
-
   return { resolutions, matchedTcgId, matchedFuzzy, fuzzyAttempts }
 }
 
@@ -314,34 +314,25 @@ export async function ingestPriceChartingCategory(
     },
   )
 
+  // Load the game's canonical products into memory ONCE, so matching is pure CPU
+  // (no per-row D1 query — the fix for the fuzzy-fallback storm on the no-tcg-id rows).
+  const index = await loadProductIndex(env, category)
+
   // ── Process the window in TIME-BOUNDED sub-batches; advance the cursor by the
   //    number of rows actually processed (so a budget cut-off loses no progress and
   //    the response returns counts well under the request-duration cap). ──────────
   const now = Math.floor(Date.now() / 1000)
   let processed = 0
   let matchedTcgId = 0, matchedFuzzy = 0, fuzzyAttempts = 0
-  let unmatched = 0, sealedMatched = 0, sealedRows = 0, alreadyMatchedTotal = 0, pricesUpserted = 0
+  let unmatched = 0, sealedMatched = 0, sealedRows = 0, pricesUpserted = 0
   let budgetHit = false
 
   for (let off = 0; off < window.length; off += SUBBATCH) {
     const sub = window.slice(off, off + SUBBATCH)
 
-    // Incremental skip: which sub-batch pc_ids are already matched (carry the id forward)?
-    const alreadyMatched = new Map<string, number>()
-    if (!opts.force) {
-      for (const ids of chunk(sub.map((w) => w.pcId), DB_CHUNK)) {
-        const ph = ids.map(() => '?').join(',')
-        const { results } = await env.DB.prepare(
-          `SELECT pc_id, canonical_product_id FROM pricecharting_products
-           WHERE pc_id IN (${ph}) AND canonical_product_id IS NOT NULL`,
-        ).bind(...ids).all<{ pc_id: string; canonical_product_id: number }>()
-        for (const r of results ?? []) alreadyMatched.set(r.pc_id, r.canonical_product_id)
-      }
-    }
-    alreadyMatchedTotal += alreadyMatched.size
-
+    // Matching is in-memory; fuzzy is bounded across the whole run.
     const remainingFuzzy = Math.max(0, fuzzyMax - fuzzyAttempts)
-    const r = await resolveMatches(env, category, sub, alreadyMatched, remainingFuzzy)
+    const r = matchRows(sub, index, remainingFuzzy)
     matchedTcgId += r.matchedTcgId; matchedFuzzy += r.matchedFuzzy; fuzzyAttempts += r.fuzzyAttempts
 
     const mapStmts: D1PreparedStatement[] = []
@@ -389,7 +380,6 @@ export async function ingestPriceChartingCategory(
     rowsProcessed: processed,
     matchedTcgId,
     matchedFuzzy,
-    alreadyMatched: alreadyMatchedTotal,
     unmatched,
     sealedRows,
     sealedMatched,

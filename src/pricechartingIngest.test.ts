@@ -20,26 +20,16 @@ function makeFakeDb(products: Product[]) {
   const pcMap = new Map<string, { canonical_product_id: number | null }>()
 
   function query(sql: string, args: any[]) {
-    if (sql.includes('FROM pricecharting_products') && sql.includes('canonical_product_id IS NOT NULL')) {
-      const out: any[] = []
-      for (const id of args) {
-        const m = pcMap.get(String(id))
-        if (m && m.canonical_product_id != null) out.push({ pc_id: id, canonical_product_id: m.canonical_product_id })
-      }
-      return { results: out }
-    }
-    if (sql.includes('FROM products') && sql.includes('tcgplayer_product_id IN')) {
-      const ids = args.map(Number)
-      return { results: products.filter((p) => ids.includes(p.tcgplayer_product_id))
-        .map((p) => ({ id: p.id, tcgplayer_product_id: p.tcgplayer_product_id, name: p.name })) }
-    }
-    if (sql.includes('FROM products p') && sql.includes('JOIN sets')) {
-      const num = String(args[args.length - 2])
-      const cats = args.slice(0, args.length - 2).map(Number)
-      return { results: products.filter((p) =>
-        cats.includes(p.category) &&
-        (p.number.toLowerCase() === num || p.number.toLowerCase().startsWith(num + '/')))
-        .slice(0, 25).map((p) => ({ id: p.id, name: p.name, number: p.number })) }
+    // The only read now: loadProductIndex's paginated product pull (scoped by category).
+    // OFFSET/LIMIT are inline in the SQL; the test fixture is one page, so we return all
+    // matching rows on the first call (offset 0) and an empty page on any later offset.
+    if (sql.includes('FROM products p') && sql.includes('JOIN canonical_games')) {
+      const cats = args.map(Number)
+      const offsetMatch = sql.match(/OFFSET (\d+)/)
+      const offset = offsetMatch ? Number(offsetMatch[1]) : 0
+      if (offset > 0) return { results: [] }
+      return { results: products.filter((p) => cats.includes(p.category))
+        .map((p) => ({ id: p.id, tcgId: p.tcgplayer_product_id, name: p.name, number: p.number })) }
     }
     throw new Error('unhandled query SQL: ' + sql.slice(0, 60))
   }
@@ -153,11 +143,12 @@ describe('ingestPriceChartingCategory', () => {
 
     await ingestPriceChartingCategory(baseEnv(db, kv) as any, 'pokemon-cards')
     const after1 = db._prices.size
-    // Second run: matched pc_ids now resolve from the persisted map (incremental skip),
-    // prices still upsert on the same conflict keys → size is unchanged.
+    // Second run re-matches in-memory (cheap + deterministic) and upserts on the same
+    // conflict keys → no duplicate price rows.
     const c2 = await ingestPriceChartingCategory(baseEnv(db, kv) as any, 'pokemon-cards')
     expect(db._prices.size).toBe(after1)
-    expect(c2.alreadyMatched).toBeGreaterThanOrEqual(3)  // A, B, D resolved from the map
+    expect(c2.matchedTcgId).toBe(2)   // A + D match again
+    expect(c2.matchedFuzzy).toBe(1)   // B matches again
   })
 
   it('windows the file across runs — cursor advances, then wraps at EOF (resumable; bounds per-run time)', async () => {

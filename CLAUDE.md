@@ -125,7 +125,7 @@ The `0 3 * * SUN` and `0 4 * * *` (Scrydex) crons are not registered in the UAT 
 | `POST` | `/scrydex/sync-set` | `x-worker-secret` | **Blocking** per-set sync — body `{ setId \| scrydexExpansionId, force? }`; fetches that set's expansion ONCE and writes canonical prices (raw+graded) + images for it; credit-guarded; skips when both price types are fresh (unless `force`); marks the expansion fresh on success; returns `{ ok, skipped?, cardsFetched, pricesUpserted, imagesUpdated, variantsMatched, variantsConflicted, requests }`. See **Per-Set Sync** below. |
 | `POST` | `/scrydex/refresh-card` | `x-worker-secret` | **Blocking** vendor on-demand refresh — body `{ product_id }`; fetches the expansion but upserts raw+graded prices for **only the target card** (matched by `tcgplayer_product_id`/number), does NOT mark the expansion fresh; returns `{ ok, pricesUpserted, requests }` |
 | `POST` | `/scrydex/vision-identify` | `x-worker-secret` | **Blocking** Scrydex Vision card identify (§4 #7) — `multipart/form-data` `image` + optional `games` (csv). Calls `scrydexVisionIdentify()` (credit guard + **5-credit** `scrydex_api_log` debit); returns `{ ok, analysis, matches }` (403/cap → 502 `{ok:false,status:403}` so the caller falls back to Claude). Content proxies this **admin-only** for the scanner. |
-| `POST` | `/pricecharting/ingest` | `x-worker-secret` | **CSV BULK-INGEST** (2026-06-16). Body `{ category, force? }` (`category` ∈ pokemon-cards\|magic-cards\|yugioh-cards\|one-piece-cards). Same job the `0 5 * * *` cron runs for one category. Streams the per-game price-guide CSV, matches each row to a canonical product (tcg-id first → validated fuzzy fallback), persists the map (`pricecharting_products`), and upserts canonical `prices` (source='pricecharting'). Resumable (KV cursor `pc_ingest_cursor:{category}`) and **time-bounded** (`PC_INGEST_BUDGET_MS`, default 20s — under the ~60s request cap) so it returns counts instead of being canceled; loop until `wrapped:true`. Returns `{ ok, matchedTcgId, matchedFuzzy, alreadyMatched, unmatched, sealedRows, sealedMatched, pricesUpserted, rowsCollected, rowsProcessed, windowStart, cursorNext, wrapped, budgetHit, durationMs }`. Needs `PRICECHARTING_TOKEN`. See **PriceCharting CSV Bulk-Ingest**. |
+| `POST` | `/pricecharting/ingest` | `x-worker-secret` | **CSV BULK-INGEST** (2026-06-16). Body `{ category, force? }` (`category` ∈ pokemon-cards\|magic-cards\|yugioh-cards\|one-piece-cards). Same job the `0 5 * * *` cron runs for one category. Streams the per-game price-guide CSV, matches each row to a canonical product (tcg-id first → validated fuzzy fallback), persists the map (`pricecharting_products`), and upserts canonical `prices` (source='pricecharting'). Resumable (KV cursor `pc_ingest_cursor:{category}`) and **time-bounded** (`PC_INGEST_BUDGET_MS`, default 20s — under the ~60s request cap) so it returns counts instead of being canceled; loop until `wrapped:true`. Returns `{ ok, matchedTcgId, matchedFuzzy, unmatched, sealedRows, sealedMatched, pricesUpserted, rowsCollected, rowsProcessed, windowStart, cursorNext, wrapped, budgetHit, durationMs }`. Needs `PRICECHARTING_TOKEN`. See **PriceCharting CSV Bulk-Ingest**. |
 | `GET` | `/pricecharting/graded?canonicalProductId=&company=&grade=` | `x-worker-secret` | **PRIMARY admin graded source** (2026-06-15). Needs **`PRICECHARTING_TOKEN`**. Resolves the canonical product → a PriceCharting id (search `/api/products?q=<name> <set>` + **validate** the best match + KV-cache `pc_id:{id}` long-TTL; raw `/api/product` cached `pc_product:{pcId}` 24h), decodes the (company,grade) tier, returns `{ ok, price, key, productName, console, salesVolume }` (price INTEGER PENNIES ÷100; `price:null` = unsupported/no-match). Rate limit 1 req/sec (sleeps between search+product). `src/lib/pricechartingClient.ts`. Content proxies **admin-only** + KV-caches 24h. |
 | `GET` | `/tcggo/graded-prices?tcgplayerId=...` | `x-worker-secret` | **SECONDARY graded fallback** (demoted 2026-06-15 — was primary). tcggo (RapidAPI `pokemon-tcg-api.p.rapidapi.com`) eBay-sold graded medians. Needs **`TCGGO_RAPIDAPI_KEY`** (NOT Scrydex). Calls `/cards?tcgplayer_id=...`, reads `prices.ebay.graded[company][grade]` → `{ ok, tcgplayerId, graded:{psa,bgs,cgc}|null, source:'tcggo' }`. `src/lib/tcggoClient.ts`. Content proxies **admin-only** + KV-caches 24h. |
 | `GET` | `/tcggo/artists?search=&page=` | `x-worker-secret` | **Artist Templates tool** (2026-06-15). Lists/searches tcggo artists → `{ ok, artists:[{id,name,slug,cards_count}], page }`. Content proxies admin-only + KV-caches briefly. |
@@ -411,19 +411,24 @@ the on-demand `/pricecharting/graded` (admin-only) stays the live fallback for O
   'normal', grade NULL); `cib`→'Grade 7 / 7.5'; `new`→'Grade 8 / 8.5'; `graded-price`→'Grade 9';
   `box-only`→'Grade 9.5'; `manual-only`→'PSA 10'; `bgs-10`→'BGS 10'; `condition-17`→'CGC 10';
   `condition-18`→'SGC 10'. (No TAG/ACE; sub-10 grades are company-agnostic — same caveats as the API.)
-- **Matching (`src/pricechartingIngest.ts`):**
-  - **PRIMARY — tcg-id** (`tcg-id` ≈73% populated; it is the TCGPlayer product id): batched
-    `products.tcgplayer_product_id IN (…)` (chunks of 90), **validated** by name-token overlap
-    (`validateTcgIdMatch`) so a wrong/stale id never misprices. tcgplayer_product_id is globally
-    unique → no game scoping needed.
-  - **FALLBACK — validated fuzzy** (no/failed tcg-id): scope candidate canonical products by game
-    (`canonical_games.tcgplayer_category_id`) + card number, score name+number (`pickBestCanonicalMatch`),
-    accept at ≥5 (name + number) — **reject weak matches rather than misprice**. Bounded per run
-    (`PC_INGEST_FUZZY_MAX`, default 400); the bulk comes from tcg-id.
-  - **Persisted mapping** → `pricecharting_products` (pc_id ↔ canonical product id) so re-ingests are
-    **incremental** (matched pc_ids skip the fuzzy work; prices still re-upsert = the daily refresh).
-    **Unmatched rows are RECORDED** (`canonical_product_id IS NULL`), never silently dropped — the
-    catalogue-gap signal (count/list per game). `sales-volume` is captured per pc_id (vendor liquidity).
+- **Matching is IN-MEMORY (`src/pricechartingIngest.ts`)** — `loadProductIndex()` pulls the game's
+  canonical products ONCE per run (paginated, a few round trips) into `byTcgId` + `byNumber` maps;
+  `matchRows()` is then pure CPU (no per-row D1 query). **WHY (fixed 2026-06-17):** the per-row fuzzy
+  JOIN fired once per row, and PriceCharting sorts the guide **oldest-first** so the early rows
+  (vintage WoTC, pre-TCGPlayer) have **no tcg-id** → an all-fuzzy storm (~135ms/row → 500 rows in 54s,
+  `matchedTcgId:0`). The in-memory index makes match cost negligible; only the batched writes hit D1.
+  - **PRIMARY — tcg-id** (`tcg-id` ≈73% populated overall; it is the TCGPlayer product id): `byTcgId`
+    map lookup, **validated** by name-token overlap (`validateTcgIdMatch`) so a wrong/stale id never
+    misprices. tcgplayer_product_id is globally unique → no game scoping needed. (Early oldest rows have
+    no tcg-id and many aren't in our catalogue → recorded unmatched; tcg-id matches climb in later/newer
+    windows — read the live rate from the per-run counts, don't assume 73% in any single window.)
+  - **FALLBACK — validated fuzzy** (no/failed tcg-id): candidates from the `byNumber` index (card
+    number), scored on name+number (`pickBestCanonicalMatch`), accept at ≥5 (name + number) — **reject
+    weak matches rather than misprice**. Bounded per run (`PC_INGEST_FUZZY_MAX`, default 400).
+  - **Persisted mapping** → `pricecharting_products` (pc_id ↔ canonical product id). Re-runs re-match
+    in memory (cheap + deterministic) and re-upsert prices on the same conflict keys (= the daily
+    refresh, no dupes). **Unmatched rows are RECORDED** (`canonical_product_id IS NULL`), never silently
+    dropped — the catalogue-gap signal (count/list per game). `sales-volume` captured per pc_id.
 - **Sealed rows** (genre = "Sealed Product"): matched like any row; written with **ONLY the ungraded /
   market row** (sealed product has no graded tiers). Where a sealed row can't be matched it is counted
   unmatched (not dropped).
