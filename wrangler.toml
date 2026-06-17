@@ -36,6 +36,18 @@ bucket_name = "sleeved-pages-images"
 binding = "SLEEVEDPAGES_KV"
 id      = "d8b69df87a0143b699e8dc75d286cdcb"
 
+# ── Worker secrets (set via `wrangler secret put <NAME>`, never committed) ─────
+#   INGESTION_WORKER_SECRET — shared secret for the admin-proxied HTTP endpoints
+#   SCRYDEX_API_KEY / SCRYDEX_TEAM_ID — Scrydex price/image/Vision
+#   PRICECHARTING_TOKEN — PriceCharting on-demand graded + daily CSV bulk-ingest
+#   TCGGO_RAPIDAPI_KEY — STILL REQUIRED: powers the Artist→Binder-Template tool
+#       (/tcggo/artists, /tcggo/artists/:id/cards). Its graded eBay-sold role was
+#       REMOVED (unreliable canonical-id matching); do NOT remove this key.
+#   APIFY_TOKEN + APIFY_EBAY_ACTOR_ID — eBay sold-comp graded gap-filler. Confirmed
+#       actor caffein.dev/ebay-sold-listings (APIFY_EBAY_ACTOR_ID = oTtB3VgfuE9GtxQt2).
+#       Worker-only; admin-proxied; never in the Content app, never logged. Gated dark
+#       behind the Content `ebay_graded_enabled` app_config flag.
+
 # Cron schedule:
 #   0 6 * * *    — daily TCGPlayer data sync
 #   0 3 * * SUN  — weekly image mirror + Scrydex set mapping

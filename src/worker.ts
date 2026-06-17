@@ -5,8 +5,9 @@ import { syncSingleSet } from './scrydexSyncSet.js';
 import { syncScrydexSetMappings } from './scrydexSetMapping.js';
 import { syncScrydexImages } from './scrydexImageSync.js';
 import { cleanupScrydexApiLog, scrydexVisionIdentify, ScrydexCreditLimitError } from './lib/scrydexClient.js';
-import { fetchTcggoGradedPrices, searchTcggoArtists, fetchAllArtistCards } from './lib/tcggoClient.js';
+import { searchTcggoArtists, fetchAllArtistCards } from './lib/tcggoClient.js';
 import { fetchPriceChartingGraded } from './lib/pricechartingClient.js';
+import { fetchEbayGraded } from './lib/ebayGradedClient.js';
 import { ingestPriceChartingCategory } from './pricechartingIngest.js';
 import { PRICECHARTING_CATEGORIES, type PriceChartingCategory } from './lib/pricechartingCsv.js';
 import { backfillR2ImageUrls, backfillVariantImages, seedVariantProducts } from './backfillR2Urls.js';
@@ -27,9 +28,17 @@ export interface Env {
   SCRYDEX_MONTHLY_LIMIT?: string;
   // Shared secret for admin-triggered HTTP endpoints
   INGESTION_WORKER_SECRET?: string;
-  // tcggo (pokemon-tcg-api.p.rapidapi.com) RapidAPI key — graded eBay-sold medians
-  // (admin-only demo path; key lives here, never in the Content app)
+  // tcggo (pokemon-tcg-api.p.rapidapi.com) RapidAPI key — STILL REQUIRED: powers the
+  // Artist→Binder-Template ingestion tool (/tcggo/artists, /tcggo/artists/:id/cards).
+  // The graded eBay-sold role was REMOVED (unreliable id matching) — eBay sold comps
+  // now come from the Apify actor below. Key lives here, never in the Content app.
   TCGGO_RAPIDAPI_KEY?: string;
+  // Apify eBay sold-comps gap-filler — graded medians for slabs PriceCharting can't
+  // price (TAG/ACE, grade < 7). Confirmed actor: caffein.dev/ebay-sold-listings
+  // (APIFY_EBAY_ACTOR_ID = oTtB3VgfuE9GtxQt2). Both live HERE only (admin-proxied;
+  // never in the Content app, never logged or returned). See lib/ebayGradedClient.ts.
+  APIFY_TOKEN?: string;
+  APIFY_EBAY_ACTOR_ID?: string;
   // PriceCharting API token — PRIMARY admin graded-price source (operator sets it;
   // lives here, never in the Content app). Also powers the daily CSV bulk-ingest
   // (src/pricechartingIngest.ts). See lib/pricechartingClient.ts.
@@ -89,28 +98,37 @@ export default {
       return json({ ok: true, message: 'Sync started' });
     }
 
-    // ── tcggo graded prices (require x-worker-secret; GET) ──────────────────────
-    // Returns eBay-sold graded medians for a TCGPlayer product id. The Content app
-    // proxies this ADMIN-ONLY and KV-caches it 24h to protect the free-tier quota.
-    // No Scrydex key needed — this uses TCGGO_RAPIDAPI_KEY (the RapidAPI key lives
-    // here, never in the Content app).
-    if (pathname === '/tcggo/graded-prices' && request.method === 'GET') {
+    // ── eBay sold-comp graded gap-filler (require x-worker-secret; GET) ─────────
+    // Graded medians for slabs PriceCharting can't price (TAG/ACE, grade < 7) or has
+    // no value for. Resolves the canonical product → eBay completed+sold search terms,
+    // runs the Apify eBay actor, then match-filters / trims / takes a median + sample
+    // size. The Content app proxies this ADMIN-ONLY, behind the dormant
+    // `ebay_graded_enabled` flag, and KV-caches it 24h (incl. nulls) so the actor fires
+    // at most once per card/grade/day. APIFY_TOKEN + APIFY_EBAY_ACTOR_ID live here only.
+    // price:null / n:0 means no comps survived — the Content chain falls to the sold link.
+    if (pathname === '/ebay/graded' && request.method === 'GET') {
       const secret = request.headers.get('x-worker-secret');
       if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
         return json({ ok: false, error: 'Unauthorized' }, 401);
       }
-      if (!env.TCGGO_RAPIDAPI_KEY) {
-        return json({ ok: false, error: 'TCGGO_RAPIDAPI_KEY not configured' }, 503);
+      if (!env.APIFY_TOKEN || !env.APIFY_EBAY_ACTOR_ID) {
+        return json({ ok: false, error: 'APIFY_TOKEN / APIFY_EBAY_ACTOR_ID not configured' }, 503);
       }
-      const tcgplayerId = new URL(request.url).searchParams.get('tcgplayerId');
-      if (!tcgplayerId) {
-        return json({ ok: false, error: 'tcgplayerId is required' }, 400);
+      const url = new URL(request.url);
+      const canonicalProductId = Number(url.searchParams.get('canonicalProductId'));
+      const company = (url.searchParams.get('company') ?? '').trim();
+      const grade   = (url.searchParams.get('grade') ?? '').trim();
+      if (!Number.isInteger(canonicalProductId) || canonicalProductId <= 0) {
+        return json({ ok: false, error: 'canonicalProductId is required' }, 400);
+      }
+      if (!company || !grade) {
+        return json({ ok: false, error: 'company and grade are required' }, 400);
       }
       try {
-        const result = await fetchTcggoGradedPrices(env, tcgplayerId);
+        const result = await fetchEbayGraded(env, { canonicalProductId, company, grade });
         return json({ ok: true, ...result });
       } catch (err) {
-        logger.error('tcggo graded fetch failed', { error: String(err), tcgplayerId });
+        logger.error('ebay graded fetch failed', { error: String(err), canonicalProductId });
         return json({ ok: false, error: String(err) }, 502);
       }
     }
