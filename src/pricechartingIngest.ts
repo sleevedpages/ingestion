@@ -239,7 +239,8 @@ function matchRows(
 const PRICE_UPSERT_SQL = `
   INSERT INTO prices (product_id, source, condition, finish, grade, value, fetched_at)
   VALUES (?, 'pricecharting', ?, ?, ?, ?, unixepoch())
-  ON CONFLICT (product_id, source, COALESCE(condition,''), COALESCE(finish,''), COALESCE(grade,''))
+  ON CONFLICT (product_id, source, COALESCE(condition,''), COALESCE(finish,''), COALESCE(grade,''),
+               COALESCE(variant,''), COALESCE(company,''), is_signed, is_error, is_perfect)
   DO UPDATE SET value = excluded.value, fetched_at = excluded.fetched_at`
 
 const MAP_UPSERT_SQL = `

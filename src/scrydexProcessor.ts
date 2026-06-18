@@ -506,7 +506,8 @@ const SCRYDEX_PRICE_SQL = `
     (product_id, source, condition, finish, grade, value,
      trend_1d, trend_7d, trend_14d, trend_30d, trend_90d, fetched_at)
   VALUES (?, 'scrydex', ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
-  ON CONFLICT (product_id, source, COALESCE(condition,''), COALESCE(finish,''), COALESCE(grade,''))
+  ON CONFLICT (product_id, source, COALESCE(condition,''), COALESCE(finish,''), COALESCE(grade,''),
+               COALESCE(variant,''), COALESCE(company,''), is_signed, is_error, is_perfect)
   DO UPDATE SET
     value      = excluded.value,
     trend_1d   = excluded.trend_1d,

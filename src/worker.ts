@@ -1,6 +1,7 @@
 import { runIngestion, processGroupMessage, type IngestionConfig, type SyncGroupMessage } from './ingestion/index.js';
 import { runMirrorJob, getPendingCards, uploadCardImage } from './image-mirror.js';
 import { processPendingWebhooks, refreshCardPrices } from './scrydexProcessor.js';
+import { enrichCard, type EnrichClass } from './scrydexEnrich.js';
 import { syncSingleSet } from './scrydexSyncSet.js';
 import { syncScrydexSetMappings } from './scrydexSetMapping.js';
 import { syncScrydexImages } from './scrydexImageSync.js';
@@ -343,6 +344,26 @@ export default {
           return json({ ok: false, error: 'product_id (canonical products.id) is required' }, 400);
         }
         const result = await refreshCardPrices(env, productId);
+        return json(result, result.ok ? 200 : 502);
+      }
+
+      // Tier-aware detail enrichment — BLOCKING (returns per-class counts). The Content app
+      // resolves the viewer's tier + per-data-class freshness and only sends the STALE classes
+      // the viewer is entitled to (Collector → ['core']; Curator+ → ['core','comps','history']).
+      // This does the credit-guarded Scrydex fetches + canonical upserts. See scrydexEnrich.ts.
+      if (pathname === '/scrydex/enrich-card') {
+        const body = await request.json().catch(() => ({})) as { canonicalProductId?: number | string; classes?: string[] };
+        const canonicalProductId = Number(body.canonicalProductId);
+        if (!Number.isInteger(canonicalProductId) || canonicalProductId < 1) {
+          return json({ ok: false, error: 'canonicalProductId (canonical products.id) is required' }, 400);
+        }
+        const allowed: EnrichClass[] = ['core', 'comps', 'history'];
+        const classes = (Array.isArray(body.classes) ? body.classes : [])
+          .filter((c): c is EnrichClass => (allowed as string[]).includes(c));
+        if (classes.length === 0) {
+          return json({ ok: false, error: 'classes must include at least one of core|comps|history' }, 400);
+        }
+        const result = await enrichCard(env, { canonicalProductId, classes });
         return json(result, result.ok ? 200 : 502);
       }
     }

@@ -208,7 +208,8 @@ const PRICE_SQL = `
   VALUES (
     (SELECT id FROM products WHERE tcgplayer_product_id = ?),
     'tcgplayer', NULL, ?, NULL, ?, ?)
-  ON CONFLICT (product_id, source, COALESCE(condition,''), COALESCE(finish,''), COALESCE(grade,''))
+  ON CONFLICT (product_id, source, COALESCE(condition,''), COALESCE(finish,''), COALESCE(grade,''),
+               COALESCE(variant,''), COALESCE(company,''), is_signed, is_error, is_perfect)
   DO UPDATE SET
     value      = excluded.value,
     fetched_at = excluded.fetched_at`;
