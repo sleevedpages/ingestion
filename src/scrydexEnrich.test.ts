@@ -30,6 +30,13 @@ const UMBREON: any = {
     {
       name: 'firstEditionHolofoil',
       marketplaces: [{ name: 'tcgplayer', product_id: '12345' }],
+      // CONFIRMED shape: pop reports nested PER VARIANT, one entry per company w/ grades[].
+      pop_reports: [
+        {
+          company: 'PSA', total: 1832, grade_total: 1811, qualified_grade_total: 0, half_grade_total: 21,
+          grades: [{ grade: '10', count: 104 }, { grade: '9', count: 618 }, { grade: '8', count: 416 }],
+        },
+      ],
       prices: [
         { type: 'raw', condition: 'NM', low: 380, mid: 420, high: 500, market: 430, trends: { days_1: { percent_change: 1.2 }, days_180: { percent_change: -5 } } },
         { type: 'raw', condition: 'LP', low: 300, mid: 330, high: 360, market: 340, trends: {} },
@@ -43,14 +50,13 @@ const UMBREON: any = {
     {
       name: 'unlimitedHolofoil',
       marketplaces: [{ name: 'tcgplayer', product_id: '12345' }],   // SHARES the same TCGPlayer id
+      pop_reports: [
+        { company: 'CGC', total: 900, grade_total: 880, grades: [{ grade: '9.5', count: 120 }, { grade: 'auth', count: 1 }] },
+      ],
       prices: [
         { type: 'raw', condition: 'NM', low: 90, mid: 110, high: 140, market: 120, trends: {} },
       ],
     },
-  ],
-  pop_reports: [
-    { company: 'PSA', grade: '10', count: 1500, total: 8000, grade_total: 1500, qualified_grade_total: 12, half_grade_total: 0 },
-    { company: 'CGC', grade: '9.5', count: 120, total: 900 },
   ],
 }
 
@@ -134,19 +140,22 @@ describe('parseCardPrices (Umbreon)', () => {
 })
 
 describe('parsePopReports', () => {
-  it('parses the array form', () => {
+  it('parses pop reports nested per variant → one row per (variant, company, grade)', () => {
     const pops = parsePopReports(UMBREON)
-    expect(pops).toHaveLength(2)
-    const psa = pops.find(p => p.company === 'PSA')!
-    expect(psa.grade).toBe('PSA 10'); expect(psa.count).toBe(1500); expect(psa.total).toBe(8000)
+    // firstEd PSA: 3 grades; unlimited CGC: 2 grades (incl. 'auth') → 5 rows.
+    expect(pops).toHaveLength(5)
+    const psa10 = pops.find(p => p.variant === 'firstEditionHolofoil' && p.grade === 'PSA 10')!
+    expect(psa10.count).toBe(104)
+    expect(psa10.total).toBe(1832)            // company-level total carried onto the grade row
+    expect(psa10.grade_total).toBe(1811)
+    expect(psa10.half_grade_total).toBe(21)
+    // per-variant separation: the unlimited CGC pops are distinct rows
+    const cgcAuth = pops.find(p => p.variant === 'unlimitedHolofoil' && p.grade === 'CGC auth')!
+    expect(cgcAuth.count).toBe(1)
   })
-  it('parses the nested-by-company form', () => {
-    const pops = parsePopReports({ pop_reports: { PSA: { total: 8000, grades: { '10': { count: 1500 } } } } })
-    expect(pops).toHaveLength(1)
-    expect(pops[0]).toMatchObject({ company: 'PSA', grade: 'PSA 10', count: 1500, total: 8000 })
-  })
-  it('tier-resilient: missing pop_reports → []', () => {
+  it('tier-resilient: missing/empty pop_reports → []', () => {
     expect(parsePopReports({})).toEqual([])
+    expect(parsePopReports({ variants: [{ name: 'normal' }] })).toEqual([])
   })
 })
 
@@ -173,22 +182,27 @@ describe('parseListings', () => {
 })
 
 describe('parsePriceHistory', () => {
-  it('parses the flat-points form', () => {
+  it('parses the confirmed day→prices[] shape (one row per day×point), slash dates → ISO', () => {
     const out = parsePriceHistory({ data: [
-      { date: '2026-06-01', low: 10, market: 12 },
-      { date: '2026-06-02', low: 11, market: 13 },
+      { date: '2026/06/18', prices: [
+        { variant: 'unlimitedHolofoil', grade: '8.5', company: 'BGS', type: 'graded', low: 399, mid: 500, high: 760, market: 700.36, currency: 'USD' },
+        { variant: 'unlimitedHolofoil', condition: 'NM', type: 'raw', low: 1000, market: 499.2, currency: 'USD' },
+      ] },
+      { date: '2026/06/17', prices: [
+        { variant: 'firstEditionHolofoil', grade: '10', company: 'CGC', type: 'graded', low: 4066, market: 11745.91, currency: 'USD' },
+      ] },
     ] })
-    expect(out).toHaveLength(2)
-    expect(out[0]).toMatchObject({ date: '2026-06-01', low: 10, market: 12 })
+    expect(out).toHaveLength(3)
+    const bgs = out.find(p => p.grade === 'BGS 8.5')!
+    expect(bgs).toMatchObject({ variant: 'unlimitedHolofoil', company: 'BGS', condition: null, date: '2026-06-18', low: 399, market: 700.36 })
+    const raw = out.find(p => p.condition === 'NM')!
+    expect(raw).toMatchObject({ grade: null, company: null, date: '2026-06-18', market: 499.2 })
+    expect(out.find(p => p.grade === 'CGC 10')!.date).toBe('2026-06-17')
   })
-  it('parses the series form (variant/condition/grade context on each point)', () => {
-    const out = parsePriceHistory({ data: [
-      { variant: 'firstEditionHolofoil', condition: 'NM', points: [{ date: '2026-06-01', low: 5, market: 6 }] },
-      { company: 'PSA', grade: '10', points: [{ date: '2026-06-01', low: 1800, market: 2100 }] },
-    ] })
-    expect(out).toHaveLength(2)
-    expect(out[0]).toMatchObject({ variant: 'firstEditionHolofoil', condition: 'NM', date: '2026-06-01' })
-    expect(out[1]).toMatchObject({ grade: 'PSA 10', company: 'PSA', condition: null })
+  it('day-level fallback shape still parses', () => {
+    const out = parsePriceHistory({ data: [{ date: '2026-06-01', low: 10, market: 12 }] })
+    expect(out).toHaveLength(1)
+    expect(out[0]).toMatchObject({ date: '2026-06-01', market: 12 })
   })
   it('tier-resilient: missing → []', () => {
     expect(parsePriceHistory({})).toEqual([])
@@ -243,7 +257,7 @@ describe('enrichCard', () => {
     const r = await enrichCard({ DB: db } as any, { canonicalProductId: 42, classes: ['core'] })
     expect(r.ok).toBe(true)
     expect(r.core!.pricesUpserted).toBeGreaterThan(0)
-    expect(r.core!.popUpserted).toBe(2)
+    expect(r.core!.popUpserted).toBe(5)   // 3 PSA (firstEd) + 2 CGC (unlimited) grade rows
     expect(db._batches.length).toBeGreaterThan(0)
     // markFresh ran for 'core'
     expect(db._runs.some((x: any) => x.sql.includes('card_enrichment_freshness') && x.args.includes('core'))).toBe(true)

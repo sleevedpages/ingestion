@@ -22,9 +22,14 @@
  * call goes through scrydexFetch's monthly guard; a guard trip (or a 403 credit cap) stops the
  * run and the caller serves the last-persisted rows rather than overage.
  *
- * ⚠️ The /listings and /price_history response shapes (and pop_reports) are written as TOLERANT
- * readers against the documented Scrydex structure — confirm with one operator probe at deploy
- * (mirrors the PriceCharting / Apify "documented assumption" pattern in this repo).
+ * SHAPES RECONCILED against the live operator payload (neo2-13, 2026-06-18):
+ *   - prices    : variant.prices[] { condition|grade+company, type, low/mid/high/market, trends }. ✓ as-built.
+ *   - pop_reports: NESTED PER VARIANT — variants[].pop_reports[] { company, total, grade_total,
+ *                  qualified_grade_total, half_grade_total, grades:[{grade,count}] } (NOT card-level).
+ *   - /listings : { data:[{ id, title, company, grade, price, sold_at, ... }] }. ✓ validated live.
+ *   - /price_history: one entry per DAY → { date, prices:[ <same per-point shape as prices> ] }
+ *                  (values live inside each prices[] element, dates are slash-format → ISO-normalised).
+ * The readers stay tolerant (currency strings, missing blocks) but now match the real structure.
  */
 
 import type { Env } from './worker.js'
@@ -41,7 +46,6 @@ const GAME_NAME_TO_SLUG: Record<string, string> = {
   'Riftbound':            'riftbound',
 }
 
-const RAW_CONDITIONS = new Set(['NM', 'LP', 'MP', 'HP', 'DM'])
 const BATCH_SIZE          = 90    // D1 binds <= 100 params/statement; the prices upsert binds 21, batch by statement count
 const LISTINGS_RETENTION_DAYS = 180
 const HISTORY_RETENTION_DAYS  = 365
@@ -181,48 +185,40 @@ export interface ParsedPopReport {
 }
 
 /**
- * Parse pop reports from a Scrydex card (include=pop_reports). Tolerant of two shapes:
- *   (a) array of entries  [{ company, grade, count, total, grade_total, ... , variant? }]
- *   (b) nested by company { PSA: { total, grades: { '10': { count, ... } } } }
- * Missing/empty → [].
+ * Parse pop reports from a Scrydex card object (include=pop_reports). CONFIRMED SHAPE
+ * (operator payload, neo2-13): pop reports are nested PER VARIANT, one entry per company,
+ * each with a `grades[]` array:
+ *   data.variants[].pop_reports[] = [{ company, total, grade_total, qualified_grade_total,
+ *                                      half_grade_total, grades: [{ grade, count }] }]
+ * → one output row per (variant, company, grade). The company-level totals repeat across that
+ * company's grade rows; `count` is the per-grade population. Grade labels can be non-numeric
+ * ('auth', '3Q', '1.5') — kept verbatim. Tier-resilient: missing/empty → [].
  */
 export function parsePopReports(card: unknown): ParsedPopReport[] {
   const c = card as any
-  const raw = c?.pop_reports ?? c?.pop_report ?? c?.population ?? null
-  if (!raw) return []
   const out: ParsedPopReport[] = []
-
-  const pushEntry = (company: string | null, gradeNum: string | null, label: string | null, e: any, variant: string | null) => {
-    const comp = normaliseCompany(company)
-    const grade = label ?? (comp && gradeNum ? `${comp} ${gradeNum}` : null)
-    if (!comp || !grade) return
-    out.push({
-      variant, company: comp, grade,
-      count:                 num(e?.count ?? e?.population),
-      total:                 num(e?.total),
-      grade_total:           num(e?.grade_total),
-      qualified_grade_total: num(e?.qualified_grade_total),
-      half_grade_total:      num(e?.half_grade_total),
-    })
-  }
-
-  if (Array.isArray(raw)) {
-    for (const e of raw) {
-      pushEntry(e?.company, e?.grade != null ? String(e.grade) : null, e?.label ?? null, e, e?.variant ?? null)
-    }
-    return out
-  }
-  // nested-by-company form
-  if (typeof raw === 'object') {
-    for (const [company, body] of Object.entries(raw as Record<string, any>)) {
-      const total = num((body as any)?.total)
-      const grades = (body as any)?.grades ?? body
-      if (grades && typeof grades === 'object') {
-        for (const [gradeNum, e] of Object.entries(grades as Record<string, any>)) {
-          if (e && typeof e === 'object') {
-            pushEntry(company, String(gradeNum), null, { ...e, total: (e as any)?.total ?? total }, null)
-          }
-        }
+  for (const variant of (c?.variants ?? []) as any[]) {
+    const variantName: string | null = variant?.name ?? null
+    for (const report of (variant?.pop_reports ?? []) as any[]) {
+      const company = normaliseCompany(report?.company)
+      if (!company) continue
+      const total                 = num(report?.total)
+      const gradeTotal            = num(report?.grade_total)
+      const qualifiedGradeTotal   = num(report?.qualified_grade_total)
+      const halfGradeTotal        = num(report?.half_grade_total)
+      for (const g of (report?.grades ?? []) as any[]) {
+        const gradeNum = g?.grade != null ? String(g.grade).trim() : null
+        if (!gradeNum) continue
+        out.push({
+          variant: variantName,
+          company,
+          grade: `${company} ${gradeNum}`,   // combined label, matching prices.grade convention
+          count:                 num(g?.count),
+          total,
+          grade_total:           gradeTotal,
+          qualified_grade_total: qualifiedGradeTotal,
+          half_grade_total:      halfGradeTotal,
+        })
       }
     }
   }
@@ -287,39 +283,53 @@ export interface ParsedHistoryPoint {
 }
 
 /**
- * Parse the daily price-history series from `/price_history`. Tolerant of two shapes:
- *   (a) flat points  { data: [{ date, low, market, variant?, condition?, grade?, company? }] }
- *   (b) series       { data: [{ variant, condition, grade, company, points: [{ date, low, market }] }] }
+ * Parse the daily price-history series from `/price_history`. CONFIRMED SHAPE (operator
+ * payload, neo2-13): one entry per DAY, each carrying a `prices[]` array of the SAME
+ * per-point objects as the card's prices (variant + condition|grade/company + type + low/mid/
+ * high/market):
+ *   { data: [ { date: '2026/06/18', prices: [ { variant, grade, company, condition?, type,
+ *                                               low, mid, high, market, currency } ] } ] }
+ * → one output row per (day, price-point). Graded points carry company+grade (grade label =
+ * `${company} ${grade}`, condition NULL); raw points carry `condition` (grade/company NULL).
+ * Slash dates normalise to ISO dashes (stable unique key + working retention prune). A
+ * day-level fallback (no `prices[]`) is kept for an older/simpler shape. Tier-resilient → [].
  */
 export function parsePriceHistory(resp: unknown): ParsedHistoryPoint[] {
   const r = resp as any
-  const arr: any[] = Array.isArray(r) ? r : (r?.data ?? r?.history ?? [])
+  const days: any[] = Array.isArray(r) ? r : (r?.data ?? r?.history ?? [])
   const out: ParsedHistoryPoint[] = []
 
-  const pushPoint = (p: any, ctx: { variant?: any; condition?: any; grade?: any; company?: any }) => {
-    const date = p?.date ?? p?.day ?? null
-    if (!date) return
-    const company  = normaliseCompany(ctx.company ?? p?.company)
-    const gradeNum = (ctx.grade ?? p?.grade)
-    const grade    = p?.grade_label ?? (company && gradeNum != null ? `${company} ${String(gradeNum).trim()}` : (gradeNum != null ? String(gradeNum) : null))
-    const condRaw  = ctx.condition ?? p?.condition
+  const pointRow = (date: string, p: any): ParsedHistoryPoint => {
+    const company  = normaliseCompany(p?.company)
+    const gradeNum = p?.grade != null ? String(p.grade).trim() : null
+    const grade    = company && gradeNum != null ? `${company} ${gradeNum}` : null
+    const condRaw  = p?.condition
     const cond     = condRaw ? String(condRaw).trim().toUpperCase() : null
-    out.push({
-      variant:   ctx.variant ?? p?.variant ?? null,
-      condition: RAW_CONDITIONS.has(cond ?? '') ? cond : (grade ? null : cond),
+    return {
+      variant:   p?.variant ?? null,
+      condition: grade ? null : cond,    // graded rows carry no raw condition
       grade,     company,
-      date:      String(date).slice(0, 10),
+      date,
       low:       num(p?.low),
       market:    num(p?.market ?? p?.price ?? p?.value),
       currency:  p?.currency ?? 'USD',
-    })
+    }
   }
 
-  for (const entry of arr) {
-    if (Array.isArray(entry?.points)) {
-      for (const p of entry.points) pushPoint(p, { variant: entry?.variant, condition: entry?.condition, grade: entry?.grade, company: entry?.company })
+  for (const day of days) {
+    const rawDate = day?.date ?? day?.day
+    if (!rawDate) continue
+    const date = String(rawDate).slice(0, 10).replace(/\//g, '-')   // '2026/06/18' → '2026-06-18'
+    const points: any[] = day?.prices ?? day?.points ?? []
+    if (Array.isArray(points) && points.length) {
+      for (const p of points) out.push(pointRow(date, p))
     } else {
-      pushPoint(entry, {})
+      // Fallback: a day-level low/market (no nested prices[]).
+      out.push({
+        variant: day?.variant ?? null, condition: null, grade: null, company: null,
+        date, low: num(day?.low), market: num(day?.market ?? day?.price ?? day?.value),
+        currency: day?.currency ?? 'USD',
+      })
     }
   }
   return out
