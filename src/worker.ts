@@ -5,13 +5,23 @@ import { enrichCard, type EnrichClass } from './scrydexEnrich.js';
 import { syncSingleSet } from './scrydexSyncSet.js';
 import { syncScrydexSetMappings } from './scrydexSetMapping.js';
 import { syncScrydexImages } from './scrydexImageSync.js';
-import { cleanupScrydexApiLog, scrydexVisionIdentify, ScrydexCreditLimitError } from './lib/scrydexClient.js';
+import { scrydexVisionIdentify, ScrydexCreditLimitError } from './lib/scrydexClient.js';
 import { searchTcggoArtists, fetchAllArtistCards } from './lib/tcggoClient.js';
 import { fetchPriceChartingGraded } from './lib/pricechartingClient.js';
 import { fetchEbayGraded } from './lib/ebayGradedClient.js';
 import { ingestPriceChartingCategory } from './pricechartingIngest.js';
 import { PRICECHARTING_CATEGORIES, type PriceChartingCategory } from './lib/pricechartingCsv.js';
 import { backfillR2ImageUrls, backfillVariantImages, seedVariantProducts } from './backfillR2Urls.js';
+import {
+  ADMIN_JOB_IDS,
+  isAdminJobId,
+  runWeeklyImagePipeline,
+  priceChartingCategoryForDay,
+  acquireJobLock,
+  releaseJobLock,
+  priceChartingCooldownRemaining,
+  startPriceChartingCooldown,
+} from './adminJobs.js';
 import { logger } from './ingestion/logger.js';
 
 export interface Env {
@@ -424,6 +434,83 @@ export default {
       return json({ ok: true, message: 'R2 backfill started — check worker logs for completion summary' });
     }
 
+    // POST /admin/run-job — manual, on-demand trigger for one of the four scheduled cron
+    // jobs (admin-proxied from the Content portal; requires x-worker-secret). Runs the SAME
+    // function the cron handler calls, fire-and-forget via waitUntil, and guards against
+    // double-firing with a best-effort KV lock. Body:
+    //   { job: 'tcg-sync'|'image-mirror'|'scrydex-drain'|'pricecharting-csv', force? }
+    if (pathname === '/admin/run-job' && request.method === 'POST') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      const body = await request.json().catch(() => ({})) as { job?: string; force?: boolean };
+      const job = body.job;
+      if (!isAdminJobId(job)) {
+        return json({ ok: false, error: `job must be one of: ${ADMIN_JOB_IDS.join(', ')}` }, 400);
+      }
+      // Per-job prerequisites (mirror the cron guards). image-mirror runs without Scrydex keys
+      // (the Scrydex sub-steps self-skip inside runWeeklyImagePipeline); scrydex-drain requires
+      // them, and pricecharting-csv requires the PriceCharting token.
+      if (job === 'scrydex-drain' && !(env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID)) {
+        return json({ ok: false, error: 'SCRYDEX_API_KEY / SCRYDEX_TEAM_ID not configured' }, 503);
+      }
+      if (job === 'pricecharting-csv' && !env.PRICECHARTING_TOKEN) {
+        return json({ ok: false, error: 'PRICECHARTING_TOKEN not configured' }, 503);
+      }
+      // PriceCharting's per-game CSV download is HARD rate-limited (~1/10min, abuse → account
+      // revocation). Gate the trigger behind a download cooldown set by ANY download (manual or
+      // the daily cron) so the button can't become a rapid-loop vector.
+      if (job === 'pricecharting-csv') {
+        const cooldown = await priceChartingCooldownRemaining(env);
+        if (cooldown > 0) {
+          return json({
+            ok: false,
+            error: `PriceCharting's CSV download is rate-limited to ~1 per 10 minutes. Try again in ~${Math.max(1, Math.ceil(cooldown / 60))} min.`,
+            cooldown: true,
+            retryAfterSec: cooldown,
+          }, 429);
+        }
+      }
+      // Double-fire guard — refuse a second run while one is already in flight.
+      if (!(await acquireJobLock(env, job))) {
+        return json({ ok: false, error: 'This job is already running.', alreadyRunning: true }, 409);
+      }
+
+      const category = job === 'pricecharting-csv' ? priceChartingCategoryForDay() : undefined;
+      // Register the download against the cooldown the moment we commit to running it.
+      if (job === 'pricecharting-csv') {
+        await startPriceChartingCooldown(env);
+      }
+
+      ctx.waitUntil(
+        (async () => {
+          try {
+            switch (job) {
+              case 'tcg-sync':
+                await runIngestion(buildConfig(env));
+                break;
+              case 'image-mirror':
+                await runWeeklyImagePipeline(env);
+                break;
+              case 'scrydex-drain':
+                await processPendingWebhooks(env);
+                break;
+              case 'pricecharting-csv':
+                await ingestPriceChartingCategory(env, category!, { force: !!body.force });
+                break;
+            }
+          } catch (err) {
+            logger.error('Manual job run failed', { job, error: String(err) });
+          } finally {
+            await releaseJobLock(env, job);
+          }
+        })()
+      );
+
+      return json({ ok: true, job, started: true, ...(category ? { category } : {}) });
+    }
+
     if (pathname === '/mirror' && request.method === 'POST') {
       try {
         // maxBatches=1 keeps the HTTP response well under 30s
@@ -479,10 +566,11 @@ export default {
     return json({ ok: false, error: 'Not found' }, 404);
   },
 
-  // Cron handler:
-  //   "0 6 * * *"         — daily TCGPlayer data sync
-  //   "0 3 * * SUN"       — weekly image mirror + Scrydex set mapping
-  //   every-10-min cron   — process pending Scrydex webhook log rows
+  // Cron handler (each job can also be run on demand via POST /admin/run-job — see adminJobs.ts):
+  //   "0 6 * * *"    — daily TCG (CSV) data sync                 → runIngestion (default case)
+  //   "0 3 * * SUN"  — weekly image-mirror pipeline               → runWeeklyImagePipeline
+  //   "0 4 * * *"    — daily Scrydex webhook drain                → processPendingWebhooks
+  //   "0 5 * * *"    — daily PriceCharting CSV (day-rotated cat)   → ingestPriceChartingCategory
   async scheduled(
     event: ScheduledEvent,
     env: Env,
@@ -491,21 +579,13 @@ export default {
     switch (event.cron) {
 
       case '0 3 * * SUN':
-        // Weekly pipeline (production only — UAT has this cron permanently disabled in wrangler.toml)
+        // Weekly image pipeline (production only — UAT has this cron permanently disabled in
+        // wrangler.toml). Same function the manual `image-mirror` trigger runs (see adminJobs.ts),
+        // so cron and on-demand stay in lockstep.
         ctx.waitUntil(
-          (async () => {
-            if (env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID) {
-              await syncScrydexSetMappings(env)
-                .catch((err) => logger.error('Scrydex set mapping failed', { error: String(err) }))
-              await syncScrydexImages(env)
-                .catch((err) => logger.error('Scrydex image sync failed', { error: String(err) }))
-            }
-            await runMirrorJob({ DB: env.DB, IMAGES_BUCKET: env.IMAGES_BUCKET }, Infinity)
-              .catch((err) => logger.error('Scheduled mirror failed', { error: String(err) }))
-
-            await cleanupScrydexApiLog(env.DB)
-              .catch((err) => logger.error('scrydex_api_log cleanup failed', { error: String(err) }))
-          })()
+          runWeeklyImagePipeline(env).catch((err) =>
+            logger.error('Weekly image pipeline failed', { error: String(err) })
+          )
         );
         break;
 
@@ -529,12 +609,16 @@ export default {
         // (KV cursor), so a large category spans several runs. The four categories cycle
         // every 4 days; spaced from the 04:00 Scrydex drain. Prod only (UAT cron list omits it).
         if (env.PRICECHARTING_TOKEN) {
-          const dayIdx = Math.floor(Date.now() / 86_400_000) % PRICECHARTING_CATEGORIES.length;
-          const category = PRICECHARTING_CATEGORIES[dayIdx];
+          const category = priceChartingCategoryForDay();
           ctx.waitUntil(
-            ingestPriceChartingCategory(env, category).catch((err) =>
-              logger.error('PriceCharting CSV ingest failed', { error: String(err), category })
-            )
+            (async () => {
+              // Register this scheduled download against the manual-trigger cooldown too, so the
+              // admin button correctly reports "cooling down" right after the daily cron runs.
+              await startPriceChartingCooldown(env);
+              await ingestPriceChartingCategory(env, category).catch((err) =>
+                logger.error('PriceCharting CSV ingest failed', { error: String(err), category })
+              );
+            })()
           );
         }
         break;
