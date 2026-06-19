@@ -237,11 +237,12 @@ function matchRows(
 }
 
 const PRICE_UPSERT_SQL = `
-  INSERT INTO prices (product_id, source, condition, finish, grade, value, fetched_at)
-  VALUES (?, 'pricecharting', ?, ?, ?, ?, unixepoch())
+  INSERT INTO prices (product_id, source, condition, finish, grade, value, retail_buy, retail_sell, fetched_at)
+  VALUES (?, 'pricecharting', ?, ?, ?, ?, ?, ?, unixepoch())
   ON CONFLICT (product_id, source, COALESCE(condition,''), COALESCE(finish,''), COALESCE(grade,''),
                COALESCE(variant,''), COALESCE(company,''), is_signed, is_error, is_perfect)
-  DO UPDATE SET value = excluded.value, fetched_at = excluded.fetched_at`
+  DO UPDATE SET value = excluded.value, retail_buy = excluded.retail_buy,
+                retail_sell = excluded.retail_sell, fetched_at = excluded.fetched_at`
 
 const MAP_UPSERT_SQL = `
   INSERT INTO pricecharting_products
@@ -355,9 +356,13 @@ export async function ingestPriceChartingCategory(
       if (res2.productId == null) { unmatched++; continue }
       if (res2.sealed) sealedMatched++
       for (const pr of csvRowToPriceRows(res2.row, { isSealed: res2.sealed })) {
-        // ungraded → (condition NULL, finish 'normal', grade NULL); graded → (NULL, NULL, label)
+        // ungraded → (condition NULL, finish 'normal', grade NULL) + retail buy/sell spread;
+        // graded → (NULL, NULL, label) value-only (retail buy/sell null).
         const finish = pr.grade == null ? 'normal' : null
-        priceStmts.push(env.DB.prepare(PRICE_UPSERT_SQL).bind(res2.productId, null, finish, pr.grade, pr.valueDollars))
+        priceStmts.push(env.DB.prepare(PRICE_UPSERT_SQL).bind(
+          res2.productId, null, finish, pr.grade, pr.valueDollars,
+          pr.retailBuyDollars ?? null, pr.retailSellDollars ?? null,
+        ))
       }
     }
     for (const b of chunk(mapStmts, DB_CHUNK)) await env.DB.batch(b)

@@ -66,6 +66,15 @@ export const PC_PRICE_COLUMNS: PcPriceColumn[] = [
 /** Just the graded columns (sealed product skips these — it has no graded tiers). */
 export const PC_GRADED_COLUMNS = PC_PRICE_COLUMNS.filter((c) => c.grade !== null)
 
+/**
+ * Ungraded buy/sell spread columns (the retail price-guide pair for the loose/market row).
+ * Captured ONLY on the ungraded row (grade === null) → canonical `prices.retail_buy`/
+ * `retail_sell` (mig 0075). They are the negotiating spread surfaced in the fallback display
+ * for cards Scrydex doesn't cover; graded tiers keep value-only.
+ */
+export const RETAIL_BUY_KEY = 'retail-loose-buy'
+export const RETAIL_SELL_KEY = 'retail-loose-sell'
+
 // ── Dollar parsing ────────────────────────────────────────────────────────────
 
 /**
@@ -151,22 +160,40 @@ export function isSealedRow(row: PcCsvRow): boolean {
   return (row['genre'] ?? '').trim() === SEALED_GENRE
 }
 
+/** One decoded canonical `prices` row from a CSV row. The ungraded/market row (grade null)
+ * may also carry the retail buy/sell spread (mig 0075); graded rows are value-only. */
+export interface PcDecodedPriceRow {
+  grade: string | null
+  valueDollars: number
+  retailBuyDollars?: number
+  retailSellDollars?: number
+}
+
 /**
  * Decode a parsed CSV row to the canonical `prices` rows it should write. Sealed rows
  * get ONLY the ungraded/market row (sealed product has no graded tiers); card rows get
  * the ungraded row plus every graded bucket that carries a positive value. `valueDollars`
- * is ready for `prices.value` (dollars). PURE.
+ * is ready for `prices.value` (dollars). The ungraded row additionally carries the retail
+ * buy/sell spread when present (→ `prices.retail_buy`/`retail_sell`). PURE.
  */
 export function csvRowToPriceRows(
   row: PcCsvRow,
   opts: { isSealed?: boolean } = {},
-): Array<{ grade: string | null; valueDollars: number }> {
+): PcDecodedPriceRow[] {
   const cols = opts.isSealed ? PC_PRICE_COLUMNS.filter((c) => c.grade === null) : PC_PRICE_COLUMNS
-  const rows: Array<{ grade: string | null; valueDollars: number }> = []
+  const rows: PcDecodedPriceRow[] = []
   for (const { col, grade } of cols) {
     const cents = parseDollarsToCents(row[col])
     if (cents == null) continue
-    rows.push({ grade, valueDollars: cents / 100 })
+    const out: PcDecodedPriceRow = { grade, valueDollars: cents / 100 }
+    if (grade === null) {
+      // The ungraded/market row carries the retail buy/sell negotiating spread.
+      const buy = parseDollarsToCents(row[RETAIL_BUY_KEY])
+      const sell = parseDollarsToCents(row[RETAIL_SELL_KEY])
+      if (buy != null) out.retailBuyDollars = buy / 100
+      if (sell != null) out.retailSellDollars = sell / 100
+    }
+    rows.push(out)
   }
   return rows
 }

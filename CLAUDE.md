@@ -434,8 +434,10 @@ the on-demand `/pricecharting/graded` (admin-only) stays the live fallback for O
   market row** (sealed product has no graded tiers). Where a sealed row can't be matched it is counted
   unmatched (not dropped).
 - **Write path:** idempotent upsert into canonical `prices` (`source='pricecharting'`), one row per
-  (product, grade/company) — `ON CONFLICT (product_id, source, COALESCE(condition,''),
-  COALESCE(finish,''), COALESCE(grade,''))`. Re-runs update value+fetched_at, never duplicate.
+  (product, grade/company) on the superset `uq_prices_identity` conflict key. Re-runs update
+  value+fetched_at, never duplicate. **The ungraded/loose row also carries the `retail_buy`/`retail_sell`
+  spread** (`retail-loose-buy`/`retail-loose-sell` → `prices.retail_buy`/`retail_sell`, mig 0075);
+  graded rows stay value-only. `csvRowToPriceRows` attaches them to the `grade===null` row.
 - **Scale / resumability / TIME-BOUNDED (must not block past the request cap):** the CSV is **streamed**
   (never buffered whole) and parsing **early-stops at the window end** (never downloads the tail past the
   window). Each run resumes from a KV cursor (`pc_ingest_cursor:{category}`) and processes rows in 500-row
@@ -512,7 +514,7 @@ from `credits_by_game` in the audit line.
 | `canonical_games` | Games. Resolve/mint by `tcgplayer_category_id`. (was `tcg_categories`) |
 | `sets` | Sets per game. `game_id`→canonical_games, `code` (was abbreviation), `release_date`, `scrydex_expansion_id`. (was `tcg_sets`) |
 | `products` | Cards + sealed. `set_id`→sets, `number`, `rarity`, `product_kind` (card/sealed). No image column. (was `tcg_products`) |
-| `prices` | `product_id`, `source` ('tcgplayer'\|'scrydex'\|'pricecharting'), `condition`, `finish`, `grade`, `value` (market), `trend_*`, `fetched_at`. **+ enrichment cols (Content mig 0073): `low`/`mid`/`high`, `variant`, `company`, `is_signed`/`is_error`/`is_perfect`, `trend_180d`, `trends_json`.** Identity index `uq_prices_identity` is the SUPERSET `(product_id, source, condition, finish, grade, variant, company, is_signed, is_error, is_perfect)` (COALESCE'd) — **all `prices` writers' `ON CONFLICT` must use this column list.** (was `tcg_prices` + `scrydex_prices`) |
+| `prices` | `product_id`, `source` ('tcgplayer'\|'scrydex'\|'pricecharting'), `condition`, `finish`, `grade`, `value` (market), `trend_*`, `fetched_at`. **+ enrichment cols (Content mig 0073): `low`/`mid`/`high`, `variant`, `company`, `is_signed`/`is_error`/`is_perfect`, `trend_180d`, `trends_json`.** **+ spread cols (Content mig 0075): `direct_low` (TCGplayer Direct), `retail_buy`/`retail_sell` (PriceCharting ungraded buy/sell).** The ungraded **SPREAD** is now persisted, not dropped: TCGCSV writes `low`/`mid`/`high`/`direct_low` (was market-only); PriceCharting writes `retail_buy`/`retail_sell` on the loose row. (Content serves the chain Scrydex→PriceCharting→TCGCSV with provenance — see Content/CLAUDE.md "Source fallback chain + provenance + spread".) Identity index `uq_prices_identity` is the SUPERSET `(product_id, source, condition, finish, grade, variant, company, is_signed, is_error, is_perfect)` (COALESCE'd) — **all `prices` writers' `ON CONFLICT` must use this column list** (the mig-0075 spread cols are non-identity). (was `tcg_prices` + `scrydex_prices`) |
 | `card_pop_reports` / `card_listings` / `card_price_history` / `card_enrichment_freshness` | Content mig 0073 — Scrydex detail enrichment: graded population counts, sold comps, daily price history, and the per-(product, data_class) 24h freshness lever. Written by `src/scrydexEnrich.ts` (`POST /scrydex/enrich-card`). See Content/CLAUDE.md "Scrydex Detail Enrichment". |
 | `product_images` | `product_id` (UNIQUE, mig 0063), `r2_url`, `source_url`, `source`, `mirrored_at`. |
 

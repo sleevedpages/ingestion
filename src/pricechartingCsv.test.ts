@@ -103,6 +103,16 @@ describe('real PriceCharting row (One Piece EB02-010)', () => {
     expect(byGrade['Grade 8 / 8.5']).toBe(1300)   // new-price
     expect(byGrade['Grade 7 / 7.5']).toBe(890.97) // cib-price
   })
+  it('captures the ungraded retail buy/sell spread on the loose row (mig 0075)', () => {
+    const out = csvRowToPriceRows(row)
+    const ungraded = out.find((r) => r.grade === null)!
+    expect(ungraded.retailBuyDollars).toBe(1452)   // retail-loose-buy  $1,452.00
+    expect(ungraded.retailSellDollars).toBe(2420)  // retail-loose-sell $2,420.00
+    // Graded rows carry value only — no retail buy/sell.
+    const psa10 = out.find((r) => r.grade === 'PSA 10')!
+    expect(psa10.retailBuyDollars).toBeUndefined()
+    expect(psa10.retailSellDollars).toBeUndefined()
+  })
 })
 
 // ── header index + row mapping ──────────────────────────────────────────────────

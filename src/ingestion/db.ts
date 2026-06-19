@@ -195,23 +195,31 @@ export async function upsertProductSourceImages(
 
 // Price -> prices  (W4; source='tcgplayer'; resolve product_id by tcgplayer_product_id)
 // finish<-sub_type_name; condition/grade NULL (TCGPlayer market prices are not
-// per-condition); value<-market_price (canonical value is market-only — low/mid/
-// high/direct_low are dropped). fetched_at<-synced_at as unix epoch.
+// per-condition); value<-market_price. The ungraded MARKET SPREAD is now persisted too —
+// low<-low_price (lowest listing), mid<-mid_price (median), high<-high_price, and
+// direct_low<-direct_low_price (TCGplayer Direct) — instead of being dropped: it is the
+// richer negotiating context surfaced as the fallback display for cards Scrydex doesn't
+// cover (the low/mid/high columns are the same ones Scrydex enrichment uses, mig 0073;
+// direct_low is mig 0075). fetched_at<-synced_at as unix epoch.
 // Conflict target is the uq_prices_identity expression index
-// (product_id, source, COALESCE(condition,''), COALESCE(finish,''), COALESCE(grade,'')).
+// (product_id, source, COALESCE(condition,''), COALESCE(finish,''), COALESCE(grade,''), ...).
 // REQUIRES products for these rows to already exist (the orchestrator/consumer now
 // upserts products BEFORE prices — see processGroupInline). A NULL product_id from
 // an unresolved sub-select would violate the NOT NULL FK; the sequencing guarantees it.
 const PRICE_SQL = `
   INSERT INTO prices
-    (product_id, source, condition, finish, grade, value, fetched_at)
+    (product_id, source, condition, finish, grade, value, low, mid, high, direct_low, fetched_at)
   VALUES (
     (SELECT id FROM products WHERE tcgplayer_product_id = ?),
-    'tcgplayer', NULL, ?, NULL, ?, ?)
+    'tcgplayer', NULL, ?, NULL, ?, ?, ?, ?, ?, ?)
   ON CONFLICT (product_id, source, COALESCE(condition,''), COALESCE(finish,''), COALESCE(grade,''),
                COALESCE(variant,''), COALESCE(company,''), is_signed, is_error, is_perfect)
   DO UPDATE SET
     value      = excluded.value,
+    low        = excluded.low,
+    mid        = excluded.mid,
+    high       = excluded.high,
+    direct_low = excluded.direct_low,
     fetched_at = excluded.fetched_at`;
 
 export async function upsertPrices(
@@ -226,6 +234,10 @@ export async function upsertPrices(
           r.tcgplayer_product_id,
           r.sub_type_name,
           r.market_price,
+          r.low_price,
+          r.mid_price,
+          r.high_price,
+          r.direct_low_price,
           unix(r.synced_at)
         )
       )
