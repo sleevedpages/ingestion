@@ -445,6 +445,11 @@ cron and looping to finish tripped the limit. Now:
   bytes in R2 (reuses the worker's `IMAGES_BUCKET`) under a dated key
   `ingest-raw/pricecharting/{category}/{YYYY-MM-DD}.csv`. Arms the 10-min cooldown the moment a download is
   attempted (even a 429 cools down — never retry-loops). The ONLY function that hits the rate-limited URL.
+  ⚠️ The response is **buffered to an `ArrayBuffer` before the R2 `put`** — R2 requires a **known length** and
+  the download stream is chunked (no `Content-Length`); passing `res.body` directly throws "Provided readable
+  stream must have a known length" (the bug that blocked the first prod fetch, 2026-06-20). A category export
+  is ~20–30 MB, well within the 128 MB Worker budget; PROCESS still STREAMS the file back from R2. Do NOT
+  revert to a raw-stream `put`.
 - **PROCESS** (`processPriceChartingWindow`) — unlimited, from R2. Read the cached object and ingest the
   ENTIRE category across many Worker invocations driven by the **dedicated `PC_PROCESS_QUEUE`**
   (`sleevedpages-pricecharting-queue`). The cursor is a **row offset OVER THE R2 FILE carried IN the queue

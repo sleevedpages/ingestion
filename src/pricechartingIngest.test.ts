@@ -68,13 +68,8 @@ function csvStream(csv: string): ReadableStream<Uint8Array> {
   return new ReadableStream({ start(c) { c.enqueue(bytes); c.close() } })
 }
 
-async function streamToString(rs: ReadableStream<Uint8Array>): Promise<string> {
-  const reader = rs.getReader(); const dec = new TextDecoder(); let out = ''
-  for (;;) { const { done, value } = await reader.read(); if (done) break; out += dec.decode(value, { stream: true }) }
-  return out
-}
-
-// Fake R2 bucket: get/put/head/list, value normalised to a string. Mirrors the bits we use.
+// Fake R2 bucket: get/put/head/list, value normalised to a string. Mirrors the bits we use —
+// and, like real R2, REJECTS a no-length ReadableStream (the regression guard for the put bug).
 function makeR2() {
   const store = new Map<string, string>()
   return {
@@ -84,7 +79,11 @@ function makeR2() {
       if (typeof value === 'string') s = value
       else if (value instanceof Uint8Array) s = new TextDecoder().decode(value)
       else if (value instanceof ArrayBuffer) s = new TextDecoder().decode(new Uint8Array(value))
-      else if (value && typeof value.getReader === 'function') s = await streamToString(value)
+      else if (value && typeof value.getReader === 'function') {
+        // Real R2 REJECTS a no-length ReadableStream ("Provided readable stream must have a known
+        // length"). Mimic that so a regression to `put(res.body)` fails this test (it shipped once).
+        throw new TypeError('Provided readable stream must have a known length')
+      }
       else s = String(value)
       store.set(key, s)
       return { key }

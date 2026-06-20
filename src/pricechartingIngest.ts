@@ -336,11 +336,17 @@ export async function fetchPriceChartingCsvToR2(env: Env, category: PriceChartin
     throw new Error(`PriceCharting CSV download failed (${category}): HTTP ${res.status}`)
   }
 
-  const bytes = Number(res.headers.get('content-length')) || null
-  await env.IMAGES_BUCKET.put(key, res.body, {
+  // R2 put() needs a KNOWN LENGTH; the PriceCharting download stream has none (chunked, no
+  // Content-Length), so a raw `res.body` throws "Provided readable stream must have a known
+  // length". Buffer the whole CSV to an ArrayBuffer first (a category export is ~20-30 MB — well
+  // within the 128 MB Worker memory budget). The PROCESS step still STREAMS the file back FROM R2,
+  // so this buffering is confined to the once-a-day FETCH.
+  const body = await res.arrayBuffer()
+  await env.IMAGES_BUCKET.put(key, body, {
     httpMetadata: { contentType: 'text/csv' },
     customMetadata: { source: 'pricecharting', category, date },
   })
+  const bytes = body.byteLength
   logger.info('pricecharting_csv_fetch', { category, key, date, bytes })
   return { category, key, date, bytes }
 }
