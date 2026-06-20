@@ -35,7 +35,8 @@ Shares the same D1 database (`sleevedpagesdb`) and R2 bucket (`sleeved-pages-ima
 - **Runtime**: Cloudflare Workers (TypeScript)
 - **Database**: Cloudflare D1 — `sleevedpagesdb` (binding: `DB`)
 - **Storage**: Cloudflare R2 — `sleeved-pages-images` (binding: `IMAGES_BUCKET`)
-- **Queue**: Cloudflare Queues — `sleevedpages-sync-queue` (binding: `SYNC_QUEUE`)
+- **Queue**: Cloudflare Queues — `sleevedpages-sync-queue` (binding: `SYNC_QUEUE`, TCGCSV per-set sync) +
+  `sleevedpages-pricecharting-queue` (binding: `PC_PROCESS_QUEUE`, PriceCharting windowed PROCESS-from-R2)
 - **Data source**: TCGCSV API (`https://tcgcsv.com`) for card/set/price data
 
 ## Commands
@@ -103,7 +104,7 @@ db/migrations/
 | `0 6 * * *` | Daily TCG data sync (categories → sets → products → prices) |
 | `0 3 * * SUN` | Weekly: `syncScrydexSetMappings` → `syncScrydexImages` → `runMirrorJob` (Infinity batches) → `scrydex_api_log` cleanup (90-day retention) |
 | `0 4 * * *` | **DAILY** Scrydex webhook drain → upsert canonical `prices` (dedup by expansion; 20h freshness). **Was `*/10`** — moved to daily for cost control (2026-06; see Price Processing). |
-| `0 5 * * *` | **DAILY** PriceCharting CSV bulk-ingest — ONE category/run, rotated by day (4-day cycle). Upserts canonical `prices` (source='pricecharting') for the 4 games. See **PriceCharting CSV Bulk-Ingest**. Prod only. |
+| `0 5 * * *` | **DAILY** PriceCharting **FETCH** (rebuilt 2026-06-19) — download ONE rotated category's CSV → R2 (the only download; arms the 10-min cooldown), then the dedicated `PC_PROCESS_QUEUE` ingests the WHOLE category from that single cached file (canonical `prices`, source='pricecharting', for the 4 games). One download/day respects the 1-per-10-min limit; the queue finishes even a big ~88k-row category. See **PriceCharting CSV Bulk-Ingest (FETCH/PROCESS split)**. Prod only. |
 
 > **Each cron can also be run ON DEMAND** from the Content admin portal (Admin → Catalog → **Ingestion Jobs**)
 > via `POST /admin/run-job` (x-worker-secret, admin-proxied). The cron handler and the manual trigger call the
@@ -133,12 +134,13 @@ The `0 3 * * SUN` and `0 4 * * *` (Scrydex) crons are not registered in the UAT 
 | `POST` | `/scrydex/refresh-card` | `x-worker-secret` | **Blocking** vendor on-demand refresh — body `{ product_id }`; fetches the expansion but upserts raw+graded prices for **only the target card** (matched by `tcgplayer_product_id`/number), does NOT mark the expansion fresh; returns `{ ok, pricesUpserted, requests }` |
 | `POST` | `/scrydex/enrich-card` | `x-worker-secret` | **Blocking** tier-aware detail enrichment (2026-06-18). Body `{ canonicalProductId, classes:['core'\|'comps'\|'history'] }`. Per class: **core** = `GET /{slug}/v1/cards/{scrydexId}?include=prices,pop_reports` → canonical `prices` (per-variant ranges low/mid/high + graded matrix w/ signed/error/perfect flags) + `card_pop_reports`; **comps** = `/listings` → `card_listings` (prune >180d); **history** = `/price_history` → `card_price_history` (prune >365d). Marks `card_enrichment_freshness(product_id, class)` per class. Credit-guarded; a guard trip / 403 cap → `{ ok:true, skipped }`. Content proxies this from `POST /api/cards/enrich` (authed + tier-gated + per-class 24h freshness). `src/scrydexEnrich.ts`. See Content/CLAUDE.md "Scrydex Detail Enrichment". |
 | `POST` | `/scrydex/vision-identify` | `x-worker-secret` | **Blocking** Scrydex Vision card identify (§4 #7) — `multipart/form-data` `image` + optional `games` (csv). Calls `scrydexVisionIdentify()` (credit guard + **5-credit** `scrydex_api_log` debit); returns `{ ok, analysis, matches }` (403/cap → 502 `{ok:false,status:403}` so the caller falls back to Claude). Content proxies this **admin-only** for the scanner. |
-| `POST` | `/pricecharting/ingest` | `x-worker-secret` | **CSV BULK-INGEST** (2026-06-16). Body `{ category, force? }` (`category` ∈ pokemon-cards\|magic-cards\|yugioh-cards\|one-piece-cards). Same job the `0 5 * * *` cron runs for one category. Streams the per-game price-guide CSV, matches each row to a canonical product (tcg-id first → validated fuzzy fallback), persists the map (`pricecharting_products`), and upserts canonical `prices` (source='pricecharting'). Resumable (KV cursor `pc_ingest_cursor:{category}`) and **time-bounded** (`PC_INGEST_BUDGET_MS`, default 20s — under the ~60s request cap) so it returns counts instead of being canceled. ⚠️ Each call **RE-DOWNLOADS the whole CSV**, and the download is HARD-limited to **1/10 min (abuse → account revoked)**, so do NOT rapid-loop a big category — one-piece is small enough (~3 calls) but the big games need the design fix (see **PriceCharting CSV Bulk-Ingest → ⚠️ design flaw**). Returns `{ ok, matchedTcgId, matchedFuzzy, unmatched, sealedRows, sealedMatched, pricesUpserted, rowsCollected, rowsProcessed, windowStart, cursorNext, wrapped, budgetHit, durationMs }`. Needs `PRICECHARTING_TOKEN`. See **PriceCharting CSV Bulk-Ingest**. |
+| `POST` | `/pricecharting/fetch` | `x-worker-secret` | **CSV FETCH** (2026-06-19) — the ONLY path that downloads. Body `{ category }`. Downloads the full per-game CSV ONCE → R2 (`ingest-raw/pricecharting/{category}/{YYYY-MM-DD}.csv`), arms the 10-min cooldown, then enqueues PROCESSing. **Cooldown-gated → 429** `{cooldown:true, retryAfterSec}` while cooling (so it can never become a rapid re-download vector). Needs `PRICECHARTING_TOKEN`. Returns `{ ok, category, key, date, bytes, processing:'enqueued' }`. |
+| `POST` | `/pricecharting/ingest` | `x-worker-secret` | **CSV PROCESS** (rebuilt 2026-06-19) — PROCESS the cached R2 file (NO download, unlimited, idempotent). Body `{ category, sync? }`. Resolves the freshest R2 file (today, else most-recent as a logged **stale fallback**) and enqueues the windowed ingest chain (matches tcg-id-first → validated fuzzy, persists `pricecharting_products`, upserts canonical `prices` source='pricecharting' incl. the retail_buy/sell spread). Default returns `{ ok, mode:'enqueued', category, key, stale }`; `sync:true` processes ONE window inline from offset 0 and returns its `PcWindowCounts` (verification). **Does NOT need `PRICECHARTING_TOKEN`** (R2-only). 409 if nothing was ever fetched. See **PriceCharting CSV Bulk-Ingest (FETCH/PROCESS split)**. |
 | `GET` | `/pricecharting/graded?canonicalProductId=&company=&grade=` | `x-worker-secret` | **PRIMARY admin graded source** (2026-06-15). Needs **`PRICECHARTING_TOKEN`**. Resolves the canonical product → a PriceCharting id (search `/api/products?q=<name> <set>` + **validate** the best match + KV-cache `pc_id:{id}` long-TTL; raw `/api/product` cached `pc_product:{pcId}` 24h), decodes the (company,grade) tier, returns `{ ok, price, key, productName, console, salesVolume }` (price INTEGER PENNIES ÷100; `price:null` = unsupported/no-match). Rate limit 1 req/sec (sleeps between search+product). `src/lib/pricechartingClient.ts`. Content proxies **admin-only** + KV-caches 24h. |
 | `GET` | `/ebay/graded?canonicalProductId=&company=&grade=` | `x-worker-secret` | **GRADED GAP-FILLER** (2026-06-17 — REPLACED the removed tcggo graded source). Prices the slabs PriceCharting can't (TAG/ACE, grade < 7). Needs **`APIFY_TOKEN` + `APIFY_EBAY_ACTOR_ID`**. Resolves the canonical product → eBay completed+sold search terms (`src/lib/ebaySoldSearch.ts`), runs the Apify eBay actor (`run-sync-get-dataset-items`), then match-filters / trims outliers (MAD) / takes a median → `{ ok, price, n, company, grade, source:'ebay-apify' }` (`price:null`/`n:0` = no comps). Circuit-breaks to null on any actor error. `src/lib/ebayGradedClient.ts`. Content proxies **admin-only**, behind the `ebay_graded_enabled` flag (ships dark), + KV-caches 24h (nulls 6h). ⚠️ Actor input/output shapes are a documented assumption until the actor is pinned + probed. |
 | `GET` | `/tcggo/artists?search=&page=` | `x-worker-secret` | **Artist Templates tool** (2026-06-15). Lists/searches tcggo artists → `{ ok, artists:[{id,name,slug,cards_count}], page }`. Content proxies admin-only + KV-caches briefly. |
 | `GET` | `/tcggo/artists/:artistId/cards?cardsCount=` | `x-worker-secret` | Paginates **ALL** of an artist's cards (bounded by cards_count / short final page / 40-page free-tier cap) → `{ ok, artistId, count, cards:[{name,card_number,rarity,episode,image,tcgplayer_id,tcgid}], requests }`. Content maps these → canonical products + mints an owned template binder. |
-| `POST` | `/admin/run-job` | `x-worker-secret` | **MANUAL CRON-JOB TRIGGER** (2026-06-19). Body `{ job: 'tcg-sync'\|'image-mirror'\|'scrydex-drain'\|'pricecharting-csv', force? }`. Runs the SAME function the matching cron calls (`src/adminJobs.ts`), **fire-and-forget via `waitUntil`** → `{ ok, job, started:true, category? }`. Per-job prereqs mirror the cron guards (scrydex-drain needs Scrydex keys → 503; pricecharting-csv needs `PRICECHARTING_TOKEN` → 503; image-mirror runs without Scrydex keys, sub-steps self-skip). **Double-fire guard:** best-effort KV lock `ingestion_job_lock:{job}` (shared `SLEEVEDPAGES_KV`) → **409** `{alreadyRunning:true}` while a run is in flight. **pricecharting-csv extra guard:** a download cooldown `ingestion_pc_csv_cooldown` (~10 min, set by ANY download — manual or cron) → **429** `{cooldown:true, retryAfterSec}` because the PriceCharting CSV download is hard rate-limited ~1/10min (abuse → account revocation). Content proxies this **admin-only** via `POST /api/admin/ingestion/trigger`; status via `GET /api/admin/ingestion/jobs`. See **Manual Cron-Job Triggers** below. |
+| `POST` | `/admin/run-job` | `x-worker-secret` | **MANUAL CRON-JOB TRIGGER** (2026-06-19). Body `{ job: 'tcg-sync'\|'image-mirror'\|'scrydex-drain'\|'pricecharting-csv'\|'pricecharting-download', force? }`. Runs the SAME function the matching cron calls (`src/adminJobs.ts`), **fire-and-forget via `waitUntil`** → `{ ok, job, started:true, category? }`. Per-job prereqs: scrydex-drain needs Scrydex keys → 503; **pricecharting-download** (the ONLY download) needs `PRICECHARTING_TOKEN` → 503; **pricecharting-csv** PROCESSes the cached R2 file (no token, no download); image-mirror runs without Scrydex keys. **Double-fire guard:** best-effort KV lock `ingestion_job_lock:{job}` (shared `SLEEVEDPAGES_KV`) → **409** `{alreadyRunning:true}`. **pricecharting-download extra guard:** a download cooldown `ingestion_pc_csv_cooldown` (~10 min, set by ANY download — manual or cron) → **429** `{cooldown:true, retryAfterSec}` (PriceCharting CSV download is hard rate-limited ~1/10min, abuse → account revocation). `pricecharting-csv` (re-process) is NOT cooldown-gated — unlimited + safe. Content proxies this **admin-only** via `POST /api/admin/ingestion/trigger`; status via `GET /api/admin/ingestion/jobs`. See **Manual Cron-Job Triggers** below. |
 
 Scrydex endpoints are called from the Admin panel via Content app proxy (`POST /api/admin/scrydex/trigger`). Direct calls require `x-worker-secret: <INGESTION_WORKER_SECRET>` header.
 
@@ -153,7 +155,8 @@ and the manual trigger call the SAME job functions (no duplicated logic):
 | `tcg-sync` | `runIngestion(buildConfig(env))` | `0 6 * * *` | ✅ idempotent upserts; long-running |
 | `image-mirror` | `runWeeklyImagePipeline(env)` (set-mappings → image sync → `runMirrorJob(Infinity)` → `cleanupScrydexApiLog`) | `0 3 * * SUN` | ✅ merge-upserts, skips already-mirrored sets; long-running |
 | `scrydex-drain` | `processPendingWebhooks(env)` | `0 4 * * *` | ✅ freshness-guarded + deduped; consumes Scrydex credits |
-| `pricecharting-csv` | `ingestPriceChartingCategory(env, priceChartingCategoryForDay())` | `0 5 * * *` | ✅ idempotent upserts + resumable cursor; consumes PriceCharting quota |
+| `pricecharting-csv` | `runPriceChartingProcess(env, priceChartingCategoryForDay())` — PROCESS the cached R2 CSV (no download) | — (on demand) | ✅ idempotent upserts, R2-only; **unlimited + safe** (never touches the rate limit) |
+| `pricecharting-download` | `runPriceChartingFetch(env, priceChartingCategoryForDay())` — DOWNLOAD fresh CSV → R2 → PROCESS | `0 5 * * *` | ⚠️ downloads from PriceCharting — **rate-limited ~1/10min** (cooldown-gated) |
 
 - **Auth:** worker side = `x-worker-secret` (`INGESTION_WORKER_SECRET`); Content proxy = the existing admin gate
   (`functions/api/admin/_middleware.js`, `data.userId === ADMIN_USER_ID`). No new env var, no schema change.
@@ -164,10 +167,11 @@ and the manual trigger call the SAME job functions (no duplicated logic):
   Content status endpoint reads the SAME keys to render a "Running" pill + disable the button (plus an
   optimistic client window to bridge KV's eventual consistency).
 - **⚠️ PriceCharting cooldown:** because the CSV download is hard rate-limited ~1/10min (abuse → account
-  revocation, see `/pricecharting/ingest`), the `pricecharting-csv` trigger is additionally gated by a ~10-min
-  download cooldown (`ingestion_pc_csv_cooldown`, set by the manual trigger AND the `0 5` cron) so the button
-  can't become a rapid-loop vector. The status endpoint surfaces `cooldownRemainingSec` so the UI pre-disables
-  it and shows a countdown.
+  revocation, see `/pricecharting/fetch`), ONLY the `pricecharting-download` trigger is gated by a ~10-min
+  download cooldown (`ingestion_pc_csv_cooldown`, set by ANY download — the trigger AND the `0 5` cron) so it
+  can't become a rapid-loop vector. The status endpoint surfaces `cooldownRemainingSec` on that job so the UI
+  pre-disables it and shows a countdown. `pricecharting-csv` (re-process the cached CSV) is **not** gated —
+  reading R2 is unlimited and safe.
 - **Last-run:** surfaced for `tcg-sync` (`tcg_sync_log`) and `image-mirror` (`image_mirror_log`); the other two
   have no dedicated run-log table yet (future nicety — the panel shows the pending Scrydex webhook count for the
   drain instead). Tests: `src/adminJobs.test.ts`.
@@ -426,20 +430,43 @@ returns the result counts so the Admin UI can show them.
 - Tests: `src/scrydexSyncSet.test.ts` (happy path → canonical writes + freshness marked;
   set-not-found; fresh-skip; force bypass; credit-guard short-circuit).
 
-## PriceCharting CSV Bulk-Ingest (2026-06-16) — the all-users graded backbone for 4 games
+## PriceCharting CSV Bulk-Ingest (FETCH/PROCESS split — rebuilt 2026-06-19) — the all-users graded backbone for 4 games
 
 The production graded+ungraded price backbone for the **4 games we ingest** (Pokémon, Magic,
 Yu-Gi-Oh, One Piece). It **supersedes the on-demand PriceCharting API path FOR THESE 4 GAMES**;
 the on-demand `/pricecharting/graded` (admin-only) stays the live fallback for OTHER games.
 
+**ARCHITECTURE — FETCH and PROCESS are SPLIT (the 2026-06-19 rebuild; `src/pricechartingIngest.ts`).**
+The source CSV download is HARD rate-limited to **1 per 10 MINUTES** (abuse → the account's API access is
+REVOKED) and each export is ~88k rows. The OLD design re-downloaded the WHOLE CSV on every windowed call
+(the KV cursor was a row offset into a *fresh re-download*), so a big category NEVER finished on the daily
+cron and looping to finish tripped the limit. Now:
+- **FETCH** (`fetchPriceChartingCsvToR2`) — once/day/category. Download the full CSV ONCE and store the RAW
+  bytes in R2 (reuses the worker's `IMAGES_BUCKET`) under a dated key
+  `ingest-raw/pricecharting/{category}/{YYYY-MM-DD}.csv`. Arms the 10-min cooldown the moment a download is
+  attempted (even a 429 cools down — never retry-loops). The ONLY function that hits the rate-limited URL.
+- **PROCESS** (`processPriceChartingWindow`) — unlimited, from R2. Read the cached object and ingest the
+  ENTIRE category across many Worker invocations driven by the **dedicated `PC_PROCESS_QUEUE`**
+  (`sleevedpages-pricecharting-queue`). The cursor is a **row offset OVER THE R2 FILE carried IN the queue
+  message** — there is NO KV cursor, so the old eventual-consistency bounce is gone. Each window is bounded
+  by a wall-time budget (`PC_INGEST_BUDGET_MS`) AND a D1-batch cap (`PC_PROCESS_MAX_BATCHES`) to stay under
+  the per-invocation sub-request limit, then enqueues the next offset until EOF. **Completing a big category
+  costs ONE download + N cheap R2 reads — never N downloads.** Re-processing the same file is idempotent
+  (upserts on the same conflict keys), so a re-process / stale fallback never double-writes.
+- **Stale fallback** (`resolveProcessKey`) — PROCESS resolves today's R2 file, else the most-recent dated
+  file (logged `pricecharting_process_stale_fallback`); the data is backup-behind-Scrydex, so a 1-day-stale
+  file is acceptable. It NEVER re-downloads to compensate and NEVER processes nothing silently.
+- **Triggers:** cron `0 5` = FETCH (rotated category) → queue PROCESS; admin `pricecharting-download` =
+  FETCH+PROCESS (cooldown-gated); admin `pricecharting-csv` + `POST /pricecharting/ingest` = PROCESS the
+  cached file (no download, unlimited); `POST /pricecharting/fetch` = explicit fresh download.
+
 - **Source (operator-confirmed):** `GET https://www.pricecharting.com/price-guide/download-custom?t={PRICECHARTING_TOKEN}&category={cat}`
   for `cat` ∈ `pokemon-cards`, `magic-cards`, `yugioh-cards`, `one-piece-cards`. Returns CSV (~88k
   rows/game). The CSV download is **HARD-rate-limited to 1 per 10 MINUTES** (the file regenerates only
   ~once/24h), and **exceeding it gets the PriceCharting account's API permissions REVOKED**
-  (operator-confirmed 2026-06-19). ⚠️ This is the constraint the current per-window re-download VIOLATES
-  when rapid-looped — see the **design-flaw** note below. We pull
-  on the **daily `0 5 * * *` cron, ONE category per run, rotated by day** (4-day cycle). Manual:
-  `POST /pricecharting/ingest { category, force? }`.
+  (operator-confirmed 2026-06-19). The FETCH/PROCESS split above means this download happens **at most once
+  per category per day** (the cron, or an explicit cooldown-gated `POST /pricecharting/fetch`); processing
+  the cached file never re-downloads. The cron pulls **ONE category per run, rotated by day** (4-day cycle).
 - **Format: TAB-separated** (operator-confirmed) with **unquoted thousands commas** in the dollar fields
   (`$2,200.00`) and trailing spaces. The parser **auto-detects the delimiter** from the header
   (`detectDelimiter` — tab vs comma) so a comma split never shreds a priced row; `parseDollarsToCents`
@@ -454,7 +481,7 @@ the on-demand `/pricecharting/graded` (admin-only) stays the live fallback for O
   `box-only`→'Grade 9.5'; `manual-only`→'PSA 10'; `bgs-10`→'BGS 10'; `condition-17`→'CGC 10';
   `condition-18`→'SGC 10'. (No TAG/ACE; sub-10 grades are company-agnostic — same caveats as the API.)
 - **Matching is IN-MEMORY (`src/pricechartingIngest.ts`)** — `loadProductIndex()` pulls the game's
-  canonical products ONCE per run (paginated, a few round trips) into `byTcgId` + `byNumber` maps;
+  canonical products ONCE per PROCESS window (paginated, a few round trips) into `byTcgId` + `byNumber` maps;
   `matchRows()` is then pure CPU (no per-row D1 query). **WHY (fixed 2026-06-17):** the per-row fuzzy
   JOIN fired once per row, and PriceCharting sorts the guide **oldest-first** so the early rows
   (vintage WoTC, pre-TCGPlayer) have **no tcg-id** → an all-fuzzy storm (~135ms/row → 500 rows in 54s,
@@ -479,44 +506,44 @@ the on-demand `/pricecharting/graded` (admin-only) stays the live fallback for O
   value+fetched_at, never duplicate. **The ungraded/loose row also carries the `retail_buy`/`retail_sell`
   spread** (`retail-loose-buy`/`retail-loose-sell` → `prices.retail_buy`/`retail_sell`, mig 0075);
   graded rows stay value-only. `csvRowToPriceRows` attaches them to the `grade===null` row.
-- **Scale / resumability / TIME-BOUNDED (must not block past the request cap):** the CSV is **streamed**
-  (never buffered whole) and parsing **early-stops at the window end** (never downloads the tail past the
-  window). Each run resumes from a KV cursor (`pc_ingest_cursor:{category}`) and processes rows in 500-row
-  sub-batches **until a wall-time budget** (`PC_INGEST_BUDGET_MS`, default **20000 ms** — under the ~60s
-  Workers request-duration cap), then saves the cursor at the **exact row reached** (`cursorNext`) and
-  returns. `PC_INGEST_MAX_ROWS` (default 25000) is a hard per-run upper bound; `wrapped:true` means it hit
-  EOF and the next run starts a fresh pass (daily refresh). A budget cut-off (`budgetHit:true`) loses no
-  progress — the cursor only advances over fully-written sub-batches, and all writes are idempotent. D1
-  writes are batched (≤90 statements/batch). Logs `{"log":"pricecharting_csv_ingest", …}` with
-  matched/fuzzy/unmatched/sealed counts + `rowsProcessed`/`cursorNext`/`wrapped`/`budgetHit`/`durationMs`.
-  > **WHY (fixed 2026-06-16):** the first synchronous run held the client connection for the whole 25k-row
-  > window and hit the **~60s request-duration cap → `outcome:"canceled"`** (cpuTime ~1s; it was I/O-bound
-  > on hundreds of sequential D1 round trips). The time-budget + sub-batch cursor caps each run well under
-  > the cap so it returns counts.
-  >
-  > **⚠️ DESIGN FLAW — do NOT rapid-loop a big category (operator-confirmed 2026-06-19).** Each
-  > `/pricecharting/ingest` call **re-downloads the ENTIRE ~88k-row CSV** and merely skips to the cursor,
-  > so the old "loop the curl until `wrapped:true`" guidance issues **one full download per ~20s window**.
-  > The PriceCharting CSV download is **HARD-limited to 1 per 10 MINUTES — abuse REVOKES the account's API
-  > permissions** (API calls 1/sec). So rapid-looping a big game (~176 windows) both **violates the limit**
-  > (observed: HTTP 429) and **thrashes the KV cursor** — a call reads `pc_ingest_cursor:{category}` before
-  > the prior call's write has propagated (KV eventual consistency), so the offset bounces and can falsely
-  > look "stuck". The daily cron (1 download/category/day) respects the limit but processes only ONE window
-  > per day, so it **never finishes** an 88k-row game. **PROPER FIX (its own prompt):** download each CSV
-  > **once/day → cache to R2** → process the whole file from the cached copy (and/or drive it with a
-  > Workflow / Durable Object / queue across sub-requests), so one daily download fully ingests a category.
-  > **For now: one-piece-cards wraps in ~3 calls; the big 3 should NOT be rapid-looped.** Status +
-  > partial-coverage numbers live in Content `Partner_Platform_Handoff_Summary.md`.
+- **Scale / windowing across invocations (PROCESS, from the cached R2 file):** each PROCESS window streams
+  the cached object (never buffers it whole), **skips to `offset` then collects up to `PC_INGEST_MAX_ROWS`
+  rows** (early-stops at the window end), matches in memory, and upserts in 500-row sub-batches **until a
+  wall-time budget** (`PC_INGEST_BUDGET_MS`, default 20s — under the ~60s request cap) **OR a D1-batch cap**
+  (`PC_PROCESS_MAX_BATCHES`, default 300 — under the 1000 sub-request/invocation cap). It then returns
+  `cursorNext = offset + rowsProcessed` and (if `wrapped:false`) the queue consumer enqueues the next window
+  at that offset. `wrapped:true` means EOF was reached and the chain stops. **The cursor lives IN the queue
+  message — there is NO KV cursor** (so no eventual-consistency bounce; `pc_ingest_cursor:*` is gone). A
+  budget/batch cut-off loses no progress (the cursor only advances over fully-written sub-batches; all
+  writes idempotent). D1 writes are batched (≤90 statements/batch). Logs `{"log":"pricecharting_csv_process",
+  …}` per window with matched/fuzzy/unmatched/sealed counts + `rowsProcessed`/`cursorNext`/`wrapped`/
+  `budgetHit`/`batchHit`/`durationMs`; FETCH logs `{"log":"pricecharting_csv_fetch", …}`.
+  > **✅ The 2026-06-16/19 "design flaw" (per-window re-download + KV-cursor bounce) is RESOLVED** by the
+  > FETCH/PROCESS split above. The download now happens **at most once/category/day**; PROCESS reads the
+  > cached R2 file unlimited times. A big ~88k-row category completes from ONE download across many cheap
+  > windows driven by `PC_PROCESS_QUEUE` — never N downloads, never the 429/revocation risk, never the KV
+  > bounce. "Looping the curl" is no longer a thing: trigger PROCESS once and the queue finishes the
+  > category. (Historical context: the old synchronous run also hit the ~60s request cap → `canceled`;
+  > the windowed-queue design caps each invocation well under both the time and sub-request limits.)
 - **Migration:** `Content/migrations/0070_pricecharting_map.sql` (the `pricecharting_products` map +
   unmatched log + sales-volume — chosen over KV because 350k rows need queryable unmatched counts +
   incremental skip; the existing `pc_id_v2:*`/`pc_product:*` KV keys remain the on-demand API path's id
   cache, a separate concern). The `prices` write needs no migration (schema already has source/grade/etc).
+  **The FETCH/PROCESS rebuild adds NO migration** — raw CSV bytes live in R2 (`ingest-raw/pricecharting/…`,
+  reusing the existing `IMAGES_BUCKET`), not D1; the cursor is in the queue message, not a table. The new
+  infra is a Cloudflare queue (`sleevedpages-pricecharting-queue` + `-uat`) the operator must `wrangler
+  queues create` before deploy. Set an R2 lifecycle rule on the `ingest-raw/` prefix (e.g. delete after
+  7–14 days) so dated CSVs don't accumulate.
 - **Serving:** Content `getGradedPrices` now reads `prices` where `source IN ('scrydex','pricecharting')`
   → the Content "Graded Prices" section serves these to **ALL users** for the 4 games (no admin gate, no
   per-call cost). PriceCharting rows exist ONLY for the 4 ingested games, so their presence IS the gate.
-- **Tests (+30 → 136):** `src/pricechartingCsv.test.ts` (delimiter detection, the real One Piece
-  EB02-010 tab row, parse, decode map, sealed, matchers) + `src/pricechartingIngest.test.ts` (tcg-id
-  primary, fuzzy fallback, weak rejection, unmatched counted, idempotent re-run, sealed write).
+- **Tests:** `src/pricechartingCsv.test.ts` (pure parsers — delimiter detection, the real One Piece
+  EB02-010 tab row, parse, decode map, sealed, matchers; UNCHANGED) + `src/pricechartingIngest.test.ts`
+  (rebuilt for the split: FETCH downloads ONCE → dated R2 key + arms cooldown + 429 still cools;
+  PROCESS ingests from R2 with NO download, windows across the message offset, idempotent re-process,
+  missing-R2 terminal; the enqueue-vs-inline driver; `resolveProcessKey` today/stale/none; and an
+  **end-to-end big-category test** asserting ONE download → many windows → all rows ingested → re-process,
+  download count == 1 throughout). Ingestion suite green at **198**.
 
 ### Drain credit audit (`processPendingWebhooks` — §4 #8, measure-first)
 
@@ -549,10 +576,11 @@ from `credits_by_game` in the audit line.
 | `SCRYDEX_TEAM_ID` | — | Scrydex team ID — required alongside API key |
 | `SCRYDEX_MONTHLY_LIMIT` | `50000` | Monthly Scrydex credit cap (Growth tier). Guard blocks calls when usage ≥ `SCRYDEX_MONTHLY_LIMIT - 500`. Set the same value in the Content app env vars. **CARRY-FORWARD (corrected 2026-06-18): STAY on Growth through ~end-of-year, then reassess post-show — do NOT drop to Starter.** The 4-tier paid data model (Collector `core_pricing` = graded matrix / pop / trends; Curator `comps_and_history` = listings + price_history) plus Vision all REQUIRE Growth-tier endpoints; Starter lacks graded/pop/trends/history/Vision, so dropping would break paid entitlements. |
 | `INGESTION_WORKER_SECRET` | — | Shared secret for admin-triggered HTTP endpoints (`/scrydex/*`, `/tcggo/*`) |
-| `PRICECHARTING_TOKEN` | — | PriceCharting API token. Powers (a) the admin graded-price source `GET /pricecharting/graded` (2026-06-15) and (b) the **daily CSV bulk-ingest** for the 4 games (`POST /pricecharting/ingest` + `0 5 * * *` cron, 2026-06-16). Set via `wrangler secret put PRICECHARTING_TOKEN` (preview + prod). Absent → both 503 and the cron no-ops. Token lives here only — never in the Content app, logs, or responses. |
-| `PC_INGEST_MAX_ROWS` | `25000` | Hard upper bound on CSV rows collected per bulk-ingest run. The run usually stops earlier on `PC_INGEST_BUDGET_MS`; this just caps memory/window size. |
-| `PC_INGEST_BUDGET_MS` | `20000` | Wall-time budget per bulk-ingest run before it stops + saves the cursor. Kept **under the ~60s Workers request-duration cap** so the synchronous endpoint returns counts instead of being canceled. ⚠️ Each call **RE-DOWNLOADS the full CSV** (HARD-limited 1/10 min — abuse → account revoked), so do NOT rapid-loop a big category — see the ⚠️ design-flaw note in **PriceCharting CSV Bulk-Ingest**. |
-| `PC_INGEST_FUZZY_MAX` | `400` | Bounded fuzzy lookups per bulk-ingest run (tcg-id carries the bulk). Unmatched rows are retried on later runs. |
+| `PRICECHARTING_TOKEN` | — | PriceCharting API token. Powers (a) the admin graded-price source `GET /pricecharting/graded` (2026-06-15) and (b) the **CSV FETCH** for the 4 games (`POST /pricecharting/fetch` + the `pricecharting-download` admin job + `0 5 * * *` cron). Required ONLY by FETCH (the download); the PROCESS path reads R2 and needs no token. Set via `wrangler secret put PRICECHARTING_TOKEN` (preview + prod). Absent → FETCH 503 and the cron no-ops; cached files can still be re-processed. Token lives here only — never in the Content app, logs, or responses. |
+| `PC_INGEST_MAX_ROWS` | `25000` | Rows COLLECTED into the in-memory window per PROCESS invocation. Usually stops earlier on `PC_INGEST_BUDGET_MS` / `PC_PROCESS_MAX_BATCHES`; this caps memory/window size. |
+| `PC_INGEST_BUDGET_MS` | `20000` | Wall-time budget per PROCESS window before it stops + enqueues the next offset. Kept **under the ~60s Workers request-duration cap**. (No longer involves any download — PROCESS reads the cached R2 file; FETCH is the separate, cooldown-gated download.) |
+| `PC_PROCESS_MAX_BATCHES` | `300` | Max `DB.batch()` calls per PROCESS window — keeps each invocation well under the **1000 sub-request/invocation** cap. Stops the window early (`batchHit:true`) and enqueues the next offset. |
+| `PC_INGEST_FUZZY_MAX` | `400` | Bounded fuzzy lookups per PROCESS window (tcg-id carries the bulk). Unmatched rows are retried on later windows/days. |
 | `TCGGO_RAPIDAPI_KEY` | — | RapidAPI key for tcggo (`pokemon-tcg-api.p.rapidapi.com`). **STILL REQUIRED** — powers the **Artist Templates** ingestion tool (`GET /tcggo/artists*`). Its graded eBay-sold role was **REMOVED** (2026-06-17, unreliable canonical-id matching); `GET /tcggo/graded-prices` is gone. Set via `wrangler secret put TCGGO_RAPIDAPI_KEY`. Absent → the artist endpoints 503. Free tier 100 req/day — Content KV-caches; artist pulls are admin-triggered + bounded. |
 | `APIFY_TOKEN` | — | Apify API token for the eBay sold-comp graded **gap-filler** `GET /ebay/graded` (2026-06-17 — replaced tcggo graded). Set via `wrangler secret put APIFY_TOKEN`. Absent → 503. Lives here only — never in the Content app, logs, or responses. |
 | `APIFY_EBAY_ACTOR_ID` | — | Apify eBay actor id (e.g. `username~actor-name`) the gap-filler runs. Set via `wrangler secret put APIFY_EBAY_ACTOR_ID`. Absent → 503. **Pin down + probe the actor's dataset shape before the Content `ebay_graded_enabled` flag is switched on** (the parser is written against a documented assumption). |

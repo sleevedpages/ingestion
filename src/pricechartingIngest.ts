@@ -1,29 +1,37 @@
 /**
- * PriceCharting CSV bulk-ingest — the production graded+ungraded price backbone for the
- * four games we ingest (Pokémon, Magic, Yu-Gi-Oh, One Piece).
+ * PriceCharting CSV bulk-ingest — FETCH / PROCESS split (rebuilt 2026-06-19).
  *
- * Once daily (cron, one category per run — see worker.ts) we pull the operator-confirmed
- * per-category price-guide CSV, MATCH each row to a canonical product (tcg-id first, then
- * a validated fuzzy fallback), PERSIST the mapping (`pricecharting_products`, so re-ingests
- * are incremental and unmatched rows are counted not dropped), and UPSERT canonical `prices`
- * rows (source='pricecharting', value in dollars, idempotent). The Content app then serves
- * those persisted graded prices to ALL users for these 4 games — no admin gate, no per-call
- * API cost (that is the whole point of the CSV path; the on-demand API stays the fallback
- * for OTHER games).
+ * The source CSV download is HARD rate-limited to 1 per 10 MINUTES (abuse → the account's API
+ * access is REVOKED) and each export is ~88k rows. The PREVIOUS design re-downloaded the WHOLE
+ * CSV on every windowed call (the KV cursor was only a row offset into a *fresh re-download*), so
+ * a big category NEVER finished on the daily cron and rapid-looping to finish tripped the limit.
+ * This module splits the two concerns so completing a big category costs ONE download + N cheap
+ * R2 reads — never N downloads:
  *
- * SECURITY: the PriceCharting token is the worker secret PRICECHARTING_TOKEN ONLY — it is
- * injected into the download URL here and never logged, returned, or persisted.
+ *   FETCH   — once per day per category. Download the full CSV ONCE and store the RAW bytes in R2
+ *             under a dated key `ingest-raw/pricecharting/{category}/{YYYY-MM-DD}.csv`. Arms the
+ *             10-min download cooldown the moment a download is attempted; never retry-loops.
+ *             (`fetchPriceChartingCsvToR2`)
+ *   PROCESS — unlimited, from R2. Read the cached object and ingest the ENTIRE category across many
+ *             Worker invocations driven by a DEDICATED queue (`PC_PROCESS_QUEUE`). The cursor is a
+ *             row offset OVER THE R2 FILE carried IN the queue message — there is NO KV cursor, so
+ *             the old eventual-consistency bounce is gone. Each window is bounded by a wall-time
+ *             budget AND a D1-batch cap (to stay under the per-invocation sub-request limit), then
+ *             enqueues the next offset until EOF. (`processPriceChartingWindow`)
  *
- * SCALE / RESUMABILITY: each export is ~88k rows. We STREAM the CSV (never buffer the whole
- * file), process a bounded window of rows per run (KV cursor `pc_ingest_cursor:{category}`,
- * advanced each run and wrapped at EOF), batch the D1 upserts (≤90 statements/batch), and
- * skip the matching for rows already matched in a prior run (prices still re-upsert — that's
- * the daily refresh). Guarded like the other ingest jobs; logs matched/fuzzy/unmatched/sealed
- * counts per run.
+ * The matching (in-memory tcg-id-first + validated fuzzy `loadProductIndex`/`matchRows`), the
+ * canonical `prices` upsert (incl. the mig-0075 `retail_buy`/`retail_sell` spread on the ungraded
+ * row), and the `pricecharting_products` map are UNCHANGED from the prior design — only the
+ * fetch/iterate mechanics changed. Re-processing the same R2 file is idempotent (upserts on the
+ * same conflict keys), so a re-process / stale-fallback never double-writes.
+ *
+ * SECURITY: the PriceCharting token is the worker secret PRICECHARTING_TOKEN ONLY — it is injected
+ * into the download URL here and never logged, returned, or persisted.
  */
 
 import type { Env } from './worker.js'
 import { logger } from './ingestion/logger.js'
+import { startPriceChartingCooldown } from './adminJobs.js'
 import {
   buildDownloadUrl,
   parseCsvLine,
@@ -49,30 +57,50 @@ const CATEGORY_TCGPLAYER_IDS: Record<string, number[]> = {
   'one-piece-cards': [68],
 }
 
-const CURSOR_PREFIX = 'pc_ingest_cursor:'
-const DEFAULT_MAX_ROWS  = 25000  // hard cap on rows collected per run — tune via PC_INGEST_MAX_ROWS
-const DEFAULT_FUZZY_MAX = 400    // fuzzy lookups per run (bounded; tcg-id carries the bulk)
-const DEFAULT_BUDGET_MS = 20000  // wall-time budget per run (< the ~60s request cap) — tune via PC_INGEST_BUDGET_MS
-const SUBBATCH = 500             // rows matched + written per inner pass; time budget checked between passes
-const DB_CHUNK = 90              // statements per DB.batch() (well under D1's 100-param/stmt cap)
+/** R2 key scheme for the cached raw downloads. Reuses the worker's existing IMAGES_BUCKET binding. */
+export const R2_RAW_PREFIX = 'ingest-raw/pricecharting'
 
-export interface PcIngestCounts {
-  category:        string
-  rowsCollected:   number   // data rows read into the window this run (bounded by maxRows / EOF)
-  rowsProcessed:   number   // rows actually matched + written before the time budget / window end
-  matchedTcgId:    number
-  matchedFuzzy:    number
-  unmatched:       number
-  sealedRows:      number
-  sealedMatched:   number
-  pricesUpserted:  number
-  fuzzyAttempts:   number
-  windowStart:     number   // cursor row offset this run started from
-  cursorNext:      number   // cursor row offset saved for the next run (0 when wrapped)
-  wrapped:         boolean   // reached EOF and finished the tail → next run starts a fresh pass
-  budgetHit:       boolean   // stopped early on the wall-time budget (more rows remain)
-  durationMs:      number
+const DEFAULT_MAX_ROWS    = 25000  // rows COLLECTED into the in-memory window per invocation — tune via PC_INGEST_MAX_ROWS
+const DEFAULT_FUZZY_MAX    = 400   // fuzzy lookups per window (bounded; tcg-id carries the bulk)
+const DEFAULT_BUDGET_MS    = 20000 // wall-time budget per window (< the ~60s request cap) — tune via PC_INGEST_BUDGET_MS
+const DEFAULT_MAX_BATCHES  = 300   // D1 DB.batch() calls per window — keeps each invocation well under the 1000 sub-request cap (PC_PROCESS_MAX_BATCHES)
+const SUBBATCH  = 500              // rows matched + written per inner pass; budgets checked between passes
+const DB_CHUNK  = 90               // statements per DB.batch() (well under D1's 100-param/stmt cap)
+
+/** The continuation message the dedicated PriceCharting PROCESS queue carries. The row offset IS
+ * the cursor (over the R2 file), so there is no KV cursor / eventual-consistency bounce. */
+export interface PcProcessMessage {
+  kind:     'pricecharting-process'
+  category: PriceChartingCategory
+  key:      string   // R2 object key of the cached CSV being processed
+  offset:   number   // data-row offset to resume from
+  stale?:   boolean  // true when processing an older R2 file because today's fetch was absent
 }
+
+/** Result of a single PROCESS window (one Worker invocation / one queue message). */
+export interface PcWindowCounts {
+  category:       string
+  key:            string
+  stale:          boolean
+  windowStart:    number
+  rowsCollected:  number    // data rows read into the window this invocation
+  rowsProcessed:  number    // rows actually matched + written before a budget cut
+  matchedTcgId:   number
+  matchedFuzzy:   number
+  unmatched:      number
+  sealedRows:     number
+  sealedMatched:  number
+  pricesUpserted: number
+  fuzzyAttempts:  number
+  cursorNext:     number    // next offset to process (== windowStart+rowsProcessed; 0 once wrapped)
+  wrapped:        boolean   // reached EOF and finished → the chain stops
+  budgetHit:      boolean   // stopped early on the wall-time budget
+  batchHit:       boolean   // stopped early on the per-window D1-batch cap
+  durationMs:     number
+}
+
+/** Result of a FETCH (one download → R2). */
+export interface PcFetchResult { category: string; key: string; date: string; bytes: number | null }
 
 interface MatchResolution {
   pcId:      string
@@ -82,11 +110,32 @@ interface MatchResolution {
   sealed:    boolean
 }
 
+interface WindowOpts { maxRows: number; fuzzyMax: number; budgetMs: number; maxBatches: number }
+
 /** Chunk an array into sub-arrays of at most `size`. */
 function chunk<T>(arr: T[], size: number): T[][] {
   const out: T[][] = []
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size))
   return out
+}
+
+/** Today's UTC date as `YYYY-MM-DD` (the dated R2 key suffix). */
+function todayUtc(): string {
+  return new Date().toISOString().slice(0, 10)
+}
+
+/** The dated R2 key for a category's raw CSV. */
+export function rawKeyFor(category: string, date: string): string {
+  return `${R2_RAW_PREFIX}/${category}/${date}.csv`
+}
+
+function windowOptsFromEnv(env: Env): WindowOpts {
+  return {
+    maxRows:    env.PC_INGEST_MAX_ROWS    ? parseInt(env.PC_INGEST_MAX_ROWS, 10)    : DEFAULT_MAX_ROWS,
+    fuzzyMax:   env.PC_INGEST_FUZZY_MAX   ? parseInt(env.PC_INGEST_FUZZY_MAX, 10)   : DEFAULT_FUZZY_MAX,
+    budgetMs:   env.PC_INGEST_BUDGET_MS   ? parseInt(env.PC_INGEST_BUDGET_MS, 10)   : DEFAULT_BUDGET_MS,
+    maxBatches: env.PC_PROCESS_MAX_BATCHES ? parseInt(env.PC_PROCESS_MAX_BATCHES, 10) : DEFAULT_MAX_BATCHES,
+  }
 }
 
 /**
@@ -150,7 +199,7 @@ export interface ProductIndex {
 }
 
 /**
- * Load the game's canonical products into an in-memory index ONCE per run, so every row
+ * Load the game's canonical products into an in-memory index ONCE per window, so every row
  * matches against memory (pure CPU) instead of a per-row D1 query. This is the fix for the
  * fuzzy-fallback storm: the early (oldest) PriceCharting rows have no tcg-id and previously
  * fired one JOIN per row (~135ms each → 54s for 500 rows). Paginated reads keep it to a
@@ -261,54 +310,101 @@ const MAP_UPSERT_SQL = `
     matched_at           = COALESCE(pricecharting_products.matched_at, excluded.matched_at),
     last_seen_at         = unixepoch()`
 
+// ── FETCH (download → R2, once/day/category) ────────────────────────────────────
+
 /**
- * Ingest ONE PriceCharting category. Streams the CSV, processes a bounded window of rows
- * (resumable via the KV cursor), matches + persists + upserts prices, returns counts.
- *
- * @throws Error on a missing token (caller maps to 503) or a non-200 CSV download.
+ * Download the FULL category CSV ONCE and store the raw bytes in R2 under a dated key. This is the
+ * ONLY function that hits the rate-limited download. It arms the 10-min cooldown the moment a
+ * download is attempted (so a failed/429 response still blocks the next attempt for the full
+ * window — never retry-loop), streams the response straight into R2 (no whole-file buffering), and
+ * returns the key for the PROCESS step. Throws on a missing token / non-200 (caller logs; MUST NOT
+ * retry-loop into the rate limit).
  */
-export async function ingestPriceChartingCategory(
-  env: Env,
-  category: PriceChartingCategory,
-  opts: { force?: boolean } = {},
-): Promise<PcIngestCounts> {
+export async function fetchPriceChartingCsvToR2(env: Env, category: PriceChartingCategory): Promise<PcFetchResult> {
   if (!env.PRICECHARTING_TOKEN) throw new Error('PRICECHARTING_TOKEN not configured')
   if (!PRICECHARTING_CATEGORIES.includes(category)) throw new Error(`Unknown category: ${category}`)
+  if (!env.IMAGES_BUCKET) throw new Error('IMAGES_BUCKET (R2) not configured')
 
-  const t0 = Date.now()
-  const maxRows  = env.PC_INGEST_MAX_ROWS ? parseInt(env.PC_INGEST_MAX_ROWS, 10) : DEFAULT_MAX_ROWS
-  const fuzzyMax = env.PC_INGEST_FUZZY_MAX ? parseInt(env.PC_INGEST_FUZZY_MAX, 10) : DEFAULT_FUZZY_MAX
-  const budgetMs = env.PC_INGEST_BUDGET_MS ? parseInt(env.PC_INGEST_BUDGET_MS, 10) : DEFAULT_BUDGET_MS
-  const kv = env.SLEEVEDPAGES_KV
+  const date = todayUtc()
+  const key = rawKeyFor(category, date)
 
-  // Resume cursor (row offset). `force` restarts from 0 and re-matches everything.
-  const cursorKey = `${CURSOR_PREFIX}${category}`
-  let windowStart = 0
-  if (!opts.force && kv) {
-    const raw = await kv.get(cursorKey)
-    const n = raw ? parseInt(raw, 10) : 0
-    if (Number.isFinite(n) && n > 0) windowStart = n
-  }
-  const windowEnd = windowStart + maxRows
-
-  // ── Stream the CSV; collect only the rows inside [windowStart, windowEnd) ────
-  // (Early-stop at windowEnd so we never download the file's tail past our window.)
-  const res = await fetch(buildDownloadUrl(category, env.PRICECHARTING_TOKEN), {
-    headers: { Accept: 'text/csv' },
-  })
+  const res = await fetch(buildDownloadUrl(category, env.PRICECHARTING_TOKEN), { headers: { Accept: 'text/csv' } })
+  // Arm the cooldown BEFORE inspecting the result so even a 429/5xx blocks the next download for
+  // the full ~10-min window — the rate-limit safety must not depend on a successful response.
+  await startPriceChartingCooldown(env)
   if (!res.ok || !res.body) {
     throw new Error(`PriceCharting CSV download failed (${category}): HTTP ${res.status}`)
   }
 
+  const bytes = Number(res.headers.get('content-length')) || null
+  await env.IMAGES_BUCKET.put(key, res.body, {
+    httpMetadata: { contentType: 'text/csv' },
+    customMetadata: { source: 'pricecharting', category, date },
+  })
+  logger.info('pricecharting_csv_fetch', { category, key, date, bytes })
+  return { category, key, date, bytes }
+}
+
+/** Lexicographically-greatest (i.e. most recent dated) raw key for a category, or null. */
+export async function latestRawKey(env: Env, category: string): Promise<string | null> {
+  if (!env.IMAGES_BUCKET) return null
+  const prefix = `${R2_RAW_PREFIX}/${category}/`
+  let best: string | null = null
+  let cursor: string | undefined
+  do {
+    const listing = await env.IMAGES_BUCKET.list({ prefix, cursor })
+    for (const o of listing.objects) {
+      if (o.key.endsWith('.csv') && (best === null || o.key > best)) best = o.key
+    }
+    cursor = listing.truncated ? listing.cursor : undefined
+  } while (cursor)
+  return best
+}
+
+/**
+ * Resolve which cached R2 file to PROCESS: today's if present, else the most recent (stale
+ * fallback — the data is backup-behind-Scrydex, so a 1-day-stale file is acceptable; we log it
+ * clearly and NEVER re-download to compensate). Returns null only when nothing has ever been
+ * fetched for this category.
+ */
+export async function resolveProcessKey(env: Env, category: string): Promise<{ key: string; stale: boolean } | null> {
+  const today = rawKeyFor(category, todayUtc())
+  const head = env.IMAGES_BUCKET ? await env.IMAGES_BUCKET.head(today) : null
+  if (head) return { key: today, stale: false }
+  const latest = await latestRawKey(env, category)
+  if (latest) return { key: latest, stale: true }
+  return null
+}
+
+// ── PROCESS (from R2, unlimited, across invocations) ────────────────────────────
+
+/**
+ * Core windowed ingest from an already-open CSV stream (the R2 object body). PURE of any source
+ * download — the caller supplies the cached bytes. Collects rows [windowStart, windowStart+maxRows),
+ * matches in memory, upserts canonical prices + the map, and stops on the wall-time budget OR the
+ * D1-batch cap so a single invocation stays under the request-duration + sub-request limits.
+ */
+async function processWindowFromBody(
+  env: Env,
+  category: string,
+  key: string,
+  stale: boolean,
+  body: ReadableStream<Uint8Array>,
+  windowStart: number,
+  opts: WindowOpts,
+): Promise<PcWindowCounts> {
+  const t0 = Date.now()
+  const windowEnd = windowStart + opts.maxRows
+
+  // ── Stream the cached CSV; collect only the rows inside [windowStart, windowEnd) ──
   let headerIdx: Record<string, number> = {}
   const window: Array<{ pcId: string; row: PcCsvRow; sealed: boolean }> = []
-
   const { reachedEof } = await streamCsv(
-    res.body,
+    body,
     (h) => { headerIdx = buildHeaderIndex(h) },
     (fields, i) => {
       if (i < windowStart) return true
-      if (i >= windowEnd) return false           // window full → stop reading the tail
+      if (i >= windowEnd) return false            // window full → stop reading the tail
       const row = rowFromFields(fields, headerIdx)
       const pcId = (row['id'] ?? '').trim()
       if (pcId) window.push({ pcId, row, sealed: isSealedRow(row) })
@@ -316,24 +412,19 @@ export async function ingestPriceChartingCategory(
     },
   )
 
-  // Load the game's canonical products into memory ONCE, so matching is pure CPU
-  // (no per-row D1 query — the fix for the fuzzy-fallback storm on the no-tcg-id rows).
+  // Load the game's canonical products into memory ONCE per window, so matching is pure CPU.
   const index = await loadProductIndex(env, category)
 
-  // ── Process the window in TIME-BOUNDED sub-batches; advance the cursor by the
-  //    number of rows actually processed (so a budget cut-off loses no progress and
-  //    the response returns counts well under the request-duration cap). ──────────
   const now = Math.floor(Date.now() / 1000)
   let processed = 0
   let matchedTcgId = 0, matchedFuzzy = 0, fuzzyAttempts = 0
   let unmatched = 0, sealedMatched = 0, sealedRows = 0, pricesUpserted = 0
-  let budgetHit = false
+  let budgetHit = false, batchHit = false, batchesIssued = 0
 
   for (let off = 0; off < window.length; off += SUBBATCH) {
     const sub = window.slice(off, off + SUBBATCH)
 
-    // Matching is in-memory; fuzzy is bounded across the whole run.
-    const remainingFuzzy = Math.max(0, fuzzyMax - fuzzyAttempts)
+    const remainingFuzzy = Math.max(0, opts.fuzzyMax - fuzzyAttempts)
     const r = matchRows(sub, index, remainingFuzzy)
     matchedTcgId += r.matchedTcgId; matchedFuzzy += r.matchedFuzzy; fuzzyAttempts += r.fuzzyAttempts
 
@@ -365,38 +456,104 @@ export async function ingestPriceChartingCategory(
         ))
       }
     }
-    for (const b of chunk(mapStmts, DB_CHUNK)) await env.DB.batch(b)
-    for (const b of chunk(priceStmts, DB_CHUNK)) await env.DB.batch(b)
+    for (const b of chunk(mapStmts, DB_CHUNK))   { await env.DB.batch(b); batchesIssued++ }
+    for (const b of chunk(priceStmts, DB_CHUNK)) { await env.DB.batch(b); batchesIssued++ }
     pricesUpserted += priceStmts.length
 
     processed += sub.length
-    if (Date.now() - t0 > budgetMs) { budgetHit = true; break }
+    // Stop on EITHER budget so a single invocation never exceeds the request-duration or
+    // sub-request cap; the cursor only advances over fully-written sub-batches (idempotent).
+    if (Date.now() - t0 > opts.budgetMs) { budgetHit = true; break }
+    if (batchesIssued >= opts.maxBatches)  { batchHit = true; break }
   }
 
-  // ── Advance / wrap the cursor ───────────────────────────────────────────────
-  // Wrapped only when we read the file's tail (reachedEof, i.e. the window wasn't
-  // capped at maxRows) AND processed every collected row within the budget.
+  // Wrapped only when we read the file's tail (reachedEof, i.e. the window wasn't capped at
+  // maxRows) AND processed every collected row within the budget. window non-empty ⟹ at least one
+  // sub-batch ran ⟹ processed > 0 ⟹ cursorNext strictly advances (no infinite chain).
   const wrapped = reachedEof && processed >= window.length
   const cursorNext = wrapped ? 0 : windowStart + processed
-  if (kv) await kv.put(cursorKey, String(cursorNext))
 
-  const counts: PcIngestCounts = {
-    category,
+  const counts: PcWindowCounts = {
+    category, key, stale, windowStart,
     rowsCollected: window.length,
     rowsProcessed: processed,
-    matchedTcgId,
-    matchedFuzzy,
-    unmatched,
-    sealedRows,
-    sealedMatched,
-    pricesUpserted,
-    fuzzyAttempts,
-    windowStart,
-    cursorNext,
-    wrapped,
-    budgetHit,
+    matchedTcgId, matchedFuzzy, unmatched, sealedRows, sealedMatched, pricesUpserted, fuzzyAttempts,
+    cursorNext, wrapped, budgetHit, batchHit,
     durationMs: Date.now() - t0,
   }
-  logger.info('pricecharting_csv_ingest', counts as unknown as Record<string, unknown>)
+  logger.info('pricecharting_csv_process', counts as unknown as Record<string, unknown>)
   return counts
+}
+
+/**
+ * Process ONE window for a queue message: open the cached R2 object and ingest from `msg.offset`.
+ * NO download. A missing R2 object is terminal (returns wrapped) so the chain stops instead of
+ * looping on an absent file.
+ */
+export async function processPriceChartingWindow(env: Env, msg: PcProcessMessage): Promise<PcWindowCounts> {
+  const obj = env.IMAGES_BUCKET ? await env.IMAGES_BUCKET.get(msg.key) : null
+  if (!obj || !obj.body) {
+    logger.error('pricecharting_process_missing_r2', { key: msg.key, category: msg.category, offset: msg.offset })
+    return {
+      category: msg.category, key: msg.key, stale: !!msg.stale, windowStart: msg.offset,
+      rowsCollected: 0, rowsProcessed: 0, matchedTcgId: 0, matchedFuzzy: 0, unmatched: 0,
+      sealedRows: 0, sealedMatched: 0, pricesUpserted: 0, fuzzyAttempts: 0,
+      cursorNext: 0, wrapped: true, budgetHit: false, batchHit: false, durationMs: 0,
+    }
+  }
+  return processWindowFromBody(env, msg.category, msg.key, !!msg.stale, obj.body, msg.offset, windowOptsFromEnv(env))
+}
+
+/**
+ * Kick off PROCESSING of a cached R2 file. In prod the dedicated queue drives the windows across
+ * invocations (enqueue the first window; the consumer self-perpetuates to EOF). With no queue
+ * bound (local dev / dry-run / tests) it falls back to an inline window-by-window loop so the path
+ * is still usable; bounded as a runaway backstop.
+ */
+export async function startPriceChartingProcessing(
+  env: Env, category: PriceChartingCategory, key: string, stale = false,
+): Promise<{ enqueued: boolean; counts?: PcWindowCounts[] }> {
+  const first: PcProcessMessage = { kind: 'pricecharting-process', category, key, offset: 0, stale }
+  if (env.PC_PROCESS_QUEUE) {
+    await env.PC_PROCESS_QUEUE.send(first)
+    return { enqueued: true }
+  }
+  const counts: PcWindowCounts[] = []
+  let msg = first
+  for (let i = 0; i < 2000; i++) {
+    const c = await processPriceChartingWindow(env, msg)
+    counts.push(c)
+    if (c.wrapped) break
+    msg = { ...msg, offset: c.cursorNext }
+  }
+  return { enqueued: false, counts }
+}
+
+// ── Job bodies (called by the cron, the admin trigger, and the HTTP endpoints) ──
+
+/**
+ * The DOWNLOAD job: fetch a fresh CSV → R2 (arms the cooldown) → start processing. The ONLY path
+ * that hits the rate-limited download. Cooldown-gating is the caller's responsibility (the admin
+ * trigger / HTTP endpoint refuse while cooling); this always attempts the (single) download.
+ */
+export async function runPriceChartingFetch(env: Env, category: PriceChartingCategory): Promise<PcFetchResult> {
+  const result = await fetchPriceChartingCsvToR2(env, category)   // throws on download failure
+  await startPriceChartingProcessing(env, category, result.key, false)
+  return result
+}
+
+/**
+ * The PROCESS job (no download): resolve the freshest cached R2 file (today, else the most recent
+ * as a logged stale fallback) and start processing it. Never downloads, never blocked by the
+ * cooldown — re-processing the cached file is unlimited and safe.
+ */
+export async function runPriceChartingProcess(env: Env, category: PriceChartingCategory): Promise<{ key: string; stale: boolean } | null> {
+  const resolved = await resolveProcessKey(env, category)
+  if (!resolved) {
+    logger.error('pricecharting_process_no_r2_file', { category })
+    return null
+  }
+  if (resolved.stale) logger.info('pricecharting_process_stale_fallback', { category, key: resolved.key })
+  await startPriceChartingProcessing(env, category, resolved.key, resolved.stale)
+  return resolved
 }

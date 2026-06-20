@@ -12,17 +12,33 @@ migrations_dir = "db/migrations"
 
 # Queue: orchestrator dispatches one message per group; consumers process them independently.
 # Each consumer invocation handles up to 10 groups (~120 subrequests max — well within limits).
-# max_concurrent_consumers = 1 keeps TCGCSV fetch rate orderly.
+# max_concurrency = 1 keeps TCGCSV fetch rate orderly (one consumer invocation at a time).
 [[queues.producers]]
 binding = "SYNC_QUEUE"
 queue   = "sleevedpages-sync-queue"
 
 [[queues.consumers]]
-queue                    = "sleevedpages-sync-queue"
-max_batch_size           = 10
-max_batch_timeout        = 30
-max_retries              = 2
-max_concurrent_consumers = 1
+queue             = "sleevedpages-sync-queue"
+max_batch_size    = 10
+max_batch_timeout = 30
+max_retries       = 2
+max_concurrency   = 1
+
+# PriceCharting PROCESS queue: one cached-CSV window per message, self-perpetuating to EOF (the
+# row offset cursor travels in the message — no KV cursor). max_batch_size=1 so each message is one
+# bounded window; max_concurrency=1 caps concurrent PROCESS invocations (a category's chain is
+# self-serial anyway — message N+1 doesn't exist until N completes). Create before deploy:
+#   npx wrangler queues create sleevedpages-pricecharting-queue
+[[queues.producers]]
+binding = "PC_PROCESS_QUEUE"
+queue   = "sleevedpages-pricecharting-queue"
+
+[[queues.consumers]]
+queue             = "sleevedpages-pricecharting-queue"
+max_batch_size    = 1
+max_batch_timeout = 5
+max_retries       = 3
+max_concurrency   = 1
 
 [[r2_buckets]]
 binding     = "IMAGES_BUCKET"
@@ -52,14 +68,17 @@ id      = "d8b69df87a0143b699e8dc75d286cdcb"
 #   0 6 * * *    — daily TCGPlayer data sync
 #   0 3 * * SUN  — weekly image mirror + Scrydex set mapping
 #   0 4 * * *    — DAILY Scrydex webhook drain (was */10; see below)
-#   0 5 * * *    — DAILY PriceCharting CSV bulk-ingest (ONE category/run, rotated by day)
+#   0 5 * * *    — DAILY PriceCharting FETCH (download ONE rotated category → R2, then queue PROCESS)
 #
-# PRICECHARTING CSV INGEST (post-show): pulls the per-game price-guide CSV for the 4 games
-# (pokemon/magic/yugioh/one-piece-cards) and upserts canonical `prices` (source='pricecharting')
-# so graded+ungraded pricing is served to ALL users for those games. One category per daily run,
-# rotated (Date-based index) — respects the source's ~1-per-10-min download rate limit (CSVs only
-# regenerate ~once/24h). 05:00 UTC is clear of the 04:00 Scrydex drain and 06:00 TCG sync. The
-# token is the PRICECHARTING_TOKEN worker secret. Migration 0070 creates the pc-id↔canonical map.
+# PRICECHARTING (FETCH/PROCESS split, rebuilt 2026-06-19): the cron FETCHes ONE rotated category's
+# price-guide CSV (pokemon/magic/yugioh/one-piece-cards) → R2 (the only download; arms the 10-min
+# cooldown), then the dedicated sleevedpages-pricecharting-queue PROCESSes the WHOLE category from
+# that single cached file (canonical `prices`, source='pricecharting', served to ALL users for the
+# 4 games). ONE download/day respects the source's ~1-per-10-min download limit (CSVs regenerate
+# ~once/24h); the queue finishes even a big ~88k-row category (the old per-window re-download never
+# could). 05:00 UTC is clear of the 04:00 Scrydex drain and 06:00 TCG sync. Token = PRICECHARTING_TOKEN.
+# Migration 0070 created the pc-id↔canonical map; the raw CSV cache is R2 (ingest-raw/pricecharting/…),
+# not D1. CREATE THE QUEUE before deploy: `wrangler queues create sleevedpages-pricecharting-queue`.
 #
 # COST CONTROL (2026-06): the price-webhook drain moved from every-10-min to ONCE DAILY.
 # A day's redundant change-notifications for a volatile expansion are collapsed into ONE
@@ -120,11 +139,24 @@ binding = "SYNC_QUEUE"
 queue   = "sleevedpages-sync-queue-uat"
 
 [[env.preview.queues.consumers]]
-queue                    = "sleevedpages-sync-queue-uat"
-max_batch_size           = 10
-max_batch_timeout        = 30
-max_retries              = 2
-max_concurrent_consumers = 1
+queue             = "sleevedpages-sync-queue-uat"
+max_batch_size    = 10
+max_batch_timeout = 30
+max_retries       = 2
+max_concurrency   = 1
+
+# PriceCharting PROCESS queue (UAT). Create before deploying preview:
+#   npx wrangler queues create sleevedpages-pricecharting-queue-uat
+[[env.preview.queues.producers]]
+binding = "PC_PROCESS_QUEUE"
+queue   = "sleevedpages-pricecharting-queue-uat"
+
+[[env.preview.queues.consumers]]
+queue             = "sleevedpages-pricecharting-queue-uat"
+max_batch_size    = 1
+max_batch_timeout = 5
+max_retries       = 3
+max_concurrency   = 1
 
 [[env.preview.r2_buckets]]
 binding     = "IMAGES_BUCKET"

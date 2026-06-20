@@ -9,7 +9,15 @@ import { scrydexVisionIdentify, ScrydexCreditLimitError } from './lib/scrydexCli
 import { searchTcggoArtists, fetchAllArtistCards } from './lib/tcggoClient.js';
 import { fetchPriceChartingGraded } from './lib/pricechartingClient.js';
 import { fetchEbayGraded } from './lib/ebayGradedClient.js';
-import { ingestPriceChartingCategory } from './pricechartingIngest.js';
+import {
+  fetchPriceChartingCsvToR2,
+  runPriceChartingFetch,
+  runPriceChartingProcess,
+  processPriceChartingWindow,
+  startPriceChartingProcessing,
+  resolveProcessKey,
+  type PcProcessMessage,
+} from './pricechartingIngest.js';
 import { PRICECHARTING_CATEGORIES, type PriceChartingCategory } from './lib/pricechartingCsv.js';
 import { backfillR2ImageUrls, backfillVariantImages, seedVariantProducts } from './backfillR2Urls.js';
 import {
@@ -20,7 +28,6 @@ import {
   acquireJobLock,
   releaseJobLock,
   priceChartingCooldownRemaining,
-  startPriceChartingCooldown,
 } from './adminJobs.js';
 import { logger } from './ingestion/logger.js';
 
@@ -28,6 +35,10 @@ export interface Env {
   DB: D1Database;
   IMAGES_BUCKET: R2Bucket;
   SYNC_QUEUE?: Queue<SyncGroupMessage>;
+  // Dedicated PriceCharting PROCESS queue — drives the from-R2 windowed ingest across invocations
+  // (one window per message, self-perpetuating to EOF). The row offset cursor travels IN the
+  // message (no KV cursor). See pricechartingIngest.ts.
+  PC_PROCESS_QUEUE?: Queue<PcProcessMessage>;
   TCGCSV_BASE_URL?: string;
   LOG_LEVEL?: string;
   DRY_RUN?: string;
@@ -55,9 +66,10 @@ export interface Env {
   // (src/pricechartingIngest.ts). See lib/pricechartingClient.ts.
   PRICECHARTING_TOKEN?: string;
   // PriceCharting CSV bulk-ingest tuning (optional — sane defaults in pricechartingIngest.ts)
-  PC_INGEST_MAX_ROWS?: string;   // hard cap on rows collected per run (window); default 25000
-  PC_INGEST_FUZZY_MAX?: string;  // bounded fuzzy lookups per run; default 400
-  PC_INGEST_BUDGET_MS?: string;  // wall-time budget per run before stopping + saving the cursor; default 20000
+  PC_INGEST_MAX_ROWS?: string;   // rows COLLECTED into the in-memory window per PROCESS invocation; default 25000
+  PC_INGEST_FUZZY_MAX?: string;  // bounded fuzzy lookups per window; default 400
+  PC_INGEST_BUDGET_MS?: string;  // wall-time budget per PROCESS window before stopping + enqueuing the next; default 20000
+  PC_PROCESS_MAX_BATCHES?: string; // D1 DB.batch() cap per PROCESS window (sub-request safety); default 300
   // Shared KV namespace (the Content app's SLEEVEDPAGES_KV) — caches resolved
   // PriceCharting ids (pc_id:*) and raw product responses (pc_product:*).
   SLEEVEDPAGES_KV?: KVNamespace;
@@ -221,10 +233,11 @@ export default {
       }
     }
 
-    // POST /pricecharting/ingest — manual trigger for the CSV bulk-ingest of ONE
-    // category. Body { category, force? }. Same job the daily cron runs (one category
-    // per run). Admin-secret gated; the token lives in PRICECHARTING_TOKEN.
-    if (pathname === '/pricecharting/ingest' && request.method === 'POST') {
+    // POST /pricecharting/fetch — the ONLY path that DOWNLOADS. Body { category }. Downloads the
+    // full CSV ONCE → R2 (dated key), arms the 10-min cooldown, then enqueues PROCESSing. Gated by
+    // the cooldown (429 while cooling) so it can never become a rapid re-download vector. Needs
+    // PRICECHARTING_TOKEN. See pricechartingIngest.ts.
+    if (pathname === '/pricecharting/fetch' && request.method === 'POST') {
       const secret = request.headers.get('x-worker-secret');
       if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
         return json({ ok: false, error: 'Unauthorized' }, 401);
@@ -232,16 +245,58 @@ export default {
       if (!env.PRICECHARTING_TOKEN) {
         return json({ ok: false, error: 'PRICECHARTING_TOKEN not configured' }, 503);
       }
-      const body = await request.json().catch(() => null) as { category?: string; force?: boolean } | null;
+      const body = await request.json().catch(() => null) as { category?: string } | null;
+      const category = (body?.category ?? '').trim() as PriceChartingCategory;
+      if (!PRICECHARTING_CATEGORIES.includes(category)) {
+        return json({ ok: false, error: `category must be one of ${PRICECHARTING_CATEGORIES.join(', ')}` }, 400);
+      }
+      const cooldown = await priceChartingCooldownRemaining(env);
+      if (cooldown > 0) {
+        return json({
+          ok: false,
+          error: `PriceCharting's CSV download is rate-limited to ~1 per 10 minutes. Try again in ~${Math.max(1, Math.ceil(cooldown / 60))} min.`,
+          cooldown: true,
+          retryAfterSec: cooldown,
+        }, 429);
+      }
+      try {
+        const result = await runPriceChartingFetch(env, category);   // downloads (arms cooldown) + enqueues PROCESS
+        return json({ ok: true, ...result, processing: 'enqueued' });
+      } catch (err) {
+        logger.error('pricecharting csv fetch failed', { error: String(err), category });
+        return json({ ok: false, error: String(err) }, 502);
+      }
+    }
+
+    // POST /pricecharting/ingest — PROCESS the cached R2 file (NO download, unlimited, safe to
+    // re-run). Body { category, sync? }. Default: enqueues the PROCESS chain (returns immediately).
+    // `sync:true` processes ONE window inline from offset 0 and returns its counts (verification).
+    // Does NOT need PRICECHARTING_TOKEN — it only reads R2. 409 if nothing has been fetched yet.
+    if (pathname === '/pricecharting/ingest' && request.method === 'POST') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      const body = await request.json().catch(() => null) as { category?: string; sync?: boolean } | null;
       const category = (body?.category ?? '').trim() as PriceChartingCategory;
       if (!PRICECHARTING_CATEGORIES.includes(category)) {
         return json({ ok: false, error: `category must be one of ${PRICECHARTING_CATEGORIES.join(', ')}` }, 400);
       }
       try {
-        const counts = await ingestPriceChartingCategory(env, category, { force: !!body?.force });
-        return json({ ok: true, ...counts });
+        const resolved = await resolveProcessKey(env, category);
+        if (!resolved) {
+          return json({ ok: false, error: `No cached CSV in R2 for ${category} — run POST /pricecharting/fetch first.` }, 409);
+        }
+        if (body?.sync) {
+          const counts = await processPriceChartingWindow(env, {
+            kind: 'pricecharting-process', category, key: resolved.key, offset: 0, stale: resolved.stale,
+          });
+          return json({ ok: true, mode: 'sync-window', ...counts });
+        }
+        await startPriceChartingProcessing(env, category, resolved.key, resolved.stale);
+        return json({ ok: true, mode: 'enqueued', category, key: resolved.key, stale: resolved.stale });
       } catch (err) {
-        logger.error('pricecharting csv ingest failed', { error: String(err), category });
+        logger.error('pricecharting csv process failed', { error: String(err), category });
         return json({ ok: false, error: String(err) }, 502);
       }
     }
@@ -434,11 +489,13 @@ export default {
       return json({ ok: true, message: 'R2 backfill started — check worker logs for completion summary' });
     }
 
-    // POST /admin/run-job — manual, on-demand trigger for one of the four scheduled cron
-    // jobs (admin-proxied from the Content portal; requires x-worker-secret). Runs the SAME
-    // function the cron handler calls, fire-and-forget via waitUntil, and guards against
-    // double-firing with a best-effort KV lock. Body:
-    //   { job: 'tcg-sync'|'image-mirror'|'scrydex-drain'|'pricecharting-csv', force? }
+    // POST /admin/run-job — manual, on-demand trigger for a scheduled ingestion job
+    // (admin-proxied from the Content portal; requires x-worker-secret). Runs the SAME function the
+    // cron/job body calls, fire-and-forget via waitUntil, and guards against double-firing with a
+    // best-effort KV lock. Body:
+    //   { job: 'tcg-sync'|'image-mirror'|'scrydex-drain'|'pricecharting-csv'|'pricecharting-download', force? }
+    // PriceCharting is FETCH/PROCESS-split: 'pricecharting-csv' = PROCESS the cached R2 CSV (no
+    // download); 'pricecharting-download' = FETCH fresh → R2 → PROCESS (the only download; cooldown-gated).
     if (pathname === '/admin/run-job' && request.method === 'POST') {
       const secret = request.headers.get('x-worker-secret');
       if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
@@ -451,17 +508,18 @@ export default {
       }
       // Per-job prerequisites (mirror the cron guards). image-mirror runs without Scrydex keys
       // (the Scrydex sub-steps self-skip inside runWeeklyImagePipeline); scrydex-drain requires
-      // them, and pricecharting-csv requires the PriceCharting token.
+      // them. pricecharting-download (the ONLY path that downloads) requires the PriceCharting
+      // token; pricecharting-csv (PROCESS from the cached R2 file) needs NO token.
       if (job === 'scrydex-drain' && !(env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID)) {
         return json({ ok: false, error: 'SCRYDEX_API_KEY / SCRYDEX_TEAM_ID not configured' }, 503);
       }
-      if (job === 'pricecharting-csv' && !env.PRICECHARTING_TOKEN) {
+      if (job === 'pricecharting-download' && !env.PRICECHARTING_TOKEN) {
         return json({ ok: false, error: 'PRICECHARTING_TOKEN not configured' }, 503);
       }
       // PriceCharting's per-game CSV download is HARD rate-limited (~1/10min, abuse → account
-      // revocation). Gate the trigger behind a download cooldown set by ANY download (manual or
-      // the daily cron) so the button can't become a rapid-loop vector.
-      if (job === 'pricecharting-csv') {
+      // revocation). Gate ONLY the download job behind the cooldown (set by ANY download) so it
+      // can't become a rapid-loop vector. pricecharting-csv re-processes the cached file → unlimited.
+      if (job === 'pricecharting-download') {
         const cooldown = await priceChartingCooldownRemaining(env);
         if (cooldown > 0) {
           return json({
@@ -477,11 +535,11 @@ export default {
         return json({ ok: false, error: 'This job is already running.', alreadyRunning: true }, 409);
       }
 
-      const category = job === 'pricecharting-csv' ? priceChartingCategoryForDay() : undefined;
-      // Register the download against the cooldown the moment we commit to running it.
-      if (job === 'pricecharting-csv') {
-        await startPriceChartingCooldown(env);
-      }
+      // Both PriceCharting jobs operate on the day-rotated category (parity with the cron). The
+      // cooldown is armed inside runPriceChartingFetch the moment it downloads — no separate call.
+      const category = job === 'pricecharting-csv' || job === 'pricecharting-download'
+        ? priceChartingCategoryForDay()
+        : undefined;
 
       ctx.waitUntil(
         (async () => {
@@ -497,7 +555,10 @@ export default {
                 await processPendingWebhooks(env);
                 break;
               case 'pricecharting-csv':
-                await ingestPriceChartingCategory(env, category!, { force: !!body.force });
+                await runPriceChartingProcess(env, category!);   // PROCESS cached R2 file — NO download
+                break;
+              case 'pricecharting-download':
+                await runPriceChartingFetch(env, category!);     // download fresh → R2 → PROCESS
                 break;
             }
           } catch (err) {
@@ -570,7 +631,7 @@ export default {
   //   "0 6 * * *"    — daily TCG (CSV) data sync                 → runIngestion (default case)
   //   "0 3 * * SUN"  — weekly image-mirror pipeline               → runWeeklyImagePipeline
   //   "0 4 * * *"    — daily Scrydex webhook drain                → processPendingWebhooks
-  //   "0 5 * * *"    — daily PriceCharting CSV (day-rotated cat)   → ingestPriceChartingCategory
+  //   "0 5 * * *"    — daily PriceCharting FETCH (day-rotated cat) → runPriceChartingFetch (→ queue PROCESS)
   async scheduled(
     event: ScheduledEvent,
     env: Env,
@@ -603,22 +664,18 @@ export default {
         break;
 
       case '0 5 * * *':
-        // DAILY: PriceCharting CSV bulk-ingest — ONE category per run, rotated by day, so
-        // the source's ~1-per-10-min download rate limit is respected trivially (the CSVs
-        // only regenerate ~once/24h anyway). Each run processes a bounded, resumable window
-        // (KV cursor), so a large category spans several runs. The four categories cycle
-        // every 4 days; spaced from the 04:00 Scrydex drain. Prod only (UAT cron list omits it).
+        // DAILY: PriceCharting — FETCH the day-rotated category's CSV ONCE → R2 (arms the 10-min
+        // cooldown), then PROCESS the WHOLE category from that single cached download via the
+        // dedicated PC_PROCESS_QUEUE (zero further downloads). ONE download/day respects the
+        // ~1-per-10-min limit; the queue finishes even a big ~88k-row category (the old per-window
+        // re-download never could). The four categories rotate (every 4 days); spaced from the
+        // 04:00 Scrydex drain. Prod only (UAT cron list omits it).
         if (env.PRICECHARTING_TOKEN) {
           const category = priceChartingCategoryForDay();
           ctx.waitUntil(
-            (async () => {
-              // Register this scheduled download against the manual-trigger cooldown too, so the
-              // admin button correctly reports "cooling down" right after the daily cron runs.
-              await startPriceChartingCooldown(env);
-              await ingestPriceChartingCategory(env, category).catch((err) =>
-                logger.error('PriceCharting CSV ingest failed', { error: String(err), category })
-              );
-            })()
+            runPriceChartingFetch(env, category).catch((err) =>
+              logger.error('PriceCharting CSV fetch failed', { error: String(err), category })
+            )
           );
         }
         break;
@@ -635,19 +692,41 @@ export default {
   },
 
   /**
-   * Queue consumer — invoked for each batch of group messages.
-   * Processes up to max_batch_size groups sequentially; max_concurrent_consumers = 1
-   * ensures TCGCSV fetch rate stays orderly across invocations.
-   *
-   * HTTP fetch errors are caught inside processGroupMessage (groups_completed still
-   * advances). D1 errors propagate here, causing the queue to retry the message.
+   * Queue consumer — serves TWO queues, discriminated by `batch.queue`:
+   *  - sleevedpages-pricecharting-queue → PriceCharting PROCESS: ingest ONE window from the cached
+   *    R2 file, then (if not wrapped) enqueue the NEXT offset — self-perpetuating to EOF with ZERO
+   *    further downloads. The offset cursor travels in the message. Idempotent upserts make a
+   *    redelivery safe. max_batch_size=1 so each message is one bounded window.
+   *  - sleevedpages-sync-queue → TCGCSV per-set sync (unchanged). Processes up to max_batch_size
+   *    groups sequentially; max_concurrency=1 keeps the TCGCSV fetch rate orderly. HTTP
+   *    fetch errors are caught inside processGroupMessage; D1 errors propagate → queue retry.
    */
   async queue(
-    batch: MessageBatch<SyncGroupMessage>,
+    batch: MessageBatch<SyncGroupMessage | PcProcessMessage>,
     env: Env
   ): Promise<void> {
+    if (batch.queue.includes('pricecharting')) {
+      for (const message of batch.messages) {
+        const msg = message.body as PcProcessMessage;
+        try {
+          const counts = await processPriceChartingWindow(env, msg);
+          if (!counts.wrapped && env.PC_PROCESS_QUEUE) {
+            // Enqueue the continuation BEFORE ack so a crash re-runs this window (idempotent) and
+            // re-enqueues — the chain never silently stops mid-category.
+            await env.PC_PROCESS_QUEUE.send({ ...msg, offset: counts.cursorNext });
+          }
+          message.ack();
+        } catch (err) {
+          logger.error('PriceCharting process window failed', {
+            error: String(err), key: msg.key, offset: msg.offset, category: msg.category,
+          });
+          message.retry();
+        }
+      }
+      return;
+    }
     for (const message of batch.messages) {
-      await processGroupMessage(message.body, env.DB);
+      await processGroupMessage(message.body as SyncGroupMessage, env.DB);
       message.ack();
     }
   },

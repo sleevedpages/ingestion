@@ -25,12 +25,15 @@ function fakeKV() {
 }
 
 describe('ADMIN_JOB_IDS / isAdminJobId', () => {
-  it('lists exactly the four cron jobs', () => {
-    expect(ADMIN_JOB_IDS).toEqual(['tcg-sync', 'image-mirror', 'scrydex-drain', 'pricecharting-csv'])
+  it('lists the cron jobs plus the explicit PriceCharting download job', () => {
+    expect(ADMIN_JOB_IDS).toEqual([
+      'tcg-sync', 'image-mirror', 'scrydex-drain', 'pricecharting-csv', 'pricecharting-download',
+    ])
   })
   it('accepts known ids and rejects everything else', () => {
     expect(isAdminJobId('tcg-sync')).toBe(true)
     expect(isAdminJobId('pricecharting-csv')).toBe(true)
+    expect(isAdminJobId('pricecharting-download')).toBe(true)
     expect(isAdminJobId('mirror')).toBe(false)
     expect(isAdminJobId('')).toBe(false)
     expect(isAdminJobId(undefined)).toBe(false)

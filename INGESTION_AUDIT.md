@@ -108,7 +108,7 @@ TCGPlayer-CDN path, though datacenter IPs are 403'd — see §6c). The default b
 
 - Queue: `sleevedpages-sync-queue` (prod) / `-uat` (preview). Binding `SYNC_QUEUE`.
 - Config (`wrangler.toml:20-25`): `max_batch_size=10`, `max_batch_timeout=30`,
-  `max_retries=2`, `max_concurrent_consumers=1`.
+  `max_retries=2`, `max_concurrency=1`.
 - Consumer loops messages, calls `processGroupMessage(message.body, env.DB)`, then `ack()`.
   Each message is one TCGPlayer group/set (`SyncGroupMessage`, `index.ts:30-39`). The
   consumer fetches that group's products+prices from TCGCSV and upserts them

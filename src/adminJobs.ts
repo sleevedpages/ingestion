@@ -9,7 +9,14 @@
 //   0 6 * * *    tcg-sync          → runIngestion()                 (worker.ts default case)
 //   0 3 * * SUN  image-mirror      → runWeeklyImagePipeline()        (this file)
 //   0 4 * * *    scrydex-drain     → processPendingWebhooks()        (scrydexProcessor.ts)
-//   0 5 * * *    pricecharting-csv → ingestPriceChartingCategory()   (pricechartingIngest.ts)
+//   0 5 * * *    (PriceCharting)   → runPriceChartingFetch()         (pricechartingIngest.ts)
+//
+// PriceCharting is FETCH/PROCESS-split (pricechartingIngest.ts): the daily cron FETCHes one
+// rotated category's CSV → R2 (the only download; arms the 10-min cooldown) then the dedicated
+// PC_PROCESS_QUEUE ingests the WHOLE category from that cached file. The two admin job ids map to
+// the two halves: `pricecharting-csv` = PROCESS the cached R2 file (no download, unlimited);
+// `pricecharting-download` = FETCH fresh → PROCESS (cooldown-gated). The job bodies live in
+// pricechartingIngest.ts; the worker run-job switch calls them.
 
 import type { Env } from './worker.js';
 import { runMirrorJob } from './image-mirror.js';
@@ -19,13 +26,19 @@ import { cleanupScrydexApiLog } from './lib/scrydexClient.js';
 import { PRICECHARTING_CATEGORIES, type PriceChartingCategory } from './lib/pricechartingCsv.js';
 import { logger } from './ingestion/logger.js';
 
-export type AdminJobId = 'tcg-sync' | 'image-mirror' | 'scrydex-drain' | 'pricecharting-csv';
+export type AdminJobId =
+  | 'tcg-sync'
+  | 'image-mirror'
+  | 'scrydex-drain'
+  | 'pricecharting-csv'        // PROCESS the cached R2 CSV (no download, unlimited, safe)
+  | 'pricecharting-download';  // FETCH a fresh CSV → R2 (the only download; cooldown-gated) then PROCESS
 
 export const ADMIN_JOB_IDS: AdminJobId[] = [
   'tcg-sync',
   'image-mirror',
   'scrydex-drain',
   'pricecharting-csv',
+  'pricecharting-download',
 ];
 
 export function isAdminJobId(value: unknown): value is AdminJobId {
@@ -73,7 +86,8 @@ const JOB_LOCK_TTL_SECONDS: Record<AdminJobId, number> = {
   'tcg-sync': 1800, // full sync is long-running; generous backstop
   'image-mirror': 3600, // Infinity-batch mirror can run long
   'scrydex-drain': 1200,
-  'pricecharting-csv': 600, // time-bounded (~20s) but guard rapid re-fire
+  'pricecharting-csv': 600,      // fire-and-forget enqueue (the queue does the work); guard rapid re-fire
+  'pricecharting-download': 600, // download + enqueue; the 10-min cooldown is the real rate guard
 };
 
 export async function isJobRunning(env: Env, job: AdminJobId): Promise<boolean> {
