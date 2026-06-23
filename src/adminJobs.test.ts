@@ -27,7 +27,7 @@ function fakeKV() {
 describe('ADMIN_JOB_IDS / isAdminJobId', () => {
   it('lists the cron jobs plus the explicit PriceCharting download job', () => {
     expect(ADMIN_JOB_IDS).toEqual([
-      'tcg-sync', 'image-mirror', 'scrydex-drain', 'pricecharting-csv', 'pricecharting-download',
+      'tcg-sync', 'image-mirror', 'scrydex-drain', 'pricecharting-csv', 'pricecharting-download', 'news-poll',
     ])
   })
   it('accepts known ids and rejects everything else', () => {

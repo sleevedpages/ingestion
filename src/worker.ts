@@ -20,6 +20,7 @@ import {
 } from './pricechartingIngest.js';
 import { PRICECHARTING_CATEGORIES, type PriceChartingCategory } from './lib/pricechartingCsv.js';
 import { backfillR2ImageUrls, backfillVariantImages, seedVariantProducts } from './backfillR2Urls.js';
+import { runNewsPoll } from './newsPoll.js';
 import {
   ADMIN_JOB_IDS,
   isAdminJobId,
@@ -560,6 +561,9 @@ export default {
               case 'pricecharting-download':
                 await runPriceChartingFetch(env, category!);     // download fresh → R2 → PROCESS
                 break;
+              case 'news-poll':
+                await runNewsPoll(env);                          // poll DotGG RSS → news_items (no key needed)
+                break;
             }
           } catch (err) {
             logger.error('Manual job run failed', { job, error: String(err) });
@@ -632,6 +636,7 @@ export default {
   //   "0 3 * * SUN"  — weekly image-mirror pipeline               → runWeeklyImagePipeline
   //   "0 4 * * *"    — daily Scrydex webhook drain                → processPendingWebhooks
   //   "0 5 * * *"    — daily PriceCharting FETCH (day-rotated cat) → runPriceChartingFetch (→ queue PROCESS)
+  //   "0 7 * * *"    — daily News poll (DotGG RSS → news_items)    → runNewsPoll (PROD triggers only)
   async scheduled(
     event: ScheduledEvent,
     env: Env,
@@ -678,6 +683,18 @@ export default {
             )
           );
         }
+        break;
+
+      case '0 7 * * *':
+        // DAILY: poll the active DotGG WordPress RSS feeds → upsert news_items (headline + link +
+        // date only; link-out, never article bodies). No Scrydex/PriceCharting key needed — public
+        // RSS. This cron is registered in PROD triggers only (UAT is populated by the on-demand
+        // POST /admin/run-job { job:'news-poll' }). 07:00 UTC is clear of the 04/05/06 ingest crons.
+        ctx.waitUntil(
+          runNewsPoll(env).catch((err) =>
+            logger.error('News poll failed', { error: String(err) })
+          )
+        );
         break;
 
       default:

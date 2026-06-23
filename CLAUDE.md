@@ -105,6 +105,7 @@ db/migrations/
 | `0 3 * * SUN` | Weekly: `syncScrydexSetMappings` → `syncScrydexImages` → `runMirrorJob` (Infinity batches) → `scrydex_api_log` cleanup (90-day retention) |
 | `0 4 * * *` | **DAILY** Scrydex webhook drain → upsert canonical `prices` (dedup by expansion; 20h freshness). **Was `*/10`** — moved to daily for cost control (2026-06; see Price Processing). |
 | `0 5 * * *` | **DAILY** PriceCharting **FETCH** (rebuilt 2026-06-19) — download ONE rotated category's CSV → R2 (the only download; arms the 10-min cooldown), then the dedicated `PC_PROCESS_QUEUE` ingests the WHOLE category from that single cached file (canonical `prices`, source='pricecharting', for the 4 games). One download/day respects the 1-per-10-min limit; the queue finishes even a big ~88k-row category. See **PriceCharting CSV Bulk-Ingest (FETCH/PROCESS split)**. Prod only. |
+| `0 7 * * *` | **DAILY** News poll → `runNewsPoll()` (`src/newsPoll.ts`). Polls the active DotGG WordPress RSS feeds (`news_sources WHERE is_active=1`), extracts ONLY headline + link + date (`src/lib/feedParser.ts` — bodies never read), UPSERTs `news_items` deduped on `link` (INSERT OR IGNORE), prunes items > 90 days. **LINK-OUT only** — no article text stored. No Scrydex/PriceCharting key needed (public RSS). **Prod only** (`[env.preview.triggers]` omits it — UAT is populated by the on-demand `news-poll` job). 07:00 UTC is clear of the 04/05/06 ingest crons. See Content/CLAUDE.md "News Feed". |
 
 > **Each cron can also be run ON DEMAND** from the Content admin portal (Admin → Catalog → **Ingestion Jobs**)
 > via `POST /admin/run-job` (x-worker-secret, admin-proxied). The cron handler and the manual trigger call the
@@ -157,6 +158,7 @@ and the manual trigger call the SAME job functions (no duplicated logic):
 | `scrydex-drain` | `processPendingWebhooks(env)` | `0 4 * * *` | ✅ freshness-guarded + deduped; consumes Scrydex credits |
 | `pricecharting-csv` | `runPriceChartingProcess(env, priceChartingCategoryForDay())` — PROCESS the cached R2 CSV (no download) | — (on demand) | ✅ idempotent upserts, R2-only; **unlimited + safe** (never touches the rate limit) |
 | `pricecharting-download` | `runPriceChartingFetch(env, priceChartingCategoryForDay())` — DOWNLOAD fresh CSV → R2 → PROCESS | `0 5 * * *` | ⚠️ downloads from PriceCharting — **rate-limited ~1/10min** (cooldown-gated) |
+| `news-poll` | `runNewsPoll(env)` — poll active DotGG RSS feeds → upsert `news_items` (headline+link+date, link-out; prune >90d) | `0 7 * * *` (PROD only) | ✅ public RSS, deduped on link — unlimited + safe; no API key. **Use this to populate UAT** (no news cron in UAT). |
 
 - **Auth:** worker side = `x-worker-secret` (`INGESTION_WORKER_SECRET`); Content proxy = the existing admin gate
   (`functions/api/admin/_middleware.js`, `data.userId === ADMIN_USER_ID`). No new env var, no schema change.
@@ -568,6 +570,29 @@ Pokémon concentration. The `SCRYDEX_DRAIN_MAX_FETCHES` bound and the `freshness
 (~3,426, ~80%)** before the daily batch; with daily dedup a run's `fetches_made` is bounded by
 the number of distinct volatile expansions, not webhook volume — read the live per-run figure
 from `credits_by_game` in the audit line.
+
+## News Poll (2026-06-22) — DotGG RSS → news_items (LINK-OUT only)
+
+Powers the Content **News Feed** under Discover. `src/newsPoll.ts` `runNewsPoll(env)` (the `0 7 * * *`
+cron, PROD only; also the `news-poll` admin job) reads `news_sources WHERE is_active=1`, fetches each
+WordPress RSS/Atom feed, and extracts **ONLY title + link + pubDate** via the dependency-free
+`src/lib/feedParser.ts` `parseFeed()`. It UPSERTs `news_items` deduped on `link` (`INSERT OR IGNORE`)
+and prunes items > 90 days. **IP posture: article bodies/summaries/excerpts are NEVER fetched-for-storage
+or stored** — `parseFeed` doesn't even read `<description>`/`<content:encoded>`/`<summary>` (a unit test
+asserts this). We link OUT for the content (mirrors the Rule Books posture).
+
+- **Resilient + polite:** descriptive User-Agent; per-feed `try/catch` isolation (one bad/stale/blocked
+  feed never aborts the run); a fetch timeout + **ONE retry** (the confirmed One Piece feed intermittently
+  5xx's — the retry + the daily cadence absorb it); `http(s)`-validates each `feed_url` before fetching.
+- **No key needed** (public RSS), so `news-poll` has no Scrydex/PriceCharting prereq in `/admin/run-job`.
+- **Step-0-confirmed seed feeds (migration 0079, Content):** Magic (`playingmtg.com/feed/`), One Piece
+  (`onepiece.gg/feed`), Lorcana (`lorcana.gg/feed/`), Flesh and Blood (`dotgg.gg/fabtcg/feed/`). Pokémon
+  (`pokemontcgzone.com` WP feed frozen at 2024-08) and Yu-Gi-Oh! (`ygozone.com` dormant) were probed and
+  **left OUT** — addable later with NO redeploy (a single `INSERT INTO news_sources`).
+- **Tables** (`news_sources` / `news_items`) are created by the **Content** migration `0079_news_feed.sql`
+  (the Content app owns the schema + serves `GET /api/news`); the worker is just the writer. `news_items`
+  has NO body column. Tests: `src/feedParser.test.ts` (parser: well-formed RSS/Atom, malformed-tolerant,
+  missing fields, dedupe-on-link, date parsing, **body-ignored assertion**). See Content/CLAUDE.md "News Feed".
 
 ## Environment Variables
 | Var | Default | Purpose |
