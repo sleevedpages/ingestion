@@ -102,7 +102,7 @@ db/migrations/
 | Cron | Job |
 |------|-----|
 | `0 6 * * *` | Daily TCG data sync (categories → sets → products → prices) |
-| `0 3 * * SUN` | Weekly: `syncScrydexSetMappings` → `syncScrydexImages` → `runMirrorJob` (Infinity batches) → `scrydex_api_log` cleanup (90-day retention) |
+| `0 3 * * SUN` | Weekly (MIRROR-FIRST since WP-2, 2026-07-07): `runMirrorJob` (Infinity batches) → `syncScrydexSetMappings` → `syncScrydexImages` → `scrydex_api_log` cleanup (90-day retention). Mirror first so the sync stages can never starve it (the 2026-07-05 run died before the mirror ran); the mirror consumes the PREVIOUS week's synced source_urls. |
 | `0 4 * * *` | **DAILY** Scrydex webhook drain → upsert canonical `prices` (dedup by expansion; 20h freshness). **Was `*/10`** — moved to daily for cost control (2026-06; see Price Processing). |
 | `0 5 * * *` | **DAILY** PriceCharting **FETCH** (rebuilt 2026-06-19) — download ONE rotated category's CSV → R2 (the only download; arms the 10-min cooldown), then the dedicated `PC_PROCESS_QUEUE` ingests the WHOLE category from that single cached file (canonical `prices`, source='pricecharting', for the 4 games). One download/day respects the 1-per-10-min limit; the queue finishes even a big ~88k-row category. See **PriceCharting CSV Bulk-Ingest (FETCH/PROCESS split)**. Prod only. |
 | `0 7 * * *` | **DAILY** News poll → `runNewsPoll()` (`src/newsPoll.ts`). Polls the active DotGG WordPress RSS feeds (`news_sources WHERE is_active=1`), extracts ONLY headline + link + date (`src/lib/feedParser.ts` — bodies never read), UPSERTs `news_items` deduped on `link` (INSERT OR IGNORE), prunes items > 90 days. **LINK-OUT only** — no article text stored. No Scrydex/PriceCharting key needed (public RSS). **Prod only** (`[env.preview.triggers]` omits it — UAT is populated by the on-demand `news-poll` job). 07:00 UTC is clear of the 04/05/06 ingest crons. See Content/CLAUDE.md "News Feed". |
@@ -154,7 +154,7 @@ and the manual trigger call the SAME job functions (no duplicated logic):
 | Job id | Underlying function | Cron | Safe to re-run? |
 |--------|---------------------|------|-----------------|
 | `tcg-sync` | `runIngestion(buildConfig(env))` | `0 6 * * *` | ✅ idempotent upserts; long-running |
-| `image-mirror` | `runWeeklyImagePipeline(env)` (set-mappings → image sync → `runMirrorJob(Infinity)` → `cleanupScrydexApiLog`) | `0 3 * * SUN` | ✅ merge-upserts, skips already-mirrored sets; long-running |
+| `image-mirror` | `runWeeklyImagePipeline(env)` (**`runMirrorJob(Infinity)` FIRST** → set-mappings → image sync → `cleanupScrydexApiLog`; WP-2 order) | `0 3 * * SUN` | ✅ merge-upserts + attempt-backoff (re-runs skip recently-attempted rows); long-running |
 | `scrydex-drain` | `processPendingWebhooks(env)` | `0 4 * * *` | ✅ freshness-guarded + deduped; consumes Scrydex credits |
 | `pricecharting-csv` | `runPriceChartingProcess(env, priceChartingCategoryForDay())` — PROCESS the cached R2 CSV (no download) | — (on demand) | ✅ idempotent upserts, R2-only; **unlimited + safe** (never touches the rate limit) |
 | `pricecharting-download` | `runPriceChartingFetch(env, priceChartingCategoryForDay())` — DOWNLOAD fresh CSV → R2 → PROCESS | `0 5 * * *` | ⚠️ downloads from PriceCharting — **rate-limited ~1/10min** (cooldown-gated) |
@@ -189,9 +189,29 @@ and the manual trigger call the SAME job functions (no duplicated logic):
 Supported games are controlled by `tcg_categories` and `price-config.ts`. Currently: Pokémon, One Piece.
 
 ## Image Mirror Pipeline
+
+**WP-2 resurrection (2026-07-07, audit IMG-1/3/4/10) — standing behavior:**
+- **Candidate selection** is the ONE shared `mirrorCandidateWhere()` (`image-mirror.ts`, used by
+  `runMirrorJob` AND `getPendingCards`): eligible (never mirrored / tcgplayer→scrydex upgrade;
+  OP/Gundam `source='scrydex'`+r2-NULL CDN-as-final stays excluded) AND mirrorable (Scrydex-host
+  `source_url` OR English-Pokémon-with-mapped-expansion URL construction — **tcgplayer-cdn-only
+  rows are never candidates**) AND due (`mirror_attempts < 5` + exponential backoff
+  3·2^attempts days on `mirror_last_attempt_at`; JS spec `isMirrorRetryDue()`).
+- **Attempt bookkeeping** (Content migration 0086): every processed card — success, failure, or
+  skip — bumps `product_images.mirror_attempts` + `mirror_last_attempt_at` (`mirrorAttemptUpsert`).
+- **Keyset pagination**: `WHERE p.id > ? ORDER BY p.id LIMIT 100` — never OFFSET.
+- **Placeholder fingerprint replaces the old blanket <300 KB guard**: the run probes
+  `PLACEHOLDER_PROBE_URL` (impossible card number → Scrydex returns its card-back placeholder),
+  SHA-256s it, and rejects any fetched image with the same hash; 1 KB sanity floor; a failed
+  probe disables detection for the run. Legit small scans now mirror. (mirror-local.mjs keeps
+  its own local guard — the script is unchanged.)
+- **Per-run summary ALWAYS logged**: `runMirrorJob` is try/finally'd — `image_mirror_log` gets
+  processed/mirrored/failed/skipped + `first_error` even if the run dies mid-batch.
+- **'Pokemon Japan' is excluded** from URL construction (`isEnglishPokemon`, lib/gameNames.ts).
+
 `runMirrorJob()` / `mirrorCard()` flow per card:
 
-**Attempt 1 — Scrydex CDN (Pokémon only)**
+**Attempt 1 — Scrydex CDN (English Pokémon only)**
 - URL: `https://images.scrydex.com/pokemon/{scrydex_set_id}-{formattedNumber}/large`
 - Requires `tcg_sets.scrydex_set_id` to be populated (set in Admin UI)
 - Card number formatting (always splits on `/` first — handles TCGPlayer `number/total` format):
@@ -201,10 +221,11 @@ Supported games are controlled by `tcg_categories` and `price-config.ts`. Curren
 - RC (Radiant Collection) cards share their parent set's `scrydex_set_id` (e.g. Generations RC → `g1`)
 - One Piece Scrydex support is deferred — alternate versions use non-sequential identifiers that don't map to TCGPlayer card numbers
 
-**Attempt 2 — TCGPlayer CDN fallback**
-- Uses the TCGPlayer source url stored in `product_images.source_url`
-- Worker datacenter IPs are **blocked (403)** by `tcgplayer-cdn.tcgplayer.com`
-- Use `mirror-local.mjs` instead for TCGPlayer images
+**Attempt 2 — stored `source_url` (non-TCGPlayer hosts only)**
+- Fetches `product_images.source_url` when it is NOT a tcgplayer-cdn url (e.g. a Scrydex-host
+  url that survived thanks to WP-1)
+- tcgplayer-cdn urls are never fetched from the worker: datacenter IPs are **blocked (403)** by
+  `tcgplayer-cdn.tcgplayer.com`, and TCGPlayer images are deliberately not mirrored anyway (below)
 
 ### TCGPlayer fallback image resolution (`_in_1000x1000`)
 TCGCSV serves TCGPlayer card images as low-res `_200w` thumbnails. `transformer.ts`
@@ -214,16 +235,17 @@ games — One Piece, Gundam — that have no Scrydex coverage). Existing rows we
 by Content migration `0064`. `_1000x1000` without the `_in_` infix is access-denied — do
 not use it.
 
-**Deliberate decision — do NOT mirror TCGPlayer images to R2.** The size guard in
-`image-mirror.ts` / `mirror-local.mjs` (~300 KB) rejects these small/`_in_1000x1000`
-TCGPlayer images on all paths, so TCGPlayer cards render from `source_url` (CDN) via the
-app's `r2_url ?? source_url` resolution — never from R2. This is intentional, not an
+**Deliberate decision — do NOT mirror TCGPlayer images to R2.** Since WP-2 the enforcement
+is STRUCTURAL: tcgplayer-cdn-only rows are excluded from the mirror candidate pool
+(`mirrorCandidateWhere()`) and `mirrorCard` refuses to fetch a tcgplayer-cdn url from the
+worker (`isTcgplayerCdnUrl` guard); `mirror-local.mjs` keeps its own ~300 KB local guard
+(script unchanged). So TCGPlayer cards render from `source_url` (CDN) via the app's
+`r2_url ?? source_url` resolution — never from R2. This is intentional, not an
 oversight: TCGPlayer's `_in_1000x1000` images carry a "SAMPLE" watermark on most
 alt-art/variant cards, so self-hosting them in R2 would spend storage to mirror a
 watermarked asset we can serve from the CDN for free (end-user browsers render the
-TCGPlayer CDN fine — only worker datacenter IPs are 403-blocked). Do not scope the guard
-to "fix" TCGPlayer mirroring. The Scrydex image path is unchanged and remains preferred
-where it has coverage.
+TCGPlayer CDN fine — only worker datacenter IPs are 403-blocked). Do not "fix" TCGPlayer
+mirroring. The Scrydex image path is unchanged and remains preferred where it has coverage.
 
 **Storage**: `cards/{tcgplayer_product_id}.{ext}` in R2
 **Public URL**: `https://images.sleevedpages.com/cards/{id}.{ext}`
@@ -315,7 +337,11 @@ Scrydex expansion id (e.g. `OP09`, `GD04`), which is what `q=expansion.id:` matc
   rate limit) and proxies here. See Content/CLAUDE.md.
 
 ### Image Sync
-- `syncScrydexImages()` runs weekly before the R2 mirror job; writes `product_images.source_url`
+- `syncScrydexImages()` runs weekly AFTER the R2 mirror stage (WP-2 mirror-first order — the
+  mirror consumes last week's URLs; this refreshes them for the next run); writes
+  `product_images.source_url`. Since WP-1, its Scrydex CDN urls SURVIVE the daily TCGCSV sync
+  (the `SOURCE_URL_PRECEDENCE_CASE` rule: scrydex > tcgplayer). Game keys come from the shared
+  `lib/gameNames.ts` map (WP-3 — 'Lorcana TCG' + the full Riftbound name; 'Pokemon Japan' absent).
 - One Piece + Gundam: each variant has a unique TCGPlayer product_id → write `variant.images[front].large`
   keyed on the `tcgplayer_product_id` bridge (per-variant), AND capture `scrydex_card_id`/
   `variant_kind`/`finish` + route collisions (see **Variant Capture (Session D-bis)**)
@@ -636,7 +662,7 @@ asserts this). We link OUT for the content (mirrors the Rule Books posture).
 |-------|---------|
 | `scrydex_expansion_freshness` | Session D (mig 0063): `(scrydex_expansion_id, price_type)` → `last_updated`. Per-expansion freshness/dedup for the price processor. |
 | `tcg_sync_log` | One row per sync run with counts + status |
-| `image_mirror_log` | One row per mirror job with processed/mirrored/failed/source counts |
+| `image_mirror_log` | One row per mirror job with processed/mirrored/failed/**skipped**/source counts + **first_error** (Content mig 0086) — written via try/finally, so a row lands even when the run dies mid-batch |
 | `scrydex_webhook_log` | Pending→processing→complete/error webhook queue (**drained ONCE DAILY** `0 4 * * *`, deduped by expansion — cost control 2026-06) |
 | `scrydex_api_log` | One row per outbound Scrydex API call — credit guard + admin dashboard. 90-day retention. |
 | `variant_ingest_conflicts` | Session D-bis (mig 0065): Scrydex variant collisions (intra-payload dup product_id / cross-product) routed for admin review instead of corrupting `products`. Deduped on `(scrydex_card_id, tcgplayer_product_id, variant_name)`. |
@@ -646,10 +672,17 @@ The old `tcg_categories` / `tcg_sets` / `tcg_products` / `tcg_prices` / `scrydex
 **frozen** (no longer written or read) and kept only as the rollback path until the final session.
 
 ## Re-mirror Logic
-(Session D — canonical: image state lives in `product_images`, joined `products → sets → canonical_games`.)
-Cards are re-queued for mirroring when:
-- **never mirrored** — no `product_images` row, or a row with `r2_url IS NULL` and `source IS NULL`
-- `product_images.source = 'tcgplayer' AND sets.scrydex_expansion_id IS NOT NULL` (upgrade to higher-res Scrydex image)
+(Session D — canonical: image state lives in `product_images`, joined `products → sets → canonical_games`.
+WP-2 2026-07-07: the full predicate is the shared `mirrorCandidateWhere()` in `image-mirror.ts`.)
+Cards are re-queued for mirroring when ALL of:
+- **eligible** — never mirrored (no `product_images` row, or `r2_url IS NULL` and `source IS NULL`),
+  OR `source = 'tcgplayer' AND sets.scrydex_expansion_id IS NOT NULL` (upgrade to Scrydex art)
+- **mirrorable** — `source_url` is a Scrydex-CDN url, OR the game is English Pokémon (NOT
+  'Pokemon Japan') with a mapped `scrydex_expansion_id` (constructed URL). TCGPlayer-cdn-only
+  rows are never candidates.
+- **due** — `mirror_attempts < 5` AND past the exponential backoff
+  (3·2^attempts days since `mirror_last_attempt_at`; mig 0086 columns)
 
 A `source='scrydex'` row with `r2_url IS NULL` (One Piece/Gundam Scrydex-CDN-as-final) is intentionally
 NOT eligible — this reproduces the old `image_source='scrydex'` exclusion.
+Reset a row's attempts to re-arm it: `UPDATE product_images SET mirror_attempts = 0, mirror_last_attempt_at = NULL WHERE product_id = ?`.

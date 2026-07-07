@@ -18,15 +18,14 @@
 
 import type { Env } from './worker.js'
 import { scrydexFetch, ScrydexCreditLimitError } from './lib/scrydexClient.js'
+import { GAME_SLUG_BY_CANONICAL_NAME } from './lib/gameNames.js'
 
-const GAME_CONFIGS = [
-  { slug: 'pokemon',           categoryName: 'Pokemon'            },
-  { slug: 'magicthegathering', categoryName: 'Magic'              },
-  { slug: 'onepiece',          categoryName: 'One Piece Card Game' },
-  { slug: 'gundam',            categoryName: 'Gundam Card Game'   },
-  { slug: 'lorcana',           categoryName: 'Lorcana'            },
-  { slug: 'riftbound',         categoryName: 'Riftbound'          },
-] as const
+// WP-3 (audit IMG-5/IMG-6b): configs derive from the ONE shared canonical-name map,
+// so the category names here are always the exact canonical_games.name strings
+// ('Lorcana TCG', 'Riftbound League of Legends Trading Card Game', …) and
+// 'Pokemon Japan' can never be swept in (it has no entry in the map).
+const GAME_CONFIGS = Object.entries(GAME_SLUG_BY_CANONICAL_NAME)
+  .map(([categoryName, slug]) => ({ slug, categoryName }))
 
 // Games where each TCGPlayer product is a distinct variant — audit these after mapping
 const VARIANT_IMAGE_CATEGORY_NAMES = new Set(['One Piece Card Game', 'Gundam Card Game'])
@@ -80,13 +79,15 @@ export async function syncScrydexSetMappings(env: Env): Promise<SyncResult> {
 
       // Fetch our canonical sets for this game (Session D: sets/canonical_games).
       // Aliases keep the downstream field names (abbreviation / scrydex_set_id) stable.
-      const gameWord = game.categoryName.split(' ')[0]
+      // WP-3 (audit IMG-6b): match the game by EXACT canonical name — the old
+      // `LIKE '%<first word>%'` matched 'Pokemon Japan' for the Pokemon config and
+      // leaked ENGLISH Scrydex expansion ids onto 44 JP sets (wrong-art mirrors).
       const { results: ourSets } = await env.DB.prepare(`
         SELECT s.id, s.name, s.code AS abbreviation, s.scrydex_expansion_id AS scrydex_set_id
         FROM   sets s
         JOIN   canonical_games g ON g.id = s.game_id
-        WHERE  LOWER(g.name) LIKE LOWER(?)
-      `).bind(`%${gameWord}%`).all()
+        WHERE  g.name = ?
+      `).bind(game.categoryName).all()
 
       const updates: D1PreparedStatement[] = []
 

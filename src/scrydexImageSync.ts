@@ -1,7 +1,8 @@
 /**
  * Scrydex Image URL Sync
  *
- * Runs weekly before the R2 mirror job so the mirror has fresh image URLs to work with.
+ * Runs weekly AFTER the R2 mirror stage (WP-2 mirror-first order): the mirror consumes the
+ * URLs the PREVIOUS week's sync wrote; this refreshes them for the next run.
  * Fetches card images from Scrydex's CDN catalog and writes them to tcg_products.image_url.
  * Never overwrites URLs that already point to our R2 (https://images.sleevedpages.com).
  *
@@ -35,14 +36,10 @@ import {
 // Games where each variant has a unique product_id + its own image
 const VARIANT_IMAGE_GAMES = new Set(['onepiece', 'gundam'])
 
-const GAME_SLUG_BY_CATEGORY: Record<string, string> = {
-  'Pokemon': 'pokemon',
-  'Magic': 'magicthegathering',
-  'One Piece Card Game': 'onepiece',
-  'Gundam Card Game': 'gundam',
-  'Lorcana': 'lorcana',
-  'Riftbound': 'riftbound',
-}
+// WP-3 (audit IMG-5): the game-name → slug map is the SHARED canonical-name map —
+// the local copy here once keyed 'Lorcana'/'Riftbound' and silently skipped both
+// games ('Pokemon Japan' is deliberately absent — see lib/gameNames.ts).
+import { GAME_SLUG_BY_CANONICAL_NAME } from './lib/gameNames.js'
 
 interface SyncResult {
   setsProcessed: number
@@ -124,7 +121,7 @@ export async function syncScrydexImages(env: Env, game?: string): Promise<SyncRe
 
   for (const set of sets as any[]) {
     const gameName = set.game as string
-    const gameSlug = GAME_SLUG_BY_CATEGORY[gameName]
+    const gameSlug = GAME_SLUG_BY_CANONICAL_NAME[gameName]
     if (!gameSlug) continue
 
     try {

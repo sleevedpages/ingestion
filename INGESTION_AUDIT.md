@@ -256,7 +256,7 @@ Control flow that swallows the error:
 
 **Net effect:** a multi-day, all-games outage looks like a stream of clean `complete` webhooks
 with 0 prices — no surfaced error, no retry, no alert. Matches the handoff's open-item #0 exactly
-(`Partner_Platform_Handoff_Summary.md:362-374`).
+(`Content/docs/handoffs/Partner_Platform_Handoff_Summary.md:362-374`).
 
 **Fix shape (do NOT implement — for Session D):** track hard fetch failures per webhook; on a
 fetch failure mark the row `status='error'` (retryable/visible) instead of `complete`; treat a
@@ -526,6 +526,6 @@ snapshot as if fresh — the exact bug the rebuild exists to kill.
 `image-mirror.ts`, `lib/scrydexClient.ts`, `db/migrations/001_initial.sql`,
 `db/migrations/0005_image_source.sql`; both `CLAUDE.md` files; `Content/CLAUDE.md` canonical
 sections; `Content/migrations/0058_canonical_tables.sql`;
-`Content/Partner_Platform_Handoff_Summary.md` open-item #0.
+`Content/docs/handoffs/Partner_Platform_Handoff_Summary.md` open-item #0.
 
 **No files were modified. No worker was run. No live API calls were made.**

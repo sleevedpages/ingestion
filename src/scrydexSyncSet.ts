@@ -38,14 +38,9 @@ import {
 const BATCH_SIZE = 100
 const VARIANT_IMAGE_GAMES = new Set(['onepiece', 'gundam'])
 
-const GAME_SLUG_BY_CATEGORY: Record<string, string> = {
-  'Pokemon':              'pokemon',
-  'Magic':               'magicthegathering',
-  'One Piece Card Game': 'onepiece',
-  'Gundam Card Game':    'gundam',
-  'Lorcana':             'lorcana',
-  'Riftbound':           'riftbound',
-}
+// WP-3 (audit IMG-5): shared canonical-name → slug map (the local copy here keyed
+// 'Lorcana'/'Riftbound' and skipped both games; see lib/gameNames.ts).
+import { GAME_SLUG_BY_CANONICAL_NAME } from './lib/gameNames.js'
 
 export interface SyncSetOptions {
   setId?:              number       // canonical sets.id
@@ -103,7 +98,7 @@ export async function syncSingleSet(env: Env, opts: SyncSetOptions): Promise<Syn
   const set = await resolveSet(env, opts)
   if (!set)                        return { ok: false, error: 'set not found' }
   if (!set.scrydex_expansion_id)   return { ok: false, error: 'set has no Scrydex expansion mapping' }
-  const gameSlug = GAME_SLUG_BY_CATEGORY[set.game]
+  const gameSlug = GAME_SLUG_BY_CANONICAL_NAME[set.game]
   if (!gameSlug)                   return { ok: false, error: `unsupported game: ${set.game}` }
   const expansionId = set.scrydex_expansion_id
 

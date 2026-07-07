@@ -52,15 +52,21 @@ export function isAdminJobId(value: unknown): value is AdminJobId {
 // manual `image-mirror` trigger, so there is a single source of truth. The Scrydex sub-steps
 // are guarded (skipped when keys are absent — e.g. UAT); the R2 mirror (Infinity batches) and
 // the api-log cleanup always run.
+//
+// ORDER IS LOAD-BEARING (WP-2, audit IMG-3): the MIRROR runs FIRST. The 2026-07-05 run died
+// inside the Scrydex sync stages and the mirror never executed (no image_mirror_log row at
+// all). Mirror-first guarantees the mirror stage always gets budget: it consumes the
+// source_urls the PREVIOUS week's sync wrote, and this week's sync then refreshes them for
+// the next run. The sync stages run after, with whatever budget remains.
 export async function runWeeklyImagePipeline(env: Env): Promise<void> {
+  await runMirrorJob({ DB: env.DB, IMAGES_BUCKET: env.IMAGES_BUCKET }, Infinity)
+    .catch((err) => logger.error('Scheduled mirror failed', { error: String(err) }));
   if (env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID) {
     await syncScrydexSetMappings(env)
       .catch((err) => logger.error('Scrydex set mapping failed', { error: String(err) }));
     await syncScrydexImages(env)
       .catch((err) => logger.error('Scrydex image sync failed', { error: String(err) }));
   }
-  await runMirrorJob({ DB: env.DB, IMAGES_BUCKET: env.IMAGES_BUCKET }, Infinity)
-    .catch((err) => logger.error('Scheduled mirror failed', { error: String(err) }));
   await cleanupScrydexApiLog(env.DB)
     .catch((err) => logger.error('scrydex_api_log cleanup failed', { error: String(err) }));
 }
