@@ -14,7 +14,8 @@
  * Stores images at: cards/{tcgplayer_product_id}.{ext}
  * Upserts product_images.r2_url (+ source, mirrored_at).
  * ALWAYS writes a per-run summary row to image_mirror_log (try/finally) —
- * processed/mirrored/failed/skipped + first_error — even if the run dies early.
+ * processed/mirrored/failed/skipped/placeholder_skips/tcgplayer_fallbacks (Content
+ * migration 0090) + first_error — even if the run dies early.
  *
  * Called by:
  *  - Scheduled cron: Sunday 3 AM UTC (runWeeklyImagePipeline — mirror runs FIRST)
@@ -247,9 +248,13 @@ export interface MirrorOutcome {
  * serves the real art directly from the CDN via `r2_url ?? source_url`. NEVER stamps
  * mirrored_at on a placeholder. Returns 'tcgplayer' when the mirror landed, else
  * 'skipped' with the repair applied.
+ *
+ * Exported (WP-6, audit IMG-7) so `deadSourceUrlSweep.ts` reuses this ONE repair path
+ * instead of a parallel implementation — it only needs `tcgplayer_product_id` (the
+ * other two fields are logging-only), hence the `Pick`.
  */
-async function tcgplayerPlaceholderFallback(
-  card: CardRow,
+export async function tcgplayerPlaceholderFallback(
+  card: Pick<CardRow, 'tcgplayer_product_id' | 'card_number' | 'set_name'>,
   bucket: R2Bucket,
   db: D1Database,
   placeholderHash: string | null,
@@ -568,8 +573,8 @@ export async function runMirrorJob(
           }
           // Card-back observability (Step-0 fix): count every placeholder detection
           // and every source_url repair. These surface in the structured run-summary
-          // log line + the returned result (image_mirror_log has no column for them —
-          // no migration this session).
+          // log line, the returned result, AND (WP-4, Content migration 0090) the
+          // persisted image_mirror_log row.
           if (result.placeholder) stats.placeholder_skips++;
           if (result.tcgplayerFallback) stats.tcgplayer_fallbacks++;
           if (result.error) firstError ??= result.error;
@@ -616,11 +621,13 @@ export async function runMirrorJob(
     const duration_ms = Date.now() - start;
     logger.info('Image mirror job complete', { ...stats, has_more, first_error: firstError });
     // The per-run summary row — written even on early death. Guarded so a
-    // log-write failure never masks the run's own error.
+    // log-write failure never masks the run's own error. placeholder_skips /
+    // tcgplayer_fallbacks (Content migration 0090) persist the card-back guard's
+    // counters, which the run computed all along but previously had no column for.
     try {
       await env.DB.prepare(`
-        INSERT INTO image_mirror_log (processed, mirrored, failed, skipped, scrydex_hits, tcgplayer_hits, duration_ms, first_error)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO image_mirror_log (processed, mirrored, failed, skipped, scrydex_hits, tcgplayer_hits, duration_ms, first_error, placeholder_skips, tcgplayer_fallbacks)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).bind(
         stats.processed,
         stats.mirrored,
@@ -630,6 +637,8 @@ export async function runMirrorJob(
         stats.tcgplayer_hits,
         duration_ms,
         firstError,
+        stats.placeholder_skips,
+        stats.tcgplayer_fallbacks,
       ).run();
     } catch (logErr) {
       logger.error('image_mirror_log write failed', { error: String(logErr) });

@@ -270,6 +270,25 @@ describe('runMirrorJob — Scrydex card-back placeholder handling', () => {
     expect(db.runCalls.some((c: any) => c.sql.includes('r2_url      = excluded.r2_url'))).toBe(true)
     expect(db.runCalls.some((c: any) => c.sql.includes('source_url = excluded.source_url') && c.args[0] === TCG_URL)).toBe(true)
   })
+
+  it('persists placeholder_skips + tcgplayer_fallbacks into the image_mirror_log row (WP-4, mig 0090)', async () => {
+    const db = makeMirrorDB([[pokemonCard()], []])
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('tcgplayer-cdn')) return notFoundResponse()
+      return okImageResponse(PLACEHOLDER)
+    }))
+    const result = await runMirrorJob({ DB: db, IMAGES_BUCKET: makeBucket() }, Infinity)
+    expect(result.placeholder_skips).toBe(1)
+    expect(result.tcgplayer_fallbacks).toBe(1)
+
+    const log = db.runCalls.find((c: any) => c.sql.includes('INSERT INTO image_mirror_log'))
+    expect(log.sql).toContain('placeholder_skips')
+    expect(log.sql).toContain('tcgplayer_fallbacks')
+    // binds: processed, mirrored, failed, skipped, scrydex_hits, tcgplayer_hits, duration,
+    // first_error, placeholder_skips, tcgplayer_fallbacks
+    expect(log.args[8]).toBe(1)
+    expect(log.args[9]).toBe(1)
+  })
 })
 
 describe('fetchPlaceholderHash', () => {
@@ -303,6 +322,7 @@ describe('runMirrorJob — image_mirror_log summary row', () => {
     // binds: processed, mirrored, failed, skipped, scrydex_hits, tcgplayer_hits, duration, first_error
     expect(log.args.slice(0, 6)).toEqual([0, 0, 0, 0, 0, 0])
     expect(log.args[7]).toBeNull()
+    expect(log.args.slice(8, 10)).toEqual([0, 0]) // placeholder_skips, tcgplayer_fallbacks
     expect(result.first_error).toBeNull()
   })
 

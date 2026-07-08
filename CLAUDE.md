@@ -141,7 +141,8 @@ The `0 3 * * SUN` and `0 4 * * *` (Scrydex) crons are not registered in the UAT 
 | `GET` | `/ebay/graded?canonicalProductId=&company=&grade=` | `x-worker-secret` | **GRADED GAP-FILLER** (2026-06-17 — REPLACED the removed tcggo graded source). Prices the slabs PriceCharting can't (TAG/ACE, grade < 7). Needs **`APIFY_TOKEN` + `APIFY_EBAY_ACTOR_ID`**. Resolves the canonical product → eBay completed+sold search terms (`src/lib/ebaySoldSearch.ts`), runs the Apify eBay actor (`run-sync-get-dataset-items`), then match-filters / trims outliers (MAD) / takes a median → `{ ok, price, n, company, grade, source:'ebay-apify' }` (`price:null`/`n:0` = no comps). Circuit-breaks to null on any actor error. `src/lib/ebayGradedClient.ts`. Content proxies **admin-only**, behind the `ebay_graded_enabled` flag (ships dark), + KV-caches 24h (nulls 6h). ⚠️ Actor input/output shapes are a documented assumption until the actor is pinned + probed. |
 | `GET` | `/tcggo/artists?search=&page=` | `x-worker-secret` | **Artist Templates tool** (2026-06-15). Lists/searches tcggo artists → `{ ok, artists:[{id,name,slug,cards_count}], page }`. Content proxies admin-only + KV-caches briefly. |
 | `GET` | `/tcggo/artists/:artistId/cards?cardsCount=` | `x-worker-secret` | Paginates **ALL** of an artist's cards (bounded by cards_count / short final page / 40-page free-tier cap) → `{ ok, artistId, count, cards:[{name,card_number,rarity,episode,image,tcgplayer_id,tcgid}], requests }`. Content maps these → canonical products + mints an owned template binder. |
-| `POST` | `/admin/purge-placeholder-mirrors` | `x-worker-secret` | **CARD-BACK CLEANUP SWEEP** (2026-07-08). Body `{ cursor?, limit? }`. **Synchronous + cursor-based** (NOT fire-and-forget): runs ONE bounded batch and returns `{ ok, scanned, purged, repaired, remaining, hasMore, cursorNext }`; the caller loops (pass `cursorNext` back as `cursor`) until `hasMore:false` — same loop shape as bulk-enrich / FETCH-PROCESS. Reads each `product_images.r2_url` object straight from R2, SHA-256s it, and on a `PLACEHOLDER_IMAGE_HASHES` match deletes the R2 object + repairs the row (source_url → reconstructed TCGplayer `_in_1000x1000`, r2_url/mirrored_at → NULL, source → NULL). Data changes are regenerable (rows self-repair on the next mirror), never destructive. Loop it with `scripts/purge-placeholder-mirrors.mjs`. See **Card-back placeholder guard** below. |
+| `POST` | `/admin/purge-placeholder-mirrors` | `x-worker-secret` | **CARD-BACK CLEANUP SWEEP** (2026-07-08). Body `{ cursor?, limit? }`. **Synchronous + cursor-based** (NOT fire-and-forget): runs ONE bounded batch and returns `{ ok, scanned, purged, repaired, remaining, hasMore, cursorNext }`; the caller loops (pass `cursorNext` back as `cursor`) until `hasMore:false` — same loop shape as bulk-enrich / FETCH-PROCESS. Reads each `product_images.r2_url` object straight from R2, SHA-256s it, and on a `PLACEHOLDER_IMAGE_HASHES` match deletes the R2 object + repairs the row (source_url → reconstructed TCGplayer `_in_1000x1000`, r2_url/mirrored_at → NULL, source → NULL). Data changes are regenerable (rows self-repair on the next mirror), never destructive. Loop it with `scripts/purge-placeholder-mirrors.mjs`, or the Content admin panel's "Purge card-back placeholders" card. See **Card-back placeholder guard** below. |
+| `POST` | `/admin/dead-url-sweep` | `x-worker-secret` | **WP-6 DEAD SOURCE_URL SWEEP** (2026-07-08, audit IMG-7). Body `{ cursor?, limit? }`. **Synchronous + cursor-based**, same shape as purge-placeholder-mirrors: `{ ok, scanned, alive, dead, repaired, remaining, hasMore, cursorNext }`. Manual-trigger only — **no cron**. Probes `product_images` rows with NO `r2_url` (source_url is their only serving path) and hashes every response (a bare 200 isn't proof of life — Scrydex serves its card-back placeholder at 200); a placeholder match repairs via the SAME `tcgplayerPlaceholderFallback` path the mirror uses; a plain-dead probe (non-2xx/network error/empty body) marks the row via the EXISTING `mirror_attempts`/`mirror_last_attempt_at` bookkeeping (mig 0086) — no new column. `src/deadSourceUrlSweep.ts`. See **Dead source_url sweep (WP-6)** below. |
 | `POST` | `/admin/run-job` | `x-worker-secret` | **MANUAL CRON-JOB TRIGGER** (2026-06-19). Body `{ job: 'tcg-sync'\|'image-mirror'\|'scrydex-drain'\|'pricecharting-csv'\|'pricecharting-download', force? }`. Runs the SAME function the matching cron calls (`src/adminJobs.ts`), **fire-and-forget via `waitUntil`** → `{ ok, job, started:true, category? }`. Per-job prereqs: scrydex-drain needs Scrydex keys → 503; **pricecharting-download** (the ONLY download) needs `PRICECHARTING_TOKEN` → 503; **pricecharting-csv** PROCESSes the cached R2 file (no token, no download); image-mirror runs without Scrydex keys. **Double-fire guard:** best-effort KV lock `ingestion_job_lock:{job}` (shared `SLEEVEDPAGES_KV`) → **409** `{alreadyRunning:true}`. **pricecharting-download extra guard:** a download cooldown `ingestion_pc_csv_cooldown` (~10 min, set by ANY download — manual or cron) → **429** `{cooldown:true, retryAfterSec}` (PriceCharting CSV download is hard rate-limited ~1/10min, abuse → account revocation). `pricecharting-csv` (re-process) is NOT cooldown-gated — unlimited + safe. Content proxies this **admin-only** via `POST /api/admin/ingestion/trigger`; status via `GET /api/admin/ingestion/jobs`. See **Manual Cron-Job Triggers** below. |
 
 Scrydex endpoints are called from the Admin panel via Content app proxy (`POST /api/admin/scrydex/trigger`). Direct calls require `x-worker-secret: <INGESTION_WORKER_SECRET>` header.
@@ -321,6 +322,83 @@ guard + repair the pipeline is self-healing.
 
 Tests: `src/lib/placeholderImages.test.ts`, `src/purgePlaceholderMirrors.test.ts`,
 and the placeholder→TCGplayer cases in `src/image-mirror.test.ts`.
+
+## Ingestion observability floor (audit WP-4, 2026-07-08 — Content migration 0090)
+
+Every worker cron/pipeline stage now writes ONE row to a NEW generic run log,
+`ingestion_run_log`, via the shared helper `src/lib/runLog.ts`:
+
+- **`writeRunLog(db, entry)`** — a guarded INSERT. NEVER throws (missing table on an
+  un-migrated DB, a transient D1 error) — a log-write failure is caught and logged, never
+  masking the stage's own result. `entry.counts` (whatever the stage returned, or nothing)
+  is best-effort `JSON.stringify`'d into `counts_json` — this table has NO fixed per-job
+  schema on purpose, since every stage's stats look different.
+- **`runStage(db, job, stage, fn)`** — wraps an EXISTING call at its call site (never
+  changes `fn`'s signature/return type): times it, writes exactly one row on success OR
+  failure (try/finally — the WP-2 `runMirrorJob` pattern generalised), and **rethrows**
+  whatever `fn` threw so existing `.catch(err => logger.error(...))` chains keep working
+  unchanged.
+- **Wired at:** the weekly image-mirror pipeline's four sub-stages (`mirror`,
+  `scrydex-set-mappings`, `scrydex-image-sync`, `api-log-cleanup` — see
+  `adminJobs.ts` `runWeeklyImagePipeline`, job id `image-mirror`); `tcg-sync` (`sync`
+  stage, both the cron default case and `/sync`/`/admin/run-job`); `scrydex-drain`
+  (`drain` stage, the cron, `/scrydex/process`, and `/admin/run-job`); `pricecharting-csv`
+  (`process`) / `pricecharting-download` (`fetch`); `news-poll` (`poll`).
+- **`image_mirror_log` gains two columns** (mig 0090): `placeholder_skips` /
+  `tcgplayer_fallbacks` — the card-back guard's counters, computed every run since that
+  session but with nowhere to persist ("no migration this session", per the prior
+  handoff entry). Now landed and wired into the existing per-run INSERT.
+- **Surfaced in Content** — `GET /api/admin/ingestion/jobs`'s new `observability` field:
+  the latest row per `(job, stage)`, `scrydex_webhook_log` status counts + the terminal
+  `'failed'` count (WP-8), both unmatched feeds (`pricecharting_products` +
+  `scrydex_unmatched_cards`, with a recent-rows peek), and the mirror job's last-run
+  summary now also carrying `placeholderSkips`/`tcgplayerFallbacks`. See
+  Content/CLAUDE.md "Observability floor (WP-4, migration 0090)".
+- **Optional zero-mirror-week alert** — Content-side only (the worker has no
+  `RESEND_API_KEY`); see Content/CLAUDE.md — fires opportunistically when an admin views
+  the panel, gated behind `app_config.image_mirror_zero_alert_enabled` (default OFF).
+
+Tests: `src/lib/runLog.test.ts` (the writer + the never-masks-the-result guarantee,
+including against the bare `{}` `env.DB` shape `adminJobs.pipeline.test.ts` already uses).
+
+## Dead source_url sweep (audit WP-6, 2026-07-08)
+
+`src/deadSourceUrlSweep.ts` (`POST /admin/dead-url-sweep`) — probes
+`product_images.source_url` for rows with NO `r2_url` (source_url is their ONLY serving
+path — a row with an `r2_url` is unaffected by a dead source_url, since `r2_url` wins in
+serving). **A bare HTTP 200 is NOT proof of life** for two reasons the audit + the
+card-back session both found: ~2.5% of stored TCGPlayer source_urls are dead upstream
+(403), and Scrydex serves its card-back placeholder at 200 for cards it has no scan of.
+Every probed body is hashed (`isPlaceholderImage()`, the SAME guard the mirror uses) —
+never trust the status code alone.
+
+- **Manual-trigger only — no cron.** Bounded keyset batches (`products.id`, the same
+  idiom as `purgePlaceholderMirrors.ts`) so it can be looped from the admin panel without
+  exceeding the request budget: `{ ok, scanned, alive, dead, repaired, remaining,
+  hasMore, cursorNext }`.
+- **Marking reuses EXISTING bookkeeping — no new column, deliberately narrower than the
+  audit's original "add `source_url_dead_at`" plan:**
+  - a **plain dead** probe (non-2xx / network error / empty body) calls the SAME
+    `mirrorAttemptUpsert()` the mirror itself calls on every processed card — the row
+    ages out of the mirror's own candidate pool through the ordinary attempt-ceiling +
+    exponential backoff (mig 0086), never a parallel mechanism.
+  - a **placeholder** match repairs through the ONE existing repair path,
+    `tcgplayerPlaceholderFallback()` — exported from `image-mirror.ts` (loosened to a
+    `Pick<CardRow, 'tcgplayer_product_id'|'card_number'|'set_name'>` parameter so the
+    sweep can call it without a full `CardRow`) — reconstructs the TCGplayer CDN url,
+    opportunistically tries to mirror it, and regardless repairs `source_url` so the app
+    stops serving the card-back. Never a second implementation of the repair.
+- **Scope note:** the sweep does NOT add a "let serving skip known-dead URLs" mechanism
+  (the audit's original WP-6 wording) — a plain-dead TCGplayer-cdn-only row has no other
+  image source to fall back to anyway, so "marking" it is an observability record (dates
+  it as investigated) more than an active serving change; a genuinely-Scrydex-hosted dead
+  row that IS a mirror candidate benefits directly (it ages out of that pool sooner).
+- **Surfaced in Content** — the WP-4 Observability panel + a loop-friendly admin proxy
+  (`POST /api/admin/image-mirror/dead-url-sweep`) + UI card, mirroring the Bulk Enrich
+  Run/Stop loop.
+
+Tests: `src/deadSourceUrlSweep.test.ts` (alive / plain-dead / placeholder-repair /
+network-error / keyset pagination).
 
 ## Local Mirror Script (`scripts/mirror-local.mjs`)
 Fetches images from your local machine's IP (bypasses CDN blocks) and hands bytes to the Worker:
@@ -765,7 +843,8 @@ asserts this). We link OUT for the content (mirrors the Rule Books posture).
 |-------|---------|
 | `scrydex_expansion_freshness` | Session D (mig 0063): `(scrydex_expansion_id, price_type)` → `last_updated`. Per-expansion freshness/dedup for the price processor. |
 | `tcg_sync_log` | One row per sync run with counts + status |
-| `image_mirror_log` | One row per mirror job with processed/mirrored/failed/**skipped**/source counts + **first_error** (Content mig 0086) — written via try/finally, so a row lands even when the run dies mid-batch |
+| `image_mirror_log` | One row per mirror job with processed/mirrored/failed/**skipped**/source counts + **first_error** (Content mig 0086) + **`placeholder_skips`/`tcgplayer_fallbacks`** (Content mig 0090 — the card-back guard's counters) — written via try/finally, so a row lands even when the run dies mid-batch |
+| `ingestion_run_log` | Content mig 0090 (audit WP-4): generic per-stage run log — `job`, `stage`, `started_at`, `finished_at`, `status` ('success'\|'error'), `counts_json` (best-effort, stage-shaped), `first_error`, `created_at`. ONE row per worker cron/pipeline stage invocation, written by the shared `runStage()`/`writeRunLog()` (`src/lib/runLog.ts`), success or failure. Covers every stage that has no dedicated table of its own (scrydex-drain, pricecharting, news-poll, and the 3 image-mirror sub-stages besides the mirror itself). |
 | `scrydex_webhook_log` | Webhook queue, lifecycle `pending → processing (atomic claim) → complete \| error (retryable) \| failed (TERMINAL)` (**drained ONCE DAILY** `0 4 * * *`, deduped by expansion — cost control 2026-06). WP-8 (Content mig 0089): `attempts` + `last_attempt_at` back the stale-claim reclaim (6h) + capped exponential error backoff (2h·2^attempts, cap 5 → `failed`). Re-arm a terminal row: `UPDATE scrydex_webhook_log SET status='pending', attempts=0 WHERE id=?`. |
 | `scrydex_unmatched_cards` | WP-8 (Content mig 0089): webhook cards with no catalogue match, recorded instead of silently dropped (ING-3). Deduped per `(scrydex_expansion_id, card_number, variant_name)` (COALESCE'd unique index — the conflict target must match it); `seen_count` ≈ days observed, `first/last_seen_at`, carries name/game_slug/tcgplayer_product_id for review. |
 | `scrydex_api_log` | One row per outbound Scrydex API call — credit guard + admin dashboard. 90-day retention. |

@@ -21,6 +21,7 @@ import {
 import { PRICECHARTING_CATEGORIES, type PriceChartingCategory } from './lib/pricechartingCsv.js';
 import { backfillR2ImageUrls, backfillVariantImages, seedVariantProducts } from './backfillR2Urls.js';
 import { purgePlaceholderMirrors } from './purgePlaceholderMirrors.js';
+import { sweepDeadSourceUrls } from './deadSourceUrlSweep.js';
 import { runNewsPoll } from './newsPoll.js';
 import {
   ADMIN_JOB_IDS,
@@ -31,6 +32,7 @@ import {
   releaseJobLock,
   priceChartingCooldownRemaining,
 } from './adminJobs.js';
+import { runStage } from './lib/runLog.js';
 import { logger } from './ingestion/logger.js';
 
 export interface Env {
@@ -121,7 +123,7 @@ export default {
         return json({ ok: false, error: 'Unauthorized' }, 401);
       }
       ctx.waitUntil(
-        runIngestion(buildConfig(env)).catch((err) =>
+        runStage(env.DB, 'tcg-sync', 'sync', () => runIngestion(buildConfig(env))).catch((err) =>
           logger.error('Manual sync failed', { error: String(err) })
         )
       );
@@ -320,7 +322,7 @@ export default {
 
       if (pathname === '/scrydex/process') {
         ctx.waitUntil(
-          processPendingWebhooks(env).catch((err) =>
+          runStage(env.DB, 'scrydex-drain', 'drain', () => processPendingWebhooks(env)).catch((err) =>
             logger.error('Manual Scrydex process failed', { error: String(err) })
           )
         );
@@ -521,6 +523,33 @@ export default {
       }
     }
 
+    // POST /admin/dead-url-sweep — WP-6 (audit IMG-7): probes product_images.source_url
+    // rows that have NO r2_url (source_url is their only serving path), hashes every
+    // probed body (a bare 200 is not proof of life — Scrydex's card-back placeholder is
+    // also a 200), and marks dead ones via the EXISTING mirror_attempts/mirror_last_attempt_at
+    // bookkeeping (no new column) or repairs a placeholder match via the shared
+    // tcgplayerPlaceholderFallback path. SYNCHRONOUS + cursor-based, same shape as
+    // purge-placeholder-mirrors: { scanned, alive, dead, repaired, remaining, hasMore,
+    // cursorNext } — the admin panel loops (passing cursorNext back as cursor) until
+    // hasMore is false. Manual-trigger only — no cron.
+    if (pathname === '/admin/dead-url-sweep' && request.method === 'POST') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      const body = await request.json().catch(() => ({})) as { cursor?: number; limit?: number };
+      try {
+        const result = await sweepDeadSourceUrls(
+          { DB: env.DB, IMAGES_BUCKET: env.IMAGES_BUCKET },
+          { cursor: body.cursor, limit: body.limit },
+        );
+        return json({ ok: true, ...result });
+      } catch (err) {
+        logger.error('dead-url-sweep failed', { error: String(err) });
+        return json({ ok: false, error: String(err) }, 500);
+      }
+    }
+
     // POST /admin/run-job — manual, on-demand trigger for a scheduled ingestion job
     // (admin-proxied from the Content portal; requires x-worker-secret). Runs the SAME function the
     // cron/job body calls, fire-and-forget via waitUntil, and guards against double-firing with a
@@ -578,22 +607,27 @@ export default {
           try {
             switch (job) {
               case 'tcg-sync':
-                await runIngestion(buildConfig(env));
+                await runStage(env.DB, 'tcg-sync', 'sync', () => runIngestion(buildConfig(env)));
                 break;
               case 'image-mirror':
+                // runWeeklyImagePipeline logs its OWN 4 per-stage rows (see adminJobs.ts) —
+                // no outer wrap needed here.
                 await runWeeklyImagePipeline(env);
                 break;
               case 'scrydex-drain':
-                await processPendingWebhooks(env);
+                await runStage(env.DB, 'scrydex-drain', 'drain', () => processPendingWebhooks(env));
                 break;
               case 'pricecharting-csv':
-                await runPriceChartingProcess(env, category!);   // PROCESS cached R2 file — NO download
+                // PROCESS cached R2 file — NO download
+                await runStage(env.DB, 'pricecharting-csv', 'process', () => runPriceChartingProcess(env, category!));
                 break;
               case 'pricecharting-download':
-                await runPriceChartingFetch(env, category!);     // download fresh → R2 → PROCESS
+                // download fresh → R2 → PROCESS
+                await runStage(env.DB, 'pricecharting-download', 'fetch', () => runPriceChartingFetch(env, category!));
                 break;
               case 'news-poll':
-                await runNewsPoll(env);                          // poll DotGG RSS → news_items (no key needed)
+                // poll DotGG RSS → news_items (no key needed)
+                await runStage(env.DB, 'news-poll', 'poll', () => runNewsPoll(env));
                 break;
             }
           } catch (err) {
@@ -704,7 +738,7 @@ export default {
         // distinct expansion. Freshness (20h) < this 24h interval, so prices still advance.
         if (env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID) {
           ctx.waitUntil(
-            processPendingWebhooks(env).catch((err) =>
+            runStage(env.DB, 'scrydex-drain', 'drain', () => processPendingWebhooks(env)).catch((err) =>
               logger.error('Scrydex webhook processing failed', { error: String(err) })
             )
           );
@@ -721,7 +755,7 @@ export default {
         if (env.PRICECHARTING_TOKEN) {
           const category = priceChartingCategoryForDay();
           ctx.waitUntil(
-            runPriceChartingFetch(env, category).catch((err) =>
+            runStage(env.DB, 'pricecharting-download', 'fetch', () => runPriceChartingFetch(env, category)).catch((err) =>
               logger.error('PriceCharting CSV fetch failed', { error: String(err), category })
             )
           );
@@ -734,7 +768,7 @@ export default {
         // RSS. This cron is registered in PROD triggers only (UAT is populated by the on-demand
         // POST /admin/run-job { job:'news-poll' }). 07:00 UTC is clear of the 04/05/06 ingest crons.
         ctx.waitUntil(
-          runNewsPoll(env).catch((err) =>
+          runStage(env.DB, 'news-poll', 'poll', () => runNewsPoll(env)).catch((err) =>
             logger.error('News poll failed', { error: String(err) })
           )
         );
@@ -743,7 +777,7 @@ export default {
       default:
         // "0 6 * * *" and any other cron — daily TCG sync
         ctx.waitUntil(
-          runIngestion(buildConfig(env)).catch((err) =>
+          runStage(env.DB, 'tcg-sync', 'sync', () => runIngestion(buildConfig(env))).catch((err) =>
             logger.error('Scheduled sync failed', { error: String(err) })
           )
         );
