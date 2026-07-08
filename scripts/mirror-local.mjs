@@ -25,6 +25,13 @@ const BATCH_SIZE = parseInt(args[args.indexOf('--batch') + 1] ?? '50', 10) || 50
 const CONCURRENCY = parseInt(args[args.indexOf('--concurrency') + 1] ?? '5', 10) || 5
 const SCRYDEX_ONLY = args.includes('--scrydex-only')
 
+// Worker endpoints require this shared secret (x-worker-secret header) — see WP-0.
+const WORKER_SECRET = process.env.INGESTION_WORKER_SECRET
+if (!WORKER_SECRET) {
+  console.error('  ✗ INGESTION_WORKER_SECRET env var is required (matches the worker\'s secret).')
+  process.exit(1)
+}
+
 // ─── Scrydex URL construction (mirrors image-mirror.ts logic) ────────────────
 
 function formatScrydexCardNumber(num) {
@@ -86,7 +93,7 @@ async function uploadImage(productId, buffer, contentType, source) {
   const imageBase64 = Buffer.from(buffer).toString('base64')
   const res = await fetch(`${WORKER_URL}/mirror/upload`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'x-worker-secret': WORKER_SECRET },
     body: JSON.stringify({ tcgplayer_product_id: productId, imageBase64, contentType, source }),
   })
   if (!res.ok) {
@@ -154,7 +161,7 @@ async function main() {
     let cards
     try {
       const pendingUrl = `${WORKER_URL}/mirror/pending?limit=${BATCH_SIZE}${SCRYDEX_ONLY ? '&scrydex_only=1' : ''}`
-      const res = await fetch(pendingUrl)
+      const res = await fetch(pendingUrl, { headers: { 'x-worker-secret': WORKER_SECRET } })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
       if (!data.ok) throw new Error(data.error ?? 'Unknown error')

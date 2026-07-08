@@ -113,7 +113,12 @@ export default {
       return json({ ok: true, service: 'sleevedpages-ingestion' });
     }
 
+    // ── Manual TCG sync trigger (require x-worker-secret; POST) ─────────────────
     if (pathname === '/sync' && request.method === 'POST') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
       ctx.waitUntil(
         runIngestion(buildConfig(env)).catch((err) =>
           logger.error('Manual sync failed', { error: String(err) })
@@ -577,6 +582,10 @@ export default {
     }
 
     if (pathname === '/mirror' && request.method === 'POST') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
       try {
         // maxBatches=1 keeps the HTTP response well under 30s
         const result = await runMirrorJob({ DB: env.DB, IMAGES_BUCKET: env.IMAGES_BUCKET }, 1);
@@ -587,9 +596,13 @@ export default {
       }
     }
 
-    // GET /mirror/pending?limit=N
+    // GET /mirror/pending?limit=N (require x-worker-secret)
     // Returns the next N cards that still need mirroring, for use by mirror-local.mjs.
     if (pathname === '/mirror/pending' && request.method === 'GET') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
       const qs          = new URL(request.url).searchParams;
       const limit       = Math.min(200, Math.max(1, parseInt(qs.get('limit') ?? '50', 10)));
       const scrydexOnly = qs.get('scrydex_only') === '1';
@@ -597,10 +610,14 @@ export default {
       return json({ ok: true, cards, has_more: cards.length === limit });
     }
 
-    // POST /mirror/upload
+    // POST /mirror/upload (require x-worker-secret)
     // Accepts image bytes (base64) fetched by mirror-local.mjs from a non-datacenter IP,
     // writes them to R2, and updates tcg_products.
     if (pathname === '/mirror/upload' && request.method === 'POST') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
       try {
         const body = await request.json() as {
           tcgplayer_product_id: number;

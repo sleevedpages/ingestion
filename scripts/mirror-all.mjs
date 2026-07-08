@@ -17,6 +17,13 @@ const args        = process.argv.slice(2)
 const DELAY_MS    = parseInt(args[args.indexOf('--delay') + 1] ?? '500', 10) || 500
 const DRY_RUN     = args.includes('--dry')
 
+// Worker endpoints require this shared secret (x-worker-secret header) — see WP-0.
+const WORKER_SECRET = process.env.INGESTION_WORKER_SECRET
+if (!DRY_RUN && !WORKER_SECRET) {
+  console.error('  ✗ INGESTION_WORKER_SECRET env var is required (matches the worker\'s secret).')
+  process.exit(1)
+}
+
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 function fmt(n) { return n.toLocaleString() }
@@ -57,7 +64,10 @@ async function main() {
 
     let res
     try {
-      const response = await fetch(`${WORKER_URL}/mirror`, { method: 'POST' })
+      const response = await fetch(`${WORKER_URL}/mirror`, {
+        method: 'POST',
+        headers: { 'x-worker-secret': WORKER_SECRET },
+      })
 
       if (!response.ok) {
         const text = await response.text().catch(() => '')
