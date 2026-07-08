@@ -22,9 +22,21 @@
  */
 
 import { buildScrydexImageUrl, buildScrydexImageUrlFromSetName } from './lib/scrydexUrl.js';
-import { writeR2Image, mirrorAttemptUpsert, isTcgplayerCdnUrl, isScrydexImageUrl } from './lib/productImages.js';
+import {
+  writeR2Image,
+  mirrorAttemptUpsert,
+  isTcgplayerCdnUrl,
+  isScrydexImageUrl,
+  placeholderRepairUpsert,
+  forceSourceUrlUpsert,
+} from './lib/productImages.js';
+import { isPlaceholderImage, sha256Hex, tcgplayerFullImageUrl } from './lib/placeholderImages.js';
 import { isEnglishPokemon } from './lib/gameNames.js';
 import { logger } from './ingestion/logger.js';
+
+// Re-export sha256Hex from the shared placeholder module so existing importers
+// (image-mirror tests, mirror-local.mjs helpers) keep resolving it from here.
+export { sha256Hex } from './lib/placeholderImages.js';
 
 const BATCH_SIZE = 100;     // cards fetched from DB per invocation
 const CONCURRENCY = 10;     // cards processed in parallel within each batch
@@ -117,6 +129,8 @@ interface MirrorStats {
   skipped: number;
   scrydex_hits: number;
   tcgplayer_hits: number;
+  placeholder_skips: number;    // Scrydex card-backs detected + rejected (not stamped)
+  tcgplayer_fallbacks: number;  // rows whose source_url was repaired to the TCGplayer CDN
 }
 
 // WP-3 (audit IMG-6): English-Pokémon check lives in lib/gameNames.ts — it EXCLUDES
@@ -135,11 +149,6 @@ export const MIN_IMAGE_BYTES = 1024;
 
 /** A Pokémon card number that cannot exist — the probe URL for the placeholder. */
 export const PLACEHOLDER_PROBE_URL = 'https://images.scrydex.com/pokemon/base1-999999/large';
-
-export async function sha256Hex(buffer: ArrayBuffer): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', buffer);
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
-}
 
 /** Fetches + hashes the Scrydex placeholder for this run. null = probe failed
  *  (404/network) → placeholder detection disabled for the run. */
@@ -160,12 +169,21 @@ export async function fetchPlaceholderHash(): Promise<string | null> {
   }
 }
 
-/** Fetches image bytes from a URL. Returns null on any non-2xx, network error,
- *  sub-floor body, or a placeholder-fingerprint match. */
+export interface FetchedImage { buffer: ArrayBuffer; contentType: string; status: number }
+
+/**
+ * Fetches image bytes from a URL. Returns:
+ *  - the image on success,
+ *  - the sentinel `'placeholder'` when the bytes ARE a Scrydex card-back (matched
+ *    against the static PLACEHOLDER_IMAGE_HASHES set OR this run's live probe hash) —
+ *    so the caller can trigger the TCGplayer fallback/repair,
+ *  - `null` on any non-2xx, network error, or sub-floor body (a genuine miss).
+ * The placeholder check hashes the bytes ONCE, so format/size are irrelevant.
+ */
 export async function fetchImage(
   url: string,
   placeholderHash: string | null = null,
-): Promise<{ buffer: ArrayBuffer; contentType: string; status: number } | null> {
+): Promise<FetchedImage | 'placeholder' | null> {
   try {
     const res = await fetch(url, {
       headers: {
@@ -190,11 +208,13 @@ export async function fetchImage(
       logger.debug('Image body below sanity floor', { url, bytes: buffer.byteLength });
       return null;
     }
-    // WP-2 (IMG-10): content fingerprint replaces the old blanket <300 KB guard —
-    // reject the Scrydex card-back placeholder by exact hash, keep small real scans.
-    if (placeholderHash && (await sha256Hex(buffer)) === placeholderHash) {
-      logger.debug('Image is the Scrydex placeholder (fingerprint match)', { url });
-      return null;
+    // Placeholder detection (IMG-10 + Step-0 card-back fix): the static
+    // PLACEHOLDER_IMAGE_HASHES set (known card-backs, incl. historical R2 bytes) plus
+    // this run's live probe fingerprint. A hit is a KNOWN card-back, byte-for-byte,
+    // whatever its size or format.
+    if (await isPlaceholderImage(buffer, placeholderHash ? [placeholderHash] : null)) {
+      logger.debug('Image is a Scrydex card-back placeholder (hash match)', { url });
+      return 'placeholder';
     }
     return { buffer, contentType, status: res.status };
   } catch (e) {
@@ -213,7 +233,59 @@ function extFromContentType(ct: string): string {
 
 export interface MirrorOutcome {
   outcome: 'scrydex' | 'tcgplayer' | 'failed' | 'skipped';
-  error?: string;     // first meaningful error for this card (feeds the run's first_error)
+  error?: string;             // first meaningful error for this card (feeds the run's first_error)
+  placeholder?: boolean;      // a Scrydex card-back placeholder was detected + handled
+  tcgplayerFallback?: boolean;// the source_url was repaired to the reconstructed TCGplayer CDN url
+}
+
+/**
+ * Card-back fallback (Step-0 fix). A Scrydex placeholder was detected for this card.
+ * Reconstruct the correct TCGplayer image and (a) opportunistically try to mirror it
+ * into R2 — usually 403s from a worker datacenter IP (tcgplayer-cdn blocks them; see
+ * CLAUDE.md), succeeds only from non-datacenter contexts; and regardless (b) repair
+ * source_url to the TCGplayer CDN url with r2_url/mirrored_at cleared, so the app
+ * serves the real art directly from the CDN via `r2_url ?? source_url`. NEVER stamps
+ * mirrored_at on a placeholder. Returns 'tcgplayer' when the mirror landed, else
+ * 'skipped' with the repair applied.
+ */
+async function tcgplayerPlaceholderFallback(
+  card: CardRow,
+  bucket: R2Bucket,
+  db: D1Database,
+  placeholderHash: string | null,
+): Promise<MirrorOutcome> {
+  const tcgUrl = tcgplayerFullImageUrl(card.tcgplayer_product_id);
+  if (!tcgUrl) {
+    logger.debug('Scrydex placeholder but no tcgplayer id to repair', {
+      id: card.tcgplayer_product_id, number: card.card_number, set: card.set_name,
+    });
+    return { outcome: 'skipped', placeholder: true, error: 'scrydex placeholder; no tcgplayer fallback id' };
+  }
+
+  const fetched = await fetchImage(tcgUrl, placeholderHash);
+  if (fetched && fetched !== 'placeholder') {
+    // Non-datacenter context (e.g. local mirror): the real TCGplayer art fetched.
+    const ext = extFromContentType(fetched.contentType);
+    const key = `cards/${card.tcgplayer_product_id}.${ext}`;
+    try {
+      await bucket.put(key, fetched.buffer, {
+        httpMetadata: { contentType: fetched.contentType, cacheControl: 'public, max-age=31536000' },
+      });
+      const r2Url = `${R2_PUBLIC_BASE}/${key}`;
+      await writeR2Image(db, card.tcgplayer_product_id, r2Url, 'tcgplayer');
+      // Point source_url at the TCGplayer CDN too (r2_url already wins in serving).
+      await forceSourceUrlUpsert(db, card.tcgplayer_product_id, tcgUrl).run();
+      return { outcome: 'tcgplayer', placeholder: true, tcgplayerFallback: true };
+    } catch (e) {
+      logger.warn('R2 put failed (tcgplayer fallback)', { key, error: String(e) });
+      // fall through to the source_url-only repair
+    }
+  }
+
+  // Expected worker path: tcgplayer-cdn 403s the worker → repair source_url so the app
+  // serves the real art from the CDN; leave r2_url NULL, never stamp mirrored_at.
+  await placeholderRepairUpsert(db, card.tcgplayer_product_id, tcgUrl).run();
+  return { outcome: 'skipped', placeholder: true, tcgplayerFallback: true };
 }
 
 /** Processes a single card: fetches image and stores in R2.
@@ -232,6 +304,7 @@ async function mirrorCard(
   // Fast path: caller supplies a specific source URL (e.g. per-variant Scrydex CDN URL)
   if (opts.sourceImageUrl) {
     const fetched = await fetchImage(opts.sourceImageUrl, placeholderHash);
+    if (fetched === 'placeholder') return tcgplayerPlaceholderFallback(card, bucket, db, placeholderHash);
     if (!fetched) return { outcome: 'failed', error: `fetch failed: ${opts.sourceImageUrl}` };
     const ext = extFromContentType(fetched.contentType);
     const key = `cards/${card.tcgplayer_product_id}.${ext}`;
@@ -260,6 +333,10 @@ async function mirrorCard(
 
     if (scrydexUrl) {
       const fetched = await fetchImage(scrydexUrl, placeholderHash);
+      // The constructed Scrydex CDN url returned the card-back placeholder (the
+      // Celebrations: Classic Collection case) — repair to the TCGplayer image
+      // instead of mirroring a card-back.
+      if (fetched === 'placeholder') return tcgplayerPlaceholderFallback(card, bucket, db, placeholderHash);
       if (fetched) {
         const ext = extFromContentType(fetched.contentType);
         const key = `cards/${card.tcgplayer_product_id}.${ext}`;
@@ -302,6 +379,10 @@ async function mirrorCard(
   }
 
   const fetched = await fetchImage(imageUrl, placeholderHash);
+  if (fetched === 'placeholder') {
+    // The stored Scrydex source_url is a card-back — repair to TCGplayer art.
+    return tcgplayerPlaceholderFallback(card, bucket, db, placeholderHash);
+  }
   if (!fetched) {
     // URL + status already logged inside fetchImage
     return { outcome: 'failed', error: firstError ?? `fetch failed: ${imageUrl}` };
@@ -414,6 +495,8 @@ export interface MirrorJobResult {
   skipped: number;
   scrydex_hits: number;
   tcgplayer_hits: number;
+  placeholder_skips: number;    // Scrydex card-backs detected + rejected this run
+  tcgplayer_fallbacks: number;  // rows whose source_url was repaired to the TCGplayer CDN
   duration_ms: number;
   has_more: boolean;          // true if more cards remain after this invocation's limit
   first_error: string | null; // first error seen this run (also persisted to image_mirror_log)
@@ -424,7 +507,7 @@ export async function runMirrorJob(
   maxBatches = 1   // 1 for HTTP requests (fast response); Infinity for cron (run until done)
 ): Promise<MirrorJobResult> {
   const start = Date.now();
-  const stats: MirrorStats = { processed: 0, mirrored: 0, failed: 0, skipped: 0, scrydex_hits: 0, tcgplayer_hits: 0 };
+  const stats: MirrorStats = { processed: 0, mirrored: 0, failed: 0, skipped: 0, scrydex_hits: 0, tcgplayer_hits: 0, placeholder_skips: 0, tcgplayer_fallbacks: 0 };
   let firstError: string | null = null;
   let has_more = false;
 
@@ -483,6 +566,12 @@ export async function runMirrorJob(
             if (result.outcome === 'scrydex') stats.scrydex_hits++;
             else stats.tcgplayer_hits++;
           }
+          // Card-back observability (Step-0 fix): count every placeholder detection
+          // and every source_url repair. These surface in the structured run-summary
+          // log line + the returned result (image_mirror_log has no column for them —
+          // no migration this session).
+          if (result.placeholder) stats.placeholder_skips++;
+          if (result.tcgplayerFallback) stats.tcgplayer_fallbacks++;
           if (result.error) firstError ??= result.error;
         }
         // Attempt bookkeeping for every processed card (success, fail, AND skip —

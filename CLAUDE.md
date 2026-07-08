@@ -141,6 +141,7 @@ The `0 3 * * SUN` and `0 4 * * *` (Scrydex) crons are not registered in the UAT 
 | `GET` | `/ebay/graded?canonicalProductId=&company=&grade=` | `x-worker-secret` | **GRADED GAP-FILLER** (2026-06-17 — REPLACED the removed tcggo graded source). Prices the slabs PriceCharting can't (TAG/ACE, grade < 7). Needs **`APIFY_TOKEN` + `APIFY_EBAY_ACTOR_ID`**. Resolves the canonical product → eBay completed+sold search terms (`src/lib/ebaySoldSearch.ts`), runs the Apify eBay actor (`run-sync-get-dataset-items`), then match-filters / trims outliers (MAD) / takes a median → `{ ok, price, n, company, grade, source:'ebay-apify' }` (`price:null`/`n:0` = no comps). Circuit-breaks to null on any actor error. `src/lib/ebayGradedClient.ts`. Content proxies **admin-only**, behind the `ebay_graded_enabled` flag (ships dark), + KV-caches 24h (nulls 6h). ⚠️ Actor input/output shapes are a documented assumption until the actor is pinned + probed. |
 | `GET` | `/tcggo/artists?search=&page=` | `x-worker-secret` | **Artist Templates tool** (2026-06-15). Lists/searches tcggo artists → `{ ok, artists:[{id,name,slug,cards_count}], page }`. Content proxies admin-only + KV-caches briefly. |
 | `GET` | `/tcggo/artists/:artistId/cards?cardsCount=` | `x-worker-secret` | Paginates **ALL** of an artist's cards (bounded by cards_count / short final page / 40-page free-tier cap) → `{ ok, artistId, count, cards:[{name,card_number,rarity,episode,image,tcgplayer_id,tcgid}], requests }`. Content maps these → canonical products + mints an owned template binder. |
+| `POST` | `/admin/purge-placeholder-mirrors` | `x-worker-secret` | **CARD-BACK CLEANUP SWEEP** (2026-07-08). Body `{ cursor?, limit? }`. **Synchronous + cursor-based** (NOT fire-and-forget): runs ONE bounded batch and returns `{ ok, scanned, purged, repaired, remaining, hasMore, cursorNext }`; the caller loops (pass `cursorNext` back as `cursor`) until `hasMore:false` — same loop shape as bulk-enrich / FETCH-PROCESS. Reads each `product_images.r2_url` object straight from R2, SHA-256s it, and on a `PLACEHOLDER_IMAGE_HASHES` match deletes the R2 object + repairs the row (source_url → reconstructed TCGplayer `_in_1000x1000`, r2_url/mirrored_at → NULL, source → NULL). Data changes are regenerable (rows self-repair on the next mirror), never destructive. Loop it with `scripts/purge-placeholder-mirrors.mjs`. See **Card-back placeholder guard** below. |
 | `POST` | `/admin/run-job` | `x-worker-secret` | **MANUAL CRON-JOB TRIGGER** (2026-06-19). Body `{ job: 'tcg-sync'\|'image-mirror'\|'scrydex-drain'\|'pricecharting-csv'\|'pricecharting-download', force? }`. Runs the SAME function the matching cron calls (`src/adminJobs.ts`), **fire-and-forget via `waitUntil`** → `{ ok, job, started:true, category? }`. Per-job prereqs: scrydex-drain needs Scrydex keys → 503; **pricecharting-download** (the ONLY download) needs `PRICECHARTING_TOKEN` → 503; **pricecharting-csv** PROCESSes the cached R2 file (no token, no download); image-mirror runs without Scrydex keys. **Double-fire guard:** best-effort KV lock `ingestion_job_lock:{job}` (shared `SLEEVEDPAGES_KV`) → **409** `{alreadyRunning:true}`. **pricecharting-download extra guard:** a download cooldown `ingestion_pc_csv_cooldown` (~10 min, set by ANY download — manual or cron) → **429** `{cooldown:true, retryAfterSec}` (PriceCharting CSV download is hard rate-limited ~1/10min, abuse → account revocation). `pricecharting-csv` (re-process) is NOT cooldown-gated — unlimited + safe. Content proxies this **admin-only** via `POST /api/admin/ingestion/trigger`; status via `GET /api/admin/ingestion/jobs`. See **Manual Cron-Job Triggers** below. |
 
 Scrydex endpoints are called from the Admin panel via Content app proxy (`POST /api/admin/scrydex/trigger`). Direct calls require `x-worker-secret: <INGESTION_WORKER_SECRET>` header.
@@ -204,7 +205,10 @@ Supported games are controlled by `tcg_categories` and `price-config.ts`. Curren
   `PLACEHOLDER_PROBE_URL` (impossible card number → Scrydex returns its card-back placeholder),
   SHA-256s it, and rejects any fetched image with the same hash; 1 KB sanity floor; a failed
   probe disables detection for the run. Legit small scans now mirror. (mirror-local.mjs keeps
-  its own local guard — the script is unchanged.)
+  its own local guard — the script is unchanged.) **Augmented 2026-07-08** by the STATIC
+  `PLACEHOLDER_IMAGE_HASHES` set + a TCGplayer fallback/repair — see **Card-back placeholder
+  guard** below (the live probe alone can't catch a historically-mirrored, since-re-encoded
+  card-back).
 - **Per-run summary ALWAYS logged**: `runMirrorJob` is try/finally'd — `image_mirror_log` gets
   processed/mirrored/failed/skipped + `first_error` even if the run dies mid-batch.
 - **'Pokemon Japan' is excluded** from URL construction (`isEnglishPokemon`, lib/gameNames.ts).
@@ -250,6 +254,73 @@ mirroring. The Scrydex image path is unchanged and remains preferred where it ha
 **Storage**: `cards/{tcgplayer_product_id}.{ext}` in R2
 **Public URL**: `https://images.sleevedpages.com/cards/{id}.{ext}`
 **DB update**: sets `tcg_products.image_url` to R2 URL + `tcg_products.image_source` to `'scrydex'` or `'tcgplayer'`
+
+## Card-back placeholder guard (Step-0 fix, 2026-07-08)
+
+**Problem (operator-confirmed, real assets):** Scrydex has no scans for some cards
+(the whole **`cel25c` / "Celebrations: Classic Collection"** sub-set) and instead
+serves a generic Pokémon **card-back placeholder** at HTTP 200. Because
+`SOURCE_URL_PRECEDENCE_CASE` makes any `images.scrydex.com` URL win, that card-back
+overwrote the correct TCGplayer `source_url` in `product_images`, the mirror stamped
+it into R2, and it then won everywhere via `r2_url ?? source_url ?? snapshot`.
+
+**Shared module `src/lib/placeholderImages.ts` — the ONE guard:**
+- `PLACEHOLDER_IMAGE_HASHES: Set<string>` — SHA-256 hex of every KNOWN card-back
+  body, seeded from Step-0 (live `/large` `fd7c3800…`, `/medium` `b69464a4…`,
+  `/small` `01f03f71…`, **and the historical R2 object `c4d4811d…` (cards/250321.png,
+  which differs from today's live placeholder — Scrydex re-encoded it, so only a
+  static hash finds it)**). **How to append:** download the offending R2 object /
+  Scrydex URL, `sha256sum` it, eyeball that it IS a card-back, add the hex + a note.
+  A false hash would purge a real card — verify first.
+- `isPlaceholderImage(bytes | hex, extraHashes?)` — pure, unit-testable, Workers-native
+  `crypto.subtle` (no dependency). Hashes bytes ONCE, so format/size are irrelevant.
+- `tcgplayerFullImageUrl(tcgplayer_product_id)` → `https://tcgplayer-cdn.tcgplayer.com/product/{id}_in_1000x1000.jpg`
+  — the exact form `transformer.ts bumpTcgplayerImageRes` produces / mig 0064 stored
+  (the original image a placeholder overwrote). `_1000x1000` without `_in_` is 403.
+
+**Design chosen = mirror-only guard (design B), NOT a write-time guard.** The
+overwrite happens in the weekly `syncScrydexImages` (thousands of `product_images`
+writes/run across ~352 sets); a write-time fetch-and-hash per overwrite would blow
+the 1000-subrequest/invocation cap. The mirror already fetches+hashes every candidate,
+so the guard is free there. Accepted trade-off: a card-back can briefly serve via
+`source_url` between a Scrydex write and the next mirror pass (self-heals). So the
+Scrydex image writers are **unchanged** — the mirror + purge are the enforcement.
+
+**Mirror-side guard + TCGplayer fallback (`image-mirror.ts`):**
+- `fetchImage` now returns `'placeholder'` (sentinel) when the downloaded bytes match
+  `PLACEHOLDER_IMAGE_HASHES` OR this run's live probe hash — in addition to the
+  existing per-run `fetchPlaceholderHash()` fingerprint (self-updating backstop).
+- On a placeholder, `tcgplayerPlaceholderFallback()` fires: reconstruct the TCGplayer
+  URL and **repair `source_url` to it, r2_url/mirrored_at NULL, source NULL** (via
+  `placeholderRepairUpsert`) so the app serves the real art straight from the CDN.
+  It also *attempts* to mirror the TCGplayer image into R2 first, but **that usually
+  403s from a worker datacenter IP** (tcgplayer-cdn blocks them — the standing
+  no-TCGplayer-in-R2 reason), so the reliable outcome is the `source_url` repair, not
+  an R2 write. **`mirrored_at` is NEVER stamped on a skipped/placeholder download.**
+- Run counters `placeholder_skips` / `tcgplayer_fallbacks` are added to the structured
+  run-summary log line + the `MirrorJobResult` (NOT to `image_mirror_log` — no
+  migration this session; finer columns are a future migration).
+
+**Precedence rule (standing):** a Scrydex card-back can never win — the mirror repairs
+any placeholder to the TCGplayer image, and the app's `r2_url ?? source_url` chain then
+serves real art. If Scrydex later adds a real scan it flows through normally (a real
+scan won't hash-match).
+
+**Cleanup sweep — `purge-placeholder-mirrors`** (`src/purgePlaceholderMirrors.ts`,
+endpoint `POST /admin/purge-placeholder-mirrors`): bounded, cursor-based (keyset on
+`products.id`), ONE batch per call → `{ scanned, purged, repaired, remaining, hasMore,
+cursorNext }`. Reads each `r2_url` object from R2 (no external fetch → no
+tcgplayer-cdn 403), hashes it, and on a placeholder match deletes the R2 object then
+repairs the row (repairs D1-batched ≤90 BEFORE the R2 deletes, so a crash leaves a
+repaired row + a stale-but-harmless object, never a nulled r2_url with the card-back
+still live). Idempotent + regenerable. Loop it end-to-end with
+`node scripts/purge-placeholder-mirrors.mjs` (uses `INGESTION_WORKER_SECRET`;
+`--limit N`, `--url <uat>`). **Sweeps all sets** — the per-batch log lines report the
+true blast radius. Celebrations (or any set) is NOT blocked from syncing; with the
+guard + repair the pipeline is self-healing.
+
+Tests: `src/lib/placeholderImages.test.ts`, `src/purgePlaceholderMirrors.test.ts`,
+and the placeholder→TCGplayer cases in `src/image-mirror.test.ts`.
 
 ## Local Mirror Script (`scripts/mirror-local.mjs`)
 Fetches images from your local machine's IP (bypasses CDN blocks) and hands bytes to the Worker:

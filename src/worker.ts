@@ -20,6 +20,7 @@ import {
 } from './pricechartingIngest.js';
 import { PRICECHARTING_CATEGORIES, type PriceChartingCategory } from './lib/pricechartingCsv.js';
 import { backfillR2ImageUrls, backfillVariantImages, seedVariantProducts } from './backfillR2Urls.js';
+import { purgePlaceholderMirrors } from './purgePlaceholderMirrors.js';
 import { runNewsPoll } from './newsPoll.js';
 import {
   ADMIN_JOB_IDS,
@@ -493,6 +494,31 @@ export default {
         )
       );
       return json({ ok: true, message: 'R2 backfill started — check worker logs for completion summary' });
+    }
+
+    // POST /admin/purge-placeholder-mirrors — cleanup sweep for Scrydex card-back
+    // placeholders already mirrored into R2 (Step-0 fix). SYNCHRONOUS + cursor-based:
+    // runs ONE bounded batch and returns { scanned, purged, repaired, remaining,
+    // hasMore, cursorNext } so the admin panel loops (passing cursorNext back as
+    // cursor) until hasMore is false — same shape as the bulk-enrich / FETCH-PROCESS
+    // loops. Bounded per invocation so it stays inside the request budget. Data
+    // changes are regenerable (rows self-repair on the next mirror), not destructive.
+    if (pathname === '/admin/purge-placeholder-mirrors' && request.method === 'POST') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      const body = await request.json().catch(() => ({})) as { cursor?: number; limit?: number };
+      try {
+        const result = await purgePlaceholderMirrors(
+          { DB: env.DB, IMAGES_BUCKET: env.IMAGES_BUCKET },
+          { cursor: body.cursor, limit: body.limit },
+        );
+        return json({ ok: true, ...result });
+      } catch (err) {
+        logger.error('purge-placeholder-mirrors failed', { error: String(err) });
+        return json({ ok: false, error: String(err) }, 500);
+      }
     }
 
     // POST /admin/run-job — manual, on-demand trigger for a scheduled ingestion job

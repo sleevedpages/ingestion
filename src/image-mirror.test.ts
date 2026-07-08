@@ -193,28 +193,82 @@ describe('fetchImage — fingerprint check replaces the <300 KB guard', () => {
     vi.stubGlobal('fetch', vi.fn(async () => okImageResponse(realSmall)))
     const placeholderHash = await sha256Hex(bigBytes(1, 181_000).buffer as ArrayBuffer)
     const res = await fetchImage('https://images.scrydex.com/pokemon/sv1-25/large', placeholderHash)
+    expect(res).not.toBe('placeholder')
     expect(res).not.toBeNull()
-    expect(res!.buffer.byteLength).toBe(150_000)
+    expect((res as { buffer: ArrayBuffer }).buffer.byteLength).toBe(150_000)
   })
 
-  it('rejects bytes that hash to the placeholder fingerprint, whatever their size', async () => {
+  it('flags bytes that hash to the per-run fingerprint as a placeholder, whatever their size', async () => {
     const placeholderBytes = bigBytes(1, 181_000)
     vi.stubGlobal('fetch', vi.fn(async () => okImageResponse(placeholderBytes)))
     const placeholderHash = await sha256Hex(placeholderBytes.buffer.slice(0) as ArrayBuffer)
     const res = await fetchImage('https://images.scrydex.com/pokemon/sv1-9999/large', placeholderHash)
-    expect(res).toBeNull()
+    expect(res).toBe('placeholder')
   })
 
   it('passes everything through when no fingerprint was calibrated (probe failed)', async () => {
     const placeholderBytes = bigBytes(1, 181_000)
     vi.stubGlobal('fetch', vi.fn(async () => okImageResponse(placeholderBytes)))
     const res = await fetchImage('https://images.scrydex.com/pokemon/sv1-9999/large', null)
+    expect(res).not.toBe('placeholder')
     expect(res).not.toBeNull()
   })
 
   it('still rejects sub-floor bodies (error pages, empty responses)', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => okImageResponse(bigBytes(0, MIN_IMAGE_BYTES - 1))))
     expect(await fetchImage('https://images.scrydex.com/pokemon/sv1-25/large', null)).toBeNull()
+  })
+})
+
+// ─── card-back placeholder → TCGplayer fallback/repair (Step-0 fix) ───────────
+
+describe('runMirrorJob — Scrydex card-back placeholder handling', () => {
+  // The constructed Scrydex URL + the per-run probe both return the SAME placeholder
+  // bytes → the card is a card-back (the Celebrations: Classic Collection case).
+  const PLACEHOLDER = bigBytes(1, 200_000)
+  const TCG_URL = 'https://tcgplayer-cdn.tcgplayer.com/product/42_in_1000x1000.jpg'
+
+  it('repairs source_url to the TCGplayer CDN when the worker cannot mirror it (403/404)', async () => {
+    const db = makeMirrorDB([[pokemonCard()], []])
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('tcgplayer-cdn')) return notFoundResponse() // worker-IP 403 → treated as miss
+      return okImageResponse(PLACEHOLDER) // probe + constructed scrydex both = card-back
+    }))
+    const bucket = makeBucket()
+    const result = await runMirrorJob({ DB: db, IMAGES_BUCKET: bucket }, Infinity)
+
+    expect(result.placeholder_skips).toBe(1)
+    expect(result.tcgplayer_fallbacks).toBe(1)
+    expect(result.mirrored).toBe(0)
+    expect(result.skipped).toBe(1)
+    expect(bucket.puts).toEqual([]) // never mirrored a card-back
+
+    // source_url repaired to the reconstructed TCGplayer url; r2_url + mirrored_at nulled
+    const repair = db.runCalls.find((c: any) => c.sql.includes('mirrored_at = NULL') && c.sql.includes('source_url  = excluded.source_url'))
+    expect(repair).toBeTruthy()
+    expect(repair.args).toEqual([TCG_URL, 42])
+    // never an R2 write for this card
+    expect(db.runCalls.some((c: any) => c.sql.includes('r2_url      = excluded.r2_url'))).toBe(false)
+  })
+
+  it('mirrors the real TCGplayer art when the fetch succeeds (non-datacenter context)', async () => {
+    const db = makeMirrorDB([[pokemonCard()], []])
+    const realArt = bigBytes(9, 400_000)
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('tcgplayer-cdn')) return okImageResponse(realArt)
+      return okImageResponse(PLACEHOLDER)
+    }))
+    const bucket = makeBucket()
+    const result = await runMirrorJob({ DB: db, IMAGES_BUCKET: bucket }, Infinity)
+
+    expect(result.placeholder_skips).toBe(1)
+    expect(result.tcgplayer_fallbacks).toBe(1)
+    expect(result.mirrored).toBe(1)
+    expect(result.tcgplayer_hits).toBe(1)
+    expect(bucket.puts).toEqual([{ key: 'cards/42.png' }])
+    // R2 write (source tcgplayer) + a forced source_url write
+    expect(db.runCalls.some((c: any) => c.sql.includes('r2_url      = excluded.r2_url'))).toBe(true)
+    expect(db.runCalls.some((c: any) => c.sql.includes('source_url = excluded.source_url') && c.args[0] === TCG_URL)).toBe(true)
   })
 })
 

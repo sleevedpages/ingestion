@@ -165,6 +165,54 @@ export function mirrorAttemptUpsert(
   return db.prepare(MIRROR_ATTEMPT_SQL).bind(attemptedAt, tcgProductId)
 }
 
+// ── Placeholder repair (card-back guard: mirror-side + purge sweep) ───────────
+// A Scrydex card-back placeholder was detected — either by the mirror before an R2
+// write, or by the purge-placeholder-mirrors sweep over an existing R2 object. Point
+// the row at the reconstructed TCGplayer CDN image and clear the mirror state so the
+// app serves real art via the `r2_url ?? source_url` chain (end-user browsers load
+// tcgplayer-cdn fine; only worker datacenter IPs 403). This FORCES source_url —
+// unlike the precedence-guarded writers — because the stored value is a Scrydex-CDN
+// placeholder URL that SOURCE_URL_PRECEDENCE_CASE would otherwise preserve. `source`
+// is set NULL to match a plain TCGCSV-only source_url row (what the TCGCSV writer
+// would leave). mirrored_at is NEVER stamped on a repair (standing rule).
+const PLACEHOLDER_REPAIR_SQL = `
+  INSERT INTO product_images (product_id, source, source_url, r2_url, mirrored_at)
+  SELECT id, NULL, ?, NULL, NULL FROM products WHERE tcgplayer_product_id = ?
+  ON CONFLICT (product_id) DO UPDATE SET
+    source_url  = excluded.source_url,
+    source      = NULL,
+    r2_url      = NULL,
+    mirrored_at = NULL`
+
+/** Build a forced placeholder-repair upsert: source_url → the reconstructed
+ *  TCGplayer URL, r2_url/mirrored_at/source cleared. Used by the mirror's
+ *  placeholder fallback AND the purge-placeholder-mirrors sweep. */
+export function placeholderRepairUpsert(
+  db:           D1Database,
+  tcgProductId: number,
+  tcgplayerUrl: string,
+): D1PreparedStatement {
+  return db.prepare(PLACEHOLDER_REPAIR_SQL).bind(tcgplayerUrl, tcgProductId)
+}
+
+// Force source_url WITHOUT touching r2_url/source/mirrored_at — used after a
+// SUCCESSFUL TCGplayer fallback mirror so the pre-mirror source_url no longer points
+// at the Scrydex placeholder (r2_url already wins in serving; this keeps source_url
+// honest too). Precedence-bypassing on purpose.
+const FORCE_SOURCE_URL_SQL = `
+  INSERT INTO product_images (product_id, source_url)
+  SELECT id, ? FROM products WHERE tcgplayer_product_id = ?
+  ON CONFLICT (product_id) DO UPDATE SET source_url = excluded.source_url`
+
+/** Build a forced source_url upsert (bypasses the precedence rule). */
+export function forceSourceUrlUpsert(
+  db:           D1Database,
+  tcgProductId: number,
+  url:          string,
+): D1PreparedStatement {
+  return db.prepare(FORCE_SOURCE_URL_SQL).bind(url, tcgProductId)
+}
+
 /** Build a pre-mirror source_url upsert keyed by TCGPlayer group id + card number. */
 export function sourceUrlUpsertByGroupNumber(
   db:        D1Database,
