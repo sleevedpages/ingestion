@@ -155,7 +155,7 @@ and the manual trigger call the SAME job functions (no duplicated logic):
 |--------|---------------------|------|-----------------|
 | `tcg-sync` | `runIngestion(buildConfig(env))` | `0 6 * * *` | ✅ idempotent upserts; long-running |
 | `image-mirror` | `runWeeklyImagePipeline(env)` (**`runMirrorJob(Infinity)` FIRST** → set-mappings → image sync → `cleanupScrydexApiLog`; WP-2 order) | `0 3 * * SUN` | ✅ merge-upserts + attempt-backoff (re-runs skip recently-attempted rows); long-running |
-| `scrydex-drain` | `processPendingWebhooks(env)` | `0 4 * * *` | ✅ freshness-guarded + deduped; consumes Scrydex credits |
+| `scrydex-drain` | `processPendingWebhooks(env)` | `0 4 * * *` | ✅ freshness-guarded + deduped + atomic row claims (WP-8 — overlapping runs can never double-drain a row); consumes Scrydex credits |
 | `pricecharting-csv` | `runPriceChartingProcess(env, priceChartingCategoryForDay())` — PROCESS the cached R2 CSV (no download) | — (on demand) | ✅ idempotent upserts, R2-only; **unlimited + safe** (never touches the rate limit) |
 | `pricecharting-download` | `runPriceChartingFetch(env, priceChartingCategoryForDay())` — DOWNLOAD fresh CSV → R2 → PROCESS | `0 5 * * *` | ⚠️ downloads from PriceCharting — **rate-limited ~1/10min** (cooldown-gated) |
 | `news-poll` | `runNewsPoll(env)` — poll active DotGG RSS feeds → upsert `news_items` (headline+link+date, link-out; prune >90d) | `0 7 * * *` (PROD only) | ✅ public RSS, deduped on link — unlimited + safe; no API key. **Use this to populate UAT** (no news cron in UAT). |
@@ -321,6 +321,33 @@ Scrydex expansion id (e.g. `OP09`, `GD04`), which is what `q=expansion.id:` matc
     overflow rows stay pending for the next run / a manual `POST /scrydex/process`.
   - Primary match: `variant.marketplaces[tcgplayer].product_id` → canonical `products.tcgplayer_product_id`;
     fallback `card.number` + `scrydex_expansion_id` join. Batches at 100 statements per `DB.batch()`.
+- **WP-8 retry semantics + atomic claims (2026-07-07; Content migration 0089 adds
+  `attempts`/`last_attempt_at` + `scrydex_unmatched_cards`).** Row lifecycle:
+  `pending → processing (claimed) → complete | error (retryable) | failed (TERMINAL)`.
+  - **Atomic claims (double-drain guard):** every candidate row is claimed with a conditional
+    UPDATE (`status='processing'`, `last_attempt_at=unixepoch()`; the WHERE re-checks the observed
+    state; `meta.changes===1` = the claim won) — overlapping runs (cron + manual
+    `POST /scrydex/process` + the admin trigger) can never process the same row twice.
+  - **Stale-claim reclaim:** a `processing` row older than `PROCESSING_STALE_SECONDS` (6h — a run
+    died mid-claim) is a candidate again; the reclaim UPDATE re-checks staleness so two runs can't
+    both take it. Rows claimed but unreached (maxFetches / circuit break) are RELEASED back to
+    `pending` at run end.
+  - **Error retry with capped backoff:** `error` rows retry when past
+    `ERROR_RETRY_BASE_SECONDS << attempts` (2h, 4h, 8h, 16h, 32h) while
+    `attempts < MAX_DRAIN_ATTEMPTS` (5). A row-specific failure increments `attempts`; at the cap
+    the row goes **TERMINAL `'failed'`** (never selected again — poison can't loop). Unparseable
+    `expansion_ids_json` goes straight to `'failed'`.
+  - **Guard/403 failures burn NO attempt:** they mark `error` (visible, the June-outage invariant)
+    with `attempts` unchanged — a capped month must not march innocent rows to `failed`. **The
+    credit guard is the hard backstop for retries too**: it throws BEFORE any API call, so a
+    retried row can never spend past the cap, and a 403 still circuit-breaks the run.
+  - **Idempotent re-drain:** price writes are ON CONFLICT upserts on the superset identity key,
+    and the freshness window makes a re-drain of an already-fetched expansion cost ZERO credits —
+    re-processing a row is safe by construction.
+  - **Unknown cards recorded, never dropped (ING-3):** a webhook card variant that resolves to NO
+    canonical product upserts into `scrydex_unmatched_cards` (deduped per expansion+number+variant;
+    `seen_count` ≈ days observed; `first/last_seen_at`). Queryable review surface; Admin surfacing
+    is WP-4 scope.
 - **⚠️ FRESHNESS↔DRAIN COUPLING (invariant):** `SCRYDEX_PRICE_FRESHNESS_HOURS` (default 20h) MUST stay
   **< the 24h drain interval** (`DRAIN_INTERVAL_HOURS`). If it ever reaches ≥24h, every daily run no-ops
   against its own prior run and **prices silently freeze**. `freshnessSafeForDrain()` logs a loud error if
@@ -583,14 +610,19 @@ cron and looping to finish tripped the limit. Now:
 The daily drain emits a structured audit line each run for credit observability (parse from
 `wrangler tail` / Logpush):
 ```json
-{"log":"scrydex_drain_audit","rows_in":N,"distinct_expansions":M,"expansions_fetched":F,
- "fetches_made":C,"fetches_skipped_fresh":S,"rows_completed":...,"rows_left_pending":...,
+{"log":"scrydex_drain_audit","rows_in":N,"rows_reclaimed_processing":R,"rows_retried_error":E,
+ "rows_failed_terminal":T,"distinct_expansions":M,"expansions_fetched":F,
+ "fetches_made":C,"fetches_skipped_fresh":S,"unmatched_cards":U,
+ "rows_completed":...,"rows_left_pending":...,
  "circuit_broken":false,"max_fetches":1500,"freshness_hours":20,"credits_by_game":{"pokemon":C}}
 ```
 `rows_in` vs `distinct_expansions` quantifies the **dedup collapse** (M webhook rows → 1 fetch
 per distinct `(gameSlug, priceType, expansion)`); `fetches_made` (page-calls = credits) vs
 `fetches_skipped_fresh` shows the freshness savings; `credits_by_game` confirms the measured
-Pokémon concentration. The `SCRYDEX_DRAIN_MAX_FETCHES` bound and the `freshnessSafeForDrain()`
+Pokémon concentration. The WP-8 counters (2026-07-07): `rows_reclaimed_processing` = stale
+`processing` claims taken over, `rows_retried_error` = backoff-due error retries claimed,
+`rows_failed_terminal` = rows that reached the terminal `'failed'` state this run,
+`unmatched_cards` = webhook card variants recorded to `scrydex_unmatched_cards`. The `SCRYDEX_DRAIN_MAX_FETCHES` bound and the `freshnessSafeForDrain()`
 <24h invariant were **audited and confirmed correct** (no code change needed beyond the log).
 **Measured velocity** (pre-existing analysis): card-fetch calls were dominated by **Pokémon
 (~3,426, ~80%)** before the daily batch; with daily dedup a run's `fetches_made` is bounded by
@@ -663,7 +695,8 @@ asserts this). We link OUT for the content (mirrors the Rule Books posture).
 | `scrydex_expansion_freshness` | Session D (mig 0063): `(scrydex_expansion_id, price_type)` → `last_updated`. Per-expansion freshness/dedup for the price processor. |
 | `tcg_sync_log` | One row per sync run with counts + status |
 | `image_mirror_log` | One row per mirror job with processed/mirrored/failed/**skipped**/source counts + **first_error** (Content mig 0086) — written via try/finally, so a row lands even when the run dies mid-batch |
-| `scrydex_webhook_log` | Pending→processing→complete/error webhook queue (**drained ONCE DAILY** `0 4 * * *`, deduped by expansion — cost control 2026-06) |
+| `scrydex_webhook_log` | Webhook queue, lifecycle `pending → processing (atomic claim) → complete \| error (retryable) \| failed (TERMINAL)` (**drained ONCE DAILY** `0 4 * * *`, deduped by expansion — cost control 2026-06). WP-8 (Content mig 0089): `attempts` + `last_attempt_at` back the stale-claim reclaim (6h) + capped exponential error backoff (2h·2^attempts, cap 5 → `failed`). Re-arm a terminal row: `UPDATE scrydex_webhook_log SET status='pending', attempts=0 WHERE id=?`. |
+| `scrydex_unmatched_cards` | WP-8 (Content mig 0089): webhook cards with no catalogue match, recorded instead of silently dropped (ING-3). Deduped per `(scrydex_expansion_id, card_number, variant_name)` (COALESCE'd unique index — the conflict target must match it); `seen_count` ≈ days observed, `first/last_seen_at`, carries name/game_slug/tcgplayer_product_id for review. |
 | `scrydex_api_log` | One row per outbound Scrydex API call — credit guard + admin dashboard. 90-day retention. |
 | `variant_ingest_conflicts` | Session D-bis (mig 0065): Scrydex variant collisions (intra-payload dup product_id / cross-product) routed for admin review instead of corrupting `products`. Deduped on `(scrydex_card_id, tcgplayer_product_id, variant_name)`. |
 | `pricecharting_products` | 2026-06-16 (Content mig 0070): PriceCharting CSV bulk-ingest map. `pc_id` (PK) ↔ `canonical_product_id` (NULL = unmatched/catalogue-gap), `game_category`, `match_method` ('tcg-id'\|'fuzzy'), `tcg_id`, `console_name`/`product_name`, `is_sealed`, `sales_volume`, `matched_at`, `last_seen_at`. Persisted so re-ingests are incremental + unmatched is reviewable. See **PriceCharting CSV Bulk-Ingest**. |

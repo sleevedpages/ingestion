@@ -8,6 +8,13 @@ import {
   freshnessSafeForDrain,
   DRAIN_INTERVAL_HOURS,
   DEFAULT_FRESHNESS_HOURS,
+  MAX_DRAIN_ATTEMPTS,
+  PROCESSING_STALE_SECONDS,
+  ERROR_RETRY_BASE_SECONDS,
+  errorRetryBackoffSeconds,
+  isErrorRetryDue,
+  isProcessingStale,
+  type UnmatchedCardEntry,
 } from './scrydexProcessor.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -19,6 +26,9 @@ import {
 interface FakeOpts {
   first?: (sql: string, args: unknown[]) => unknown
   all?:   (sql: string, args: unknown[]) => unknown[]
+  // Per-statement meta.changes for batched UPDATEs (the WP-8 claim protocol reads it);
+  // default 1 = every claim wins. Return 0 to simulate losing a claim race.
+  batchChanges?: (sql: string, args: unknown[]) => number
 }
 interface FakeStmt { sql: string; args: unknown[]; bind: (...a: unknown[]) => FakeStmt; first: () => Promise<unknown>; all: () => Promise<{ results: unknown[] }>; run: () => Promise<{ meta: { last_row_id: number } }> }
 
@@ -37,11 +47,19 @@ function makeFakeDB(opts: FakeOpts = {}) {
       }
       return stmt
     },
-    async batch(stmts: FakeStmt[]) { batches.push(stmts); return stmts.map(() => ({})) },
+    async batch(stmts: FakeStmt[]) {
+      batches.push(stmts)
+      return stmts.map(s => ({ meta: { changes: opts.batchChanges ? opts.batchChanges(s.sql, s.args) : 1 } }))
+    },
     _runs: runs,
     _batches: batches,
   }
   return db
+}
+
+// Every batched statement across the run, flattened (claims + price upserts + unmatched + releases).
+function batchedStmts(db: ReturnType<typeof makeFakeDB>): FakeStmt[] {
+  return db._batches.flat()
 }
 
 afterEach(() => {
@@ -174,7 +192,7 @@ function webhookFirstRouter(sql: string) {
   if (sql.includes('FROM products WHERE tcgplayer_product_id')) return { id: 42 }
   return null
 }
-const pendingRow = { id: 1, event_name: 'pokemon.prices.raw', expansion_ids_json: '["exp1"]' }
+const pendingRow = { id: 1, event_name: 'pokemon.prices.raw', expansion_ids_json: '["exp1"]', status: 'pending', attempts: 0 }
 const pendingAll = (sql: string) => sql.includes("status = 'pending'") ? [pendingRow] : []
 
 describe('processPendingWebhooks — 403 masking fix', () => {
@@ -218,8 +236,9 @@ describe('processPendingWebhooks — 403 masking fix', () => {
     expect(webhookUpdates.some(r => /status\s*=\s*'complete'/.test(r.sql))).toBe(true)
     expect(webhookUpdates.some(r => /status\s*=\s*'error'/.test(r.sql))).toBe(false)
 
-    // Canonical price upsert was batched, and freshness recorded.
-    expect(db._batches.flat().length).toBe(1)
+    // Canonical price upsert was batched, and freshness recorded. (Batches now also
+    // carry the WP-8 claim statements — filter to the price writes.)
+    expect(batchedStmts(db).filter(s => s.sql.includes('INSERT INTO prices'))).toHaveLength(1)
     expect(db._runs.some(r => r.sql.includes('INSERT INTO scrydex_expansion_freshness'))).toBe(true)
   })
 
@@ -298,6 +317,289 @@ describe('ScrydexFetchError', () => {
     const e = new ScrydexFetchError(403, 'boom')
     expect(e.status).toBe(403)
     expect(e.name).toBe('ScrydexFetchError')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WP-8 — retry semantics: pure spec helpers (mirrored by the candidate SQL).
+// ─────────────────────────────────────────────────────────────────────────────
+const okCard = {
+  number: '25',
+  variants: [{
+    name: 'normal',
+    marketplaces: [{ name: 'tcgplayer', product_id: '999' }],
+    prices: [{ type: 'raw', condition: 'NM', market: 1.5, trends: {} }],
+  }],
+}
+const okFetch = () => vi.fn(async () =>
+  new Response(JSON.stringify({ data: [okCard] }), { status: 200, headers: { 'content-type': 'application/json' } }))
+
+describe('WP-8 retry spec helpers', () => {
+  it('error-retry backoff doubles per attempt from the 2h base', () => {
+    expect(ERROR_RETRY_BASE_SECONDS).toBe(2 * 3600)
+    expect(errorRetryBackoffSeconds(0)).toBe(2 * 3600)
+    expect(errorRetryBackoffSeconds(1)).toBe(4 * 3600)
+    expect(errorRetryBackoffSeconds(2)).toBe(8 * 3600)
+    expect(errorRetryBackoffSeconds(4)).toBe(32 * 3600)
+  })
+
+  it('isErrorRetryDue honours the backoff window and the attempt cap', () => {
+    const now = 1_000_000
+    // attempts=1 → due after 4h.
+    expect(isErrorRetryDue(1, now - 4 * 3600, now)).toBe(true)
+    expect(isErrorRetryDue(1, now - 4 * 3600 + 1, now)).toBe(false)
+    // at/over MAX attempts → never due, regardless of age (terminal cap).
+    expect(isErrorRetryDue(MAX_DRAIN_ATTEMPTS, 0, now)).toBe(false)
+    expect(isErrorRetryDue(MAX_DRAIN_ATTEMPTS + 3, 0, now)).toBe(false)
+  })
+
+  it('isProcessingStale flips at the 6h staleness threshold', () => {
+    const now = 1_000_000
+    expect(PROCESSING_STALE_SECONDS).toBe(6 * 3600)
+    expect(isProcessingStale(now - PROCESSING_STALE_SECONDS, now)).toBe(true)
+    expect(isProcessingStale(now - PROCESSING_STALE_SECONDS + 1, now)).toBe(false)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WP-8 — candidate selection + atomic claims.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('processPendingWebhooks — WP-8 candidate selection + claims', () => {
+  it('the candidate scan covers stale-processing reclaim and backoff-gated error retries', async () => {
+    let selectionSql = ''
+    const db = makeFakeDB({
+      first: webhookFirstRouter,
+      all: (sql) => {
+        if (sql.includes("status = 'pending'")) { selectionSql = sql; return [] }
+        return []
+      },
+    })
+    await processPendingWebhooks({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any)
+
+    // Reclaim clause: stale 'processing' claims re-enter the pool.
+    expect(selectionSql).toContain("status = 'processing'")
+    expect(selectionSql).toContain(`unixepoch() - ${PROCESSING_STALE_SECONDS}`)
+    // Error-retry clause: capped attempts + exponential (bit-shift) backoff.
+    expect(selectionSql).toContain(`attempts < ${MAX_DRAIN_ATTEMPTS}`)
+    expect(selectionSql).toContain(`${ERROR_RETRY_BASE_SECONDS} << attempts`)
+  })
+
+  it('RECLAIM: a stuck processing row is claimed with a staleness-guarded UPDATE and drains to complete', async () => {
+    vi.stubGlobal('fetch', okFetch())
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const stuckRow = { id: 9, event_name: 'pokemon.prices.raw', expansion_ids_json: '["exp1"]', status: 'processing', attempts: 0 }
+    const db = makeFakeDB({
+      first: webhookFirstRouter,
+      all: (sql) => sql.includes("status = 'pending'") ? [stuckRow] : [],
+    })
+    await processPendingWebhooks({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any)
+
+    // The claim used the reclaim shape: no status flip (it is already 'processing'),
+    // and the WHERE re-checks staleness so a concurrent run cannot also take it.
+    const claim = batchedStmts(db).find(s => s.sql.includes('last_attempt_at = unixepoch()') && s.args.includes(9))
+    expect(claim).toBeDefined()
+    expect(claim!.sql).toContain(`unixepoch() - ${PROCESSING_STALE_SECONDS}`)
+
+    // The stranded row drained to complete.
+    const completes = db._runs.filter(r => /status\s*=\s*'complete'/.test(r.sql) && r.args.includes(9))
+    expect(completes).toHaveLength(1)
+    const audit = findAuditLine(logSpy)
+    expect(audit.rows_reclaimed_processing).toBe(1)
+  })
+
+  it('DOUBLE-DRAIN GUARD: a row whose claim is lost (changes=0) is not processed at all', async () => {
+    const fetchMock = okFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    const db = makeFakeDB({
+      first: webhookFirstRouter,
+      all: pendingAll,
+      // Another overlapping run already owns every row.
+      batchChanges: (sql) => sql.includes('scrydex_webhook_log') ? 0 : 1,
+    })
+    await processPendingWebhooks({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any)
+
+    expect(fetchMock).not.toHaveBeenCalled()                                        // no credit spend
+    expect(db._runs.filter(r => r.sql.includes('scrydex_webhook_log'))).toHaveLength(0) // no status writes
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WP-8 — error retry, terminal state, guard-stops-retry, idempotent re-drain.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('processPendingWebhooks — WP-8 retry outcomes', () => {
+  const errorRow = (attempts: number) =>
+    ({ id: 5, event_name: 'pokemon.prices.raw', expansion_ids_json: '["exp1"]', status: 'error', attempts })
+
+  it('BACKOFF RETRY: an error row is claimed (status → processing) and completes on success', async () => {
+    vi.stubGlobal('fetch', okFetch())
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const db = makeFakeDB({
+      first: webhookFirstRouter,
+      all: (sql) => sql.includes("status = 'pending'") ? [errorRow(2)] : [],
+    })
+    await processPendingWebhooks({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any)
+
+    const claim = batchedStmts(db).find(s => s.sql.includes("status = 'error'") && s.args.includes(5))
+    expect(claim).toBeDefined()
+    expect(claim!.sql).toContain("SET status = 'processing'")
+    expect(db._runs.filter(r => /status\s*=\s*'complete'/.test(r.sql) && r.args.includes(5))).toHaveLength(1)
+    expect(findAuditLine(logSpy).rows_retried_error).toBe(1)
+  })
+
+  it('TERMINAL STATE: a row-specific failure at the attempt cap goes to failed, never error', async () => {
+    // Transient 500 on the expansion fetch — a row-specific failure that burns an attempt.
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('boom', { status: 500 })))
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const db = makeFakeDB({
+      first: webhookFirstRouter,
+      all: (sql) => sql.includes("status = 'pending'") ? [errorRow(MAX_DRAIN_ATTEMPTS - 1)] : [],
+    })
+    await processPendingWebhooks({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any)
+    errSpy.mockRestore()
+
+    // The failure write burns an attempt and carries the terminal CASE.
+    const failure = db._runs.find(r => r.sql.includes('attempts = attempts + 1') && r.args.includes(5))
+    expect(failure).toBeDefined()
+    expect(failure!.sql).toContain(`CASE WHEN attempts + 1 >= ${MAX_DRAIN_ATTEMPTS} THEN 'failed' ELSE 'error' END`)
+    expect(findAuditLine(logSpy).rows_failed_terminal).toBe(1)
+  })
+
+  it('TERMINAL STATE: unparseable expansion_ids_json goes straight to failed (deterministic poison)', async () => {
+    const badRow = { id: 3, event_name: 'pokemon.prices.raw', expansion_ids_json: 'not json', status: 'pending', attempts: 0 }
+    const db = makeFakeDB({
+      first: webhookFirstRouter,
+      all: (sql) => sql.includes("status = 'pending'") ? [badRow] : [],
+    })
+    await processPendingWebhooks({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any)
+
+    const failed = db._runs.find(r => /status\s*=\s*'failed'/.test(r.sql) && r.args.includes(3))
+    expect(failed).toBeDefined()
+    expect(db._runs.some(r => /status\s*=\s*'error'/.test(r.sql))).toBe(false)
+  })
+
+  it('GUARD STOPS RETRY: a credit-guard trip on a retried row spends nothing further and burns no attempt', async () => {
+    // The guard reads monthly usage BEFORE any API call — an exhausted budget throws
+    // ScrydexCreditLimitError without fetching. The retried row must stay retryable
+    // ('error', attempts unchanged) so it drains once credits return.
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const db = makeFakeDB({
+      first: (sql) => sql.includes('SUM(credits_used)') ? { total: 999_999 } : webhookFirstRouter(sql),
+      all: (sql) => sql.includes("status = 'pending'") ? [errorRow(2)] : [],
+    })
+    await processPendingWebhooks({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any)
+    warnSpy.mockRestore()
+
+    expect(fetchMock).not.toHaveBeenCalled()   // the guard blocked the call itself
+    const errorWrite = db._runs.find(r => /status\s*=\s*'error'/.test(r.sql) && r.args.includes(5))
+    expect(errorWrite).toBeDefined()
+    expect(errorWrite!.sql).not.toContain('attempts = attempts + 1')  // no attempt burned
+    expect(db._runs.some(r => /status\s*=\s*'failed'/.test(r.sql))).toBe(false)
+  })
+
+  it('IDEMPOTENT RE-DRAIN: a retried row whose expansion is already fresh completes with ZERO fetches', async () => {
+    // The SCRYDEX_PRICE_FRESHNESS_HOURS dedup is what makes re-processing safe: the
+    // expansion was fetched by the earlier (failed-after-fetch or overlapping) run, so
+    // the retry costs no credits and re-writes nothing.
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const db = makeFakeDB({
+      first: (sql) => sql.includes('scrydex_expansion_freshness') ? { 1: 1 } : webhookFirstRouter(sql),
+      all: (sql) => sql.includes("status = 'pending'") ? [errorRow(1)] : [],
+    })
+    await processPendingWebhooks({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any)
+
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(batchedStmts(db).filter(s => s.sql.includes('INSERT INTO prices'))).toHaveLength(0)
+    expect(db._runs.filter(r => /status\s*=\s*'complete'/.test(r.sql) && r.args.includes(5))).toHaveLength(1)
+  })
+
+  it('RELEASE: rows claimed but unreached (maxFetches cut) go back to pending, not stranded processing', async () => {
+    vi.stubGlobal('fetch', okFetch())
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    // Two rows for two DISTINCT expansions; maxFetches=1 stops after the first.
+    const rows = [
+      { id: 1, event_name: 'pokemon.prices.raw', expansion_ids_json: '["exp1"]', status: 'pending', attempts: 0 },
+      { id: 2, event_name: 'pokemon.prices.raw', expansion_ids_json: '["exp2"]', status: 'pending', attempts: 0 },
+    ]
+    const db = makeFakeDB({
+      first: webhookFirstRouter,
+      all: (sql) => sql.includes("status = 'pending'") ? rows : [],
+    })
+    await processPendingWebhooks({
+      DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't', SCRYDEX_DRAIN_MAX_FETCHES: '1',
+    } as any)
+    warnSpy.mockRestore()
+
+    // Row 1 completed; row 2 was claimed then released back to pending (guarded on the claim).
+    expect(db._runs.filter(r => /status\s*=\s*'complete'/.test(r.sql) && r.args.includes(1))).toHaveLength(1)
+    const release = batchedStmts(db).find(s => s.sql.includes("SET status = 'pending'") && s.args.includes(2))
+    expect(release).toBeDefined()
+    expect(release!.sql).toContain("AND status = 'processing'")
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WP-8 — unknown-card logging (audit ING-3): no more silent drops.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('processPendingWebhooks — unknown-card logging', () => {
+  it('records an unmatched webhook card to scrydex_unmatched_cards and counts it in the audit line', async () => {
+    const unknownCard = {
+      id: 'XX01-999', name: 'Mystery Promo', number: '999',
+      variants: [{
+        name: 'normal',
+        marketplaces: [{ name: 'tcgplayer', product_id: '424242' }],
+        prices: [{ type: 'raw', condition: 'NM', market: 3, trends: {} }],
+      }],
+    }
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response(JSON.stringify({ data: [unknownCard] }), { status: 200, headers: { 'content-type': 'application/json' } })))
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    // No product resolves (neither R1 nor R2) → the card is unknown to the catalogue.
+    const db = makeFakeDB({
+      first: (sql) => sql.includes('FROM products') ? null : webhookFirstRouter(sql),
+      all: pendingAll,
+    })
+    await processPendingWebhooks({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any)
+
+    const unmatchedWrites = batchedStmts(db).filter(s => s.sql.includes('scrydex_unmatched_cards'))
+    expect(unmatchedWrites).toHaveLength(1)
+    // (scrydex_card_id, name, number, game_slug, expansion_id, tcgplayer_product_id, variant)
+    expect(unmatchedWrites[0].args).toEqual(['XX01-999', 'Mystery Promo', '999', 'pokemon', 'exp1', '424242', 'normal'])
+    // Deduped upsert — a daily re-encounter bumps the counter instead of duplicating.
+    expect(unmatchedWrites[0].sql).toContain('ON CONFLICT')
+    expect(unmatchedWrites[0].sql).toContain('seen_count           = seen_count + 1')
+
+    // The row still completes (0 prices) and the audit line counts the unmatched card.
+    expect(db._runs.filter(r => /status\s*=\s*'complete'/.test(r.sql) && r.args.includes(1))).toHaveLength(1)
+    expect(findAuditLine(logSpy).unmatched_cards).toBe(1)
+  })
+
+  it('buildPriceUpserts pushes unresolved variants onto the collector without changing its return', async () => {
+    const db = makeFakeDB({ first: () => null })
+    const collector: UnmatchedCardEntry[] = []
+    const card = {
+      id: 'OP99-001', name: 'Ghost Leader', number: 'OP99-001',
+      variants: [
+        { name: 'normal', marketplaces: [{ name: 'tcgplayer', product_id: '111' }], prices: [{ type: 'raw', condition: 'NM', market: 1 }] },
+        { name: 'altArt', marketplaces: [], prices: [{ type: 'raw', condition: 'NM', market: 2 }] },
+      ],
+    }
+    const upserts = await buildPriceUpserts(db as any, card, 'OP99', 'raw', collector)
+    expect(upserts).toHaveLength(0)
+    expect(collector).toEqual([
+      { scrydexCardId: 'OP99-001', cardName: 'Ghost Leader', cardNumber: 'OP99-001', variantName: 'normal', tcgplayerProductId: '111' },
+      { scrydexCardId: 'OP99-001', cardName: 'Ghost Leader', cardNumber: 'OP99-001', variantName: 'altArt', tcgplayerProductId: null },
+    ])
+  })
+
+  it('omitting the collector keeps the legacy silent-skip shape for sync-set/refresh callers', async () => {
+    const db = makeFakeDB({ first: () => null })
+    const card = { number: '25', variants: [{ name: 'normal', marketplaces: [], prices: [{ type: 'raw', condition: 'NM', market: 1 }] }] }
+    await expect(buildPriceUpserts(db as any, card, 'exp1', 'raw')).resolves.toEqual([])
   })
 })
 

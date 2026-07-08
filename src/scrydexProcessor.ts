@@ -39,6 +39,33 @@
  *      silent 'complete'; a 403 additionally breaks the run so the batch stops burning
  *      calls on guaranteed-403 expansions.
  *
+ *   4. RETRY SEMANTICS + ATOMIC ROW CLAIMS (WP-8, 2026-07-07)
+ *      Row lifecycle: pending → processing (claimed) → complete | error | failed.
+ *      - CLAIM: every candidate row is claimed with an atomic conditional UPDATE
+ *        (status flips to 'processing', last_attempt_at stamped; the WHERE re-checks the
+ *        observed state so exactly ONE run wins — meta.changes===1). Overlapping runs
+ *        (cron + manual /scrydex/process + admin trigger) can never double-drain a row.
+ *      - RECLAIM: a row stuck in 'processing' past PROCESSING_STALE_SECONDS (a run died
+ *        mid-claim — waitUntil cutoff, crash) becomes a candidate again; the reclaim
+ *        UPDATE re-checks staleness so two overlapping runs can't both take it.
+ *      - ERROR RETRY: 'error' rows are retried with exponential backoff
+ *        (ERROR_RETRY_BASE_SECONDS << attempts) while attempts < MAX_DRAIN_ATTEMPTS.
+ *        A row-specific failure increments attempts; at the cap the row goes TERMINAL
+ *        ('failed', never selected again) so a poison row can never loop forever.
+ *        Malformed expansion_ids_json is deterministic poison → straight to 'failed'.
+ *      - GUARD/403 failures do NOT burn an attempt (environmental, not poison): the row
+ *        is marked 'error' (visible, the June-outage invariant) with attempts unchanged,
+ *        and the run circuit-breaks — the credit guard remains the hard backstop that
+ *        stops ALL retry spend (it throws BEFORE any API call is made).
+ *      - RELEASE: rows claimed but not reached (maxFetches / circuit break) are released
+ *        back to 'pending' at run end; a killed run's claims heal via the stale reclaim.
+ *      - IDEMPOTENCY: re-processing a row is safe by construction — price writes are
+ *        ON CONFLICT upserts on the superset identity key, and the freshness window
+ *        makes a re-drain of an already-fetched expansion cost ZERO credits (<20h).
+ *      - UNKNOWN CARDS (ING-3): webhook cards with no catalogue match are no longer
+ *        dropped silently — recorded to scrydex_unmatched_cards (deduped per
+ *        expansion+number+variant, first/last-seen + counter; migration 0089).
+ *
  * Price matching strategy (in priority order):
  *   1. variant.marketplaces[tcgplayer].product_id → products.tcgplayer_product_id (canonical)
  *   2. Fallback: card.number + expansion scrydex_expansion_id join
@@ -87,6 +114,37 @@ export const DEFAULT_FRESHNESS_HOURS = 20
 /** True when the freshness window is short enough that the daily drain won't no-op. */
 export function freshnessSafeForDrain(freshnessHours: number, drainHours = DRAIN_INTERVAL_HOURS): boolean {
   return freshnessHours < drainHours
+}
+
+// ── WP-8 retry semantics (migration 0089: attempts + last_attempt_at) ─────────
+// A row-specific failure increments `attempts`; at MAX_DRAIN_ATTEMPTS the row goes
+// TERMINAL ('failed') and is never selected again — a poison row cannot loop forever.
+export const MAX_DRAIN_ATTEMPTS = 5
+// A 'processing' claim older than this is a dead run's leftover and is reclaimable.
+// Well past any live invocation's lifetime (waitUntil is minutes), well under the
+// daily drain interval so a crashed claim heals by the next scheduled run.
+export const PROCESSING_STALE_SECONDS = 6 * 3600
+// Error-retry backoff doubles per recorded attempt: 2h, 4h, 8h, 16h, 32h. On the
+// daily cadence that means "next run" for early attempts and a skipped day near the
+// cap. The SQL mirror uses SQLite's `<<` (the WP-2 bit-shift idiom).
+export const ERROR_RETRY_BASE_SECONDS = 2 * 3600
+
+/** JS spec for the candidate SQL's backoff term (kept in lockstep by unit tests). */
+export function errorRetryBackoffSeconds(attempts: number): number {
+  return ERROR_RETRY_BASE_SECONDS * (2 ** Math.max(0, attempts))
+}
+
+/** True when an 'error' row is due for a retry: under the attempt cap AND past its
+ *  exponential backoff. `anchorSec` = last_attempt_at ?? completed_at ?? received_at
+ *  (legacy rows predate the columns and are due immediately). */
+export function isErrorRetryDue(attempts: number, anchorSec: number, nowSec: number): boolean {
+  if (attempts >= MAX_DRAIN_ATTEMPTS) return false
+  return anchorSec <= nowSec - errorRetryBackoffSeconds(attempts)
+}
+
+/** True when a 'processing' claim is stale (the claiming run died) and reclaimable. */
+export function isProcessingStale(anchorSec: number, nowSec: number): boolean {
+  return anchorSec <= nowSec - PROCESSING_STALE_SECONDS
 }
 
 /** Thrown by fetchExpansionCards on a non-OK Scrydex response. Carries the HTTP
@@ -194,16 +252,41 @@ export async function markExpansionFresh(
 // ─── Main processor ───────────────────────────────────────────────────────────
 
 // Per-row drain state. A row is complete only when ALL its (deduped) expansion
-// work-items resolve ok/fresh; any error marks it error; circuit-break/cap leaves any
-// unprocessed row pending for the next run.
+// work-items resolve ok/fresh; any error marks it error; circuit-break/cap releases any
+// unprocessed CLAIMED row back to pending at run end (WP-8).
 interface RowState {
   id:        unknown
+  attempts:  number        // attempts BEFORE this run (drives the terminal-state metric)
   remaining: Set<string>   // expansion keys not yet resolved
   errored:   boolean
-  done:      boolean       // already written to the log (complete or error)
+  done:      boolean       // already written to the log (complete or error/failed)
   prices:    number        // metrics attributed to this row (owner of its work-items)
   credits:   number
 }
+
+/** A webhook card variant that resolved to NO canonical product (audit ING-3). */
+export interface UnmatchedCardEntry {
+  scrydexCardId:      string | null
+  cardName:           string | null
+  cardNumber:         string | null
+  variantName:        string | null
+  tcgplayerProductId: string | null
+}
+
+// Deduped record of unknown webhook cards (migration 0089). The conflict target must
+// match uq_scrydex_unmatched_identity's COALESCE'd expression list exactly.
+const UNMATCHED_UPSERT_SQL = `
+  INSERT INTO scrydex_unmatched_cards
+    (scrydex_card_id, card_name, card_number, game_slug, scrydex_expansion_id,
+     tcgplayer_product_id, variant_name)
+  VALUES (?, ?, ?, ?, ?, ?, ?)
+  ON CONFLICT (COALESCE(scrydex_expansion_id,''), COALESCE(card_number,''), COALESCE(variant_name,''))
+  DO UPDATE SET
+    last_seen_at         = unixepoch(),
+    seen_count           = seen_count + 1,
+    scrydex_card_id      = COALESCE(excluded.scrydex_card_id,      scrydex_unmatched_cards.scrydex_card_id),
+    card_name            = COALESCE(excluded.card_name,            scrydex_unmatched_cards.card_name),
+    tcgplayer_product_id = COALESCE(excluded.tcgplayer_product_id, scrydex_unmatched_cards.tcgplayer_product_id)`
 
 export async function processPendingWebhooks(env: Env): Promise<void> {
   // ── Config ──────────────────────────────────────────────────────────────────
@@ -229,38 +312,109 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
     ? new Set(env.SCRYDEX_PRICE_GAMES.split(',').map(s => s.trim()).filter(Boolean))
     : null
 
-  // ── Load the day's pending backlog ────────────────────────────────────────────
-  const pending = await env.DB.prepare(`
-    SELECT id, event_name, expansion_ids_json
+  // ── Load the day's candidate backlog (WP-8) ──────────────────────────────────
+  // Three candidate classes in ONE scan, oldest first:
+  //   1. status = 'pending' — normal backlog.
+  //   2. stale 'processing' — a claim left by a run that died (reclaim).
+  //   3. retry-due 'error' — under the attempt cap AND past the exponential backoff.
+  // The `<<` backoff term mirrors errorRetryBackoffSeconds(); `attempts < MAX` bounds
+  // the shift. COALESCE anchors legacy rows (columns predate mig 0089) as due now.
+  const candidates = await env.DB.prepare(`
+    SELECT id, event_name, expansion_ids_json, status, attempts
     FROM   scrydex_webhook_log
     WHERE  status = 'pending'
+       OR (status = 'processing'
+           AND COALESCE(last_attempt_at, received_at) <= unixepoch() - ${PROCESSING_STALE_SECONDS})
+       OR (status = 'error'
+           AND attempts < ${MAX_DRAIN_ATTEMPTS}
+           AND COALESCE(last_attempt_at, completed_at, received_at)
+               <= unixepoch() - (${ERROR_RETRY_BASE_SECONDS} << attempts))
     ORDER BY received_at ASC
     LIMIT ${PENDING_ROW_LIMIT}
   `).all()
 
-  if (!pending.results.length) return
+  if (!candidates.results.length) return
+
+  // ── CLAIM each candidate atomically (the double-drain guard) ──────────────────
+  // One conditional UPDATE per row: the WHERE re-checks the observed state, so when
+  // overlapping runs race (cron + manual /scrydex/process + admin trigger), exactly
+  // one sees meta.changes === 1 and owns the row. A reclaim must re-check staleness —
+  // status stays 'processing' either way, so the status check alone can't discriminate.
+  const CLAIM_SQL: Record<string, string> = {
+    pending: `UPDATE scrydex_webhook_log SET status = 'processing', last_attempt_at = unixepoch()
+              WHERE id = ? AND status = 'pending'`,
+    processing: `UPDATE scrydex_webhook_log SET last_attempt_at = unixepoch()
+              WHERE id = ? AND status = 'processing'
+                AND COALESCE(last_attempt_at, received_at) <= unixepoch() - ${PROCESSING_STALE_SECONDS}`,
+    error: `UPDATE scrydex_webhook_log SET status = 'processing', last_attempt_at = unixepoch()
+              WHERE id = ? AND status = 'error'`,
+  }
+  interface ClaimedRow { id: unknown; eventName: string; expansionIdsJson: string; attempts: number; fromStatus: string }
+  const claimed: ClaimedRow[] = []
+  let reclaimedProcessing = 0
+  let retriedError = 0
+  const candidateRows = candidates.results as any[]
+  for (let i = 0; i < candidateRows.length; i += BATCH_SIZE) {
+    const chunk = candidateRows.slice(i, i + BATCH_SIZE)
+    const results = await env.DB.batch(chunk.map(r =>
+      env.DB.prepare(CLAIM_SQL[r.status as string] ?? CLAIM_SQL.pending).bind(r.id)
+    ))
+    for (let j = 0; j < chunk.length; j++) {
+      if ((results[j] as any)?.meta?.changes !== 1) continue   // lost the race — another run owns it
+      const r = chunk[j]
+      if (r.status === 'processing') reclaimedProcessing++
+      else if (r.status === 'error') retriedError++
+      claimed.push({
+        id: r.id,
+        eventName: r.event_name as string,
+        expansionIdsJson: r.expansion_ids_json as string,
+        attempts: typeof r.attempts === 'number' ? r.attempts : 0,
+        fromStatus: r.status as string,
+      })
+    }
+  }
+
+  if (!claimed.length) return
 
   // ── Parse rows → build the DEDUPED work-item set (one per distinct expansion) ──
   const rowState = new Map<unknown, RowState>()
   const rowsByKey = new Map<string, unknown[]>()           // expansion key → row ids
   const workItems = new Map<string, { gameSlug: string; priceType: string; expansionId: string; ownerRowId: unknown }>()
+  let failedTerminal = 0                                   // rows that reached the terminal 'failed' state this run
   const markComplete = async (id: unknown, prices: number, credits: number) =>
     env.DB.prepare(`UPDATE scrydex_webhook_log SET status='complete', prices_upserted=?, credits_used=?, completed_at=unixepoch() WHERE id=?`)
       .bind(prices, credits, id).run()
+  // Row-specific failure: burns an attempt; at MAX_DRAIN_ATTEMPTS the row goes
+  // TERMINAL ('failed') and is never selected again (poison rows can't loop forever).
   const markError = async (id: unknown, prices: number, credits: number, msg: string) =>
+    env.DB.prepare(`UPDATE scrydex_webhook_log
+      SET status = CASE WHEN attempts + 1 >= ${MAX_DRAIN_ATTEMPTS} THEN 'failed' ELSE 'error' END,
+          attempts = attempts + 1,
+          prices_upserted=?, credits_used=?, error_message=?, completed_at=unixepoch()
+      WHERE id=?`)
+      .bind(prices, credits, msg, id).run()
+  // Environmental failure (credit guard trip / 403 cap): visible status='error' (the
+  // June-outage invariant) but NO attempt burned — a capped month must never march
+  // innocent rows to the terminal state. The guard itself stops all retry spend.
+  const markErrorNoAttempt = async (id: unknown, prices: number, credits: number, msg: string) =>
     env.DB.prepare(`UPDATE scrydex_webhook_log SET status='error', prices_upserted=?, credits_used=?, error_message=?, completed_at=unixepoch() WHERE id=?`)
       .bind(prices, credits, msg, id).run()
+  // Deterministic poison (unparseable payload): re-parsing can never succeed → TERMINAL.
+  const markFailed = async (id: unknown, msg: string) =>
+    env.DB.prepare(`UPDATE scrydex_webhook_log SET status='failed', attempts = attempts + 1, error_message=?, completed_at=unixepoch() WHERE id=?`)
+      .bind(msg, id).run()
 
-  for (const row of pending.results) {
-    const id = (row as any).id
+  for (const row of claimed) {
+    const id = row.id
     let expansionIds: string[]
     try {
-      expansionIds = JSON.parse((row as any).expansion_ids_json as string)
+      expansionIds = JSON.parse(row.expansionIdsJson)
     } catch (err) {
-      await markError(id, 0, 0, `bad expansion_ids_json: ${(err as Error).message}`)
+      failedTerminal++
+      await markFailed(id, `bad expansion_ids_json: ${(err as Error).message}`)
       continue
     }
-    const eventName = (row as any).event_name as string
+    const eventName = row.eventName
     const gameSlug  = eventName.split('.')[0]
     const priceType = eventName.includes('graded') ? 'graded' : 'raw'
 
@@ -271,7 +425,7 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
     }
 
     const keys = expansionIds.map(e => `${gameSlug}|${priceType}|${e}`)
-    const st: RowState = { id, remaining: new Set(keys), errored: false, done: false, prices: 0, credits: 0 }
+    const st: RowState = { id, attempts: row.attempts, remaining: new Set(keys), errored: false, done: false, prices: 0, credits: 0 }
     rowState.set(id, st)
     for (let i = 0; i < keys.length; i++) {
       const key = keys[i]
@@ -288,7 +442,8 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
 
   const gameFilterLabel = gameFilter ? [...gameFilter].join(',') : 'none'
   console.log(
-    `[ScrydexProcessor] daily drain - ${pending.results.length} pending rows -> ` +
+    `[ScrydexProcessor] daily drain - ${claimed.length} claimed rows ` +
+    `(${reclaimedProcessing} reclaimed-stale, ${retriedError} error-retries) -> ` +
     `${workItems.size} distinct expansions (freshness=${freshnessHours}h, maxFetches=${maxFetches}, ` +
     `gameFilter=${gameFilterLabel})`
   )
@@ -309,15 +464,22 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
       }
     }
   }
-  // Fail one expansion key: mark every referencing row error (once).
-  const failKey = async (key: string, msg: string) => {
+  // Fail one expansion key: mark every referencing row error (once). `burnAttempt`
+  // distinguishes a row-specific failure (counts toward the terminal cap) from an
+  // environmental one (guard/403 — retried without limit once credits return).
+  const failKey = async (key: string, msg: string, burnAttempt: boolean) => {
     for (const id of rowsByKey.get(key) ?? []) {
       const st = rowState.get(id)
       if (!st || st.done) continue
       st.remaining.delete(key)
       st.errored = true
       st.done = true
-      await markError(id, st.prices, st.credits, msg)
+      if (burnAttempt) {
+        if (st.attempts + 1 >= MAX_DRAIN_ATTEMPTS) failedTerminal++
+        await markError(id, st.prices, st.credits, msg)
+      } else {
+        await markErrorNoAttempt(id, st.prices, st.credits, msg)
+      }
     }
   }
 
@@ -325,6 +487,7 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
   let totalFetches = 0            // Scrydex page-calls (= credits) made this run
   let skippedFresh = 0            // expansions inside the freshness window (no API call)
   let expansionsFetched = 0       // distinct expansions we actually fetched live
+  let totalUnmatched = 0          // webhook card variants with no catalogue match (ING-3)
   let circuitBroken = false
   // Per-game credit velocity (page-calls) — confirms which game dominates a run.
   const creditsByGame: Record<string, number> = {}
@@ -349,11 +512,26 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
       creditsByGame[wi.gameSlug] = (creditsByGame[wi.gameSlug] ?? 0) + requests
 
       const allUpserts: D1PreparedStatement[] = []
+      const unmatched: UnmatchedCardEntry[] = []
       for (const card of cards) {
-        allUpserts.push(...await buildPriceUpserts(env.DB, card, wi.expansionId, wi.priceType))
+        allUpserts.push(...await buildPriceUpserts(env.DB, card, wi.expansionId, wi.priceType, unmatched))
       }
       for (let i = 0; i < allUpserts.length; i += BATCH_SIZE) {
         await env.DB.batch(allUpserts.slice(i, i + BATCH_SIZE))
+      }
+      // Unknown cards (ING-3): record instead of dropping silently. Deduped per
+      // (expansion, number, variant) — a daily re-encounter bumps seen_count, so
+      // seen_count ≈ days observed and the table never balloons.
+      if (unmatched.length) {
+        totalUnmatched += unmatched.length
+        const stmts = unmatched.map(u =>
+          env.DB.prepare(UNMATCHED_UPSERT_SQL).bind(
+            u.scrydexCardId, u.cardName, u.cardNumber,
+            wi.gameSlug, wi.expansionId, u.tcgplayerProductId, u.variantName,
+          ))
+        for (let i = 0; i < stmts.length; i += BATCH_SIZE) {
+          await env.DB.batch(stmts.slice(i, i + BATCH_SIZE))
+        }
       }
       await markExpansionFresh(env.DB, wi.expansionId, wi.priceType)
       await satisfyKey(key, allUpserts.length, requests)
@@ -362,47 +540,70 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
     } catch (err) {
       const msg = (err as Error).message
       if (err instanceof ScrydexCreditLimitError) {
+        // The credit guard is the hard backstop for retries too: it throws BEFORE any
+        // API call, so a retried row can never spend past the cap. No attempt burned —
+        // a capped month must not march innocent rows to 'failed'.
         console.warn('[ScrydexProcessor] Credit limit guard triggered — stopping run')
         circuitBroken = true
-        await failKey(key, msg)
+        await failKey(key, msg, false)
         break
       }
       if (err instanceof ScrydexFetchError && err.status === 403) {
         console.error(`[ScrydexProcessor] 403 (CREDIT_CAP_HIT) on ${wi.gameSlug}/${wi.expansionId} — circuit breaker, stopping run`)
         circuitBroken = true
-        await failKey(key, msg)
+        await failKey(key, msg, false)
         break
       }
-      // Transient/other error on a single expansion: mark its rows error, keep going.
+      // Transient/other error on a single expansion: mark its rows error (burns an
+      // attempt — the capped-retry path to the terminal state), keep going.
       console.error(`[ScrydexProcessor] Expansion ${wi.gameSlug}/${wi.expansionId}:`, err)
-      await failKey(key, msg)
+      await failKey(key, msg, true)
     }
   }
 
-  const leftoverRows = [...rowState.values()].filter(s => !s.done).length
+  // ── RELEASE claimed-but-unreached rows back to 'pending' (WP-8) ───────────────
+  // maxFetches / circuit break can leave claimed rows unprocessed; releasing them
+  // restores the pre-claim semantics ("stays pending for the next run"). A run KILLED
+  // before this point (waitUntil cutoff) heals via the stale-'processing' reclaim.
+  // The status guard means we only touch rows still holding our claim.
+  const unfinished = [...rowState.values()].filter(s => !s.done)
+  for (let i = 0; i < unfinished.length; i += BATCH_SIZE) {
+    await env.DB.batch(unfinished.slice(i, i + BATCH_SIZE).map(st =>
+      env.DB.prepare(`UPDATE scrydex_webhook_log SET status = 'pending' WHERE id = ? AND status = 'processing'`)
+        .bind(st.id)
+    ))
+  }
+
+  const leftoverRows = unfinished.length
   console.log(
     `[ScrydexProcessor] daily drain complete — ${totalFetches} fetches, ${skippedFresh} fresh-skipped, ` +
-    `${leftoverRows} rows left pending` + (circuitBroken ? ' (circuit-broken)' : '')
+    `${leftoverRows} rows released back to pending, ${failedTerminal} terminal` +
+    (circuitBroken ? ' (circuit-broken)' : '')
   )
 
   // Structured audit line (Part B, §4 #8) — one machine-parseable JSON record per run so
   // credit consumption is measurable from `wrangler tail` / Logpush without scraping prose.
   // `rows_in` vs `distinct_expansions` quantifies the dedup collapse; `fetches_made`
   // (page-calls = credits) vs `fetches_skipped_fresh` shows the freshness savings;
-  // `credits_by_game` confirms the measured Pokémon concentration.
+  // `credits_by_game` confirms the measured Pokémon concentration. WP-8 adds the
+  // reclaim/retry/terminal/unmatched counters.
   console.log(JSON.stringify({
-    log:                   'scrydex_drain_audit',
-    rows_in:               pending.results.length,
-    distinct_expansions:   workItems.size,
-    expansions_fetched:    expansionsFetched,
-    fetches_made:          totalFetches,
-    fetches_skipped_fresh: skippedFresh,
-    rows_completed:        pending.results.length - leftoverRows,
-    rows_left_pending:     leftoverRows,
-    circuit_broken:        circuitBroken,
-    max_fetches:           maxFetches,
-    freshness_hours:       freshnessHours,
-    credits_by_game:       creditsByGame,
+    log:                        'scrydex_drain_audit',
+    rows_in:                    claimed.length,
+    rows_reclaimed_processing:  reclaimedProcessing,
+    rows_retried_error:         retriedError,
+    rows_failed_terminal:       failedTerminal,
+    distinct_expansions:        workItems.size,
+    expansions_fetched:         expansionsFetched,
+    fetches_made:               totalFetches,
+    fetches_skipped_fresh:      skippedFresh,
+    unmatched_cards:            totalUnmatched,
+    rows_completed:             claimed.length - leftoverRows,
+    rows_left_pending:          leftoverRows,
+    circuit_broken:             circuitBroken,
+    max_fetches:                maxFetches,
+    freshness_hours:            freshnessHours,
+    credits_by_game:            creditsByGame,
   }))
 }
 
@@ -517,11 +718,18 @@ const SCRYDEX_PRICE_SQL = `
     trend_90d  = excluded.trend_90d,
     fetched_at = excluded.fetched_at`
 
+/**
+ * Builds canonical price upserts for one webhook card. When the optional `unmatched`
+ * collector is passed (the daily drain does; sync-set / refresh-card do not), every
+ * variant that resolves to NO canonical product is pushed onto it instead of being
+ * dropped silently (audit ING-3) — the caller records them to scrydex_unmatched_cards.
+ */
 export async function buildPriceUpserts(
   db:          D1Database,
   card:        unknown,
   expansionId: string,
   priceType:   string,
+  unmatched?:  UnmatchedCardEntry[],
 ): Promise<D1PreparedStatement[]> {
   const c = card as any
   const upserts: D1PreparedStatement[] = []
@@ -557,7 +765,16 @@ export async function buildPriceUpserts(
       `).bind(c.number ?? '', expansionId).first() as { id: number } | null
     }
 
-    if (!product) continue
+    if (!product) {
+      unmatched?.push({
+        scrydexCardId:      c.id != null ? String(c.id) : null,
+        cardName:           c.name != null ? String(c.name) : null,
+        cardNumber:         c.number != null ? String(c.number) : null,
+        variantName:        variant.name != null ? String(variant.name) : 'normal',
+        tcgplayerProductId: tcgProductId != null ? String(tcgProductId) : null,
+      })
+      continue
+    }
 
     const variantName: string  = variant.name ?? 'normal'
     const variantPrices: any[] = variant.prices ?? []
