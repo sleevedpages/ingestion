@@ -88,15 +88,11 @@
 import type { Env } from './worker.js'
 import { ScrydexCreditLimitError } from './lib/scrydexClient.js'
 import { fetchAllExpansionCards, ScrydexCardsError } from './lib/scrydexCards.js'
-
-const SLUG_TO_GAME: Record<string, string> = {
-  pokemon:           'Pokemon',
-  magicthegathering: 'Magic',
-  onepiece:          'One Piece Card Game',
-  gundam:            'Gundam Card Game',
-  lorcana:           'Lorcana',
-  riftbound:         'Riftbound',
-}
+// WP-3 (audit IMG-5): shared canonical-name → slug map. The local SLUG_TO_GAME here once
+// keyed 'Lorcana'/'Riftbound' → the vendor single-card refresh (refreshCardPrices) could
+// never resolve a slug for those two games. 'Pokemon Japan' is deliberately absent so a JP
+// card never collides onto the English 'pokemon' slug. See lib/gameNames.ts (the drift anchor).
+import { GAME_SLUG_BY_CANONICAL_NAME } from './lib/gameNames.js'
 
 const BATCH_SIZE          = 100
 // Daily batch: a full day's backlog is larger than a 10-min one. Cap rows loaded per run
@@ -631,10 +627,6 @@ async function fetchExpansionCards(
 
 // ─── Vendor on-demand single-card refresh ────────────────────────────────────
 
-const GAME_NAME_TO_SLUG: Record<string, string> = Object.fromEntries(
-  Object.entries(SLUG_TO_GAME).map(([slug, name]) => [name, slug])
-)
-
 export interface RefreshResult {
   ok:              boolean
   error?:          string
@@ -667,7 +659,7 @@ export async function refreshCardPrices(env: Env, productId: number): Promise<Re
 
   if (!product)              return { ok: false, error: 'product not found' }
   if (!product.expansion_id) return { ok: false, error: 'no Scrydex expansion mapping for this product' }
-  const gameSlug = GAME_NAME_TO_SLUG[product.game]
+  const gameSlug = GAME_SLUG_BY_CANONICAL_NAME[product.game]
   if (!gameSlug)             return { ok: false, error: `unsupported game: ${product.game}` }
   const expansionId = product.expansion_id   // captured (narrowed) before awaits
   const targetPid   = product.tcgplayer_product_id

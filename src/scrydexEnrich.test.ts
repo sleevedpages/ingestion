@@ -251,6 +251,39 @@ describe('enrichCard', () => {
     expect(r).toMatchObject({ ok: true, skipped: 'unsupported_game' })
   })
 
+  // WP-3 (audit IMG-5) pricing-path fix: the local GAME_NAME_TO_SLUG once keyed 'Lorcana'/
+  // 'Riftbound' — spellings that matched NO canonical_games.name, so a Lorcana TCG / Riftbound
+  // card returned skipped='unsupported_game' and could never detail-enrich. It now imports the
+  // shared lib/gameNames.ts map keyed by the EXACT canonical names.
+  it('WP-3: a Lorcana TCG card resolves the correct slug end-to-end (was silently unsupported)', async () => {
+    ;(scrydexFetch as any).mockClear()
+    const db = makeDb({ ...PRODUCT_ROW, game: 'Lorcana TCG' })
+    ;(scrydexFetch as any).mockResolvedValue(okRes({ data: UMBREON }))
+    const r = await enrichCard({ DB: db } as any, { canonicalProductId: 42, classes: ['core'] })
+    expect(r.ok).toBe(true)
+    expect(r.skipped).toBeUndefined()
+    // The Scrydex endpoint carries the resolved slug — never a skipped run.
+    expect((scrydexFetch as any).mock.calls[0][1]).toMatch(/^\/lorcana\/v1\/cards\//)
+  })
+
+  it('WP-3: a Riftbound card (full canonical name) resolves the correct slug end-to-end', async () => {
+    ;(scrydexFetch as any).mockClear()
+    const db = makeDb({ ...PRODUCT_ROW, game: 'Riftbound League of Legends Trading Card Game' })
+    ;(scrydexFetch as any).mockResolvedValue(okRes({ data: UMBREON }))
+    const r = await enrichCard({ DB: db } as any, { canonicalProductId: 42, classes: ['core'] })
+    expect(r.ok).toBe(true)
+    expect(r.skipped).toBeUndefined()
+    expect((scrydexFetch as any).mock.calls[0][1]).toMatch(/^\/riftbound\/v1\/cards\//)
+  })
+
+  it('WP-3/IMG-6: a Pokemon Japan card is unsupported and never fetches (no English-slug collision)', async () => {
+    ;(scrydexFetch as any).mockClear()
+    const db = makeDb({ ...PRODUCT_ROW, game: 'Pokemon Japan' })
+    const r = await enrichCard({ DB: db } as any, { canonicalProductId: 42, classes: ['core'] })
+    expect(r).toMatchObject({ ok: true, skipped: 'unsupported_game' })
+    expect(scrydexFetch as any).not.toHaveBeenCalled()   // JP never rides the English 'pokemon' slug
+  })
+
   it('core: parses + batches upserts and marks the class fresh', async () => {
     const db = makeDb(PRODUCT_ROW)
     ;(scrydexFetch as any).mockResolvedValue(okRes({ data: UMBREON }))

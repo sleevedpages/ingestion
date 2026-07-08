@@ -14,8 +14,10 @@ import {
   errorRetryBackoffSeconds,
   isErrorRetryDue,
   isProcessingStale,
+  refreshCardPrices,
   type UnmatchedCardEntry,
 } from './scrydexProcessor.js'
+import { GAME_SLUG_BY_CANONICAL_NAME } from './lib/gameNames.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Minimal fake D1 — records run()/batch() and routes first()/all() via callbacks.
@@ -671,5 +673,87 @@ describe('processPendingWebhooks — structured drain audit log', () => {
     expect(audit.fetches_skipped_fresh).toBe(1)
     expect(audit.expansions_fetched).toBe(0)
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WP-3 (audit IMG-5) pricing-path fix — the vendor single-card refresh once used a
+// derived GAME_NAME_TO_SLUG whose 'Lorcana'/'Riftbound' keys matched NO canonical_games.name,
+// so refreshCardPrices returned "unsupported game" for both. It now resolves through the
+// shared lib/gameNames.ts map keyed by the EXACT canonical names.
+// ─────────────────────────────────────────────────────────────────────────────
+function refreshFirstRouter(game: string) {
+  return (sql: string) => {
+    // The refresh product lookup (JOINs canonical_games) → the target card row.
+    if (sql.includes('canonical_games')) {
+      return { id: 42, tcgplayer_product_id: 999, number: '25', expansion_id: 'exp1', game }
+    }
+    if (sql.includes('SUM(credits_used)')) return { total: 0 }          // credit guard: unused
+    if (sql.includes('FROM products WHERE tcgplayer_product_id')) return { id: 42 }
+    return null
+  }
+}
+const refreshCardResp = () => new Response(
+  JSON.stringify({ data: [okCard] }),
+  { status: 200, headers: { 'content-type': 'application/json' } },
+)
+
+describe('refreshCardPrices — WP-3 pricing-path slug resolution', () => {
+  it('a Lorcana TCG card resolves the correct slug end-to-end (was silently unsupported)', async () => {
+    const fetchMock = vi.fn(async () => refreshCardResp())
+    vi.stubGlobal('fetch', fetchMock)
+    const db = makeFakeDB({ first: refreshFirstRouter('Lorcana TCG') })
+    const r = await refreshCardPrices({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any, 42)
+    expect(r.ok).toBe(true)
+    expect(r.pricesUpserted).toBeGreaterThan(0)
+    // The Scrydex cards endpoint carries the resolved slug — never an "unsupported game" bail-out.
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/lorcana/v1/cards')
+  })
+
+  it('a Riftbound card (full canonical name) resolves the correct slug end-to-end', async () => {
+    const fetchMock = vi.fn(async () => refreshCardResp())
+    vi.stubGlobal('fetch', fetchMock)
+    const db = makeFakeDB({ first: refreshFirstRouter('Riftbound League of Legends Trading Card Game') })
+    const r = await refreshCardPrices({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any, 42)
+    expect(r.ok).toBe(true)
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/riftbound/v1/cards')
+  })
+
+  it('a Pokemon Japan card is unsupported and never fetches (no English-slug collision)', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const db = makeFakeDB({ first: refreshFirstRouter('Pokemon Japan') })
+    const r = await refreshCardPrices({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any, 42)
+    expect(r).toEqual({ ok: false, error: 'unsupported game: Pokemon Japan' })
+    expect(fetchMock).not.toHaveBeenCalled()   // JP must never collide onto the English 'pokemon' slug
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The name↔slug resolution the drain + refresh rely on, round-tripped for ALL canonical
+// games (incl. the two IMG-5 fixes) — the SHARED map (lib/gameNames.test.ts stays the drift
+// anchor for the exact key list; this asserts the pricing-path consumer's round-trip contract).
+// ─────────────────────────────────────────────────────────────────────────────
+describe('game name ↔ slug resolution (WP-3) — round-trip, no collision', () => {
+  it('every canonical game name resolves to a slug that reverses to exactly one name', () => {
+    const slugToName = new Map<string, string>()
+    for (const [name, slug] of Object.entries(GAME_SLUG_BY_CANONICAL_NAME)) {
+      expect(slug).toBeTruthy()
+      // No two distinct canonical names may collapse to one slug — that would make the
+      // reverse ambiguous and could mis-route a card (e.g. a JP card onto English pokemon).
+      expect(slugToName.has(slug)).toBe(false)
+      slugToName.set(slug, name)
+    }
+    // The two IMG-5 fixes are present with the correct slugs.
+    expect(GAME_SLUG_BY_CANONICAL_NAME['Lorcana TCG']).toBe('lorcana')
+    expect(GAME_SLUG_BY_CANONICAL_NAME['Riftbound League of Legends Trading Card Game']).toBe('riftbound')
+  })
+
+  it('Pokemon Japan does not resolve, and the pokemon slug reverses ONLY to English Pokemon', () => {
+    expect(GAME_SLUG_BY_CANONICAL_NAME['Pokemon Japan']).toBeUndefined()
+    const pokemonNames = Object.entries(GAME_SLUG_BY_CANONICAL_NAME)
+      .filter(([, slug]) => slug === 'pokemon')
+      .map(([name]) => name)
+    expect(pokemonNames).toEqual(['Pokemon'])
   })
 })

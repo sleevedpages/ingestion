@@ -35,16 +35,11 @@
 import type { Env } from './worker.js'
 import { scrydexFetch, ScrydexCreditLimitError } from './lib/scrydexClient.js'
 import { variantFinish, tcgProductIdOf } from './lib/variantCapture.js'
-
-// Game name (canonical_games.name) → Scrydex slug. Mirrors scrydexProcessor's SLUG_TO_GAME.
-const GAME_NAME_TO_SLUG: Record<string, string> = {
-  'Pokemon':              'pokemon',
-  'Magic':                'magicthegathering',
-  'One Piece Card Game':  'onepiece',
-  'Gundam Card Game':     'gundam',
-  'Lorcana':              'lorcana',
-  'Riftbound':            'riftbound',
-}
+// WP-3 (audit IMG-5): the game-name → slug map is the SHARED canonical-name map. The local
+// copy here once keyed 'Lorcana'/'Riftbound' — spellings that matched NOTHING, so Lorcana TCG
+// and Riftbound cards could never detail-enrich; 'Pokemon Japan' is deliberately absent so a
+// JP card never rides the English slug. See lib/gameNames.ts (the drift anchor).
+import { GAME_SLUG_BY_CANONICAL_NAME } from './lib/gameNames.js'
 
 const BATCH_SIZE          = 90    // D1 binds <= 100 params/statement; the prices upsert binds 21, batch by statement count
 const LISTINGS_RETENTION_DAYS = 180
@@ -452,7 +447,7 @@ export async function enrichCard(
   `).bind(canonicalProductId).first<{ id: number; scrydex_card_id: string | null; number: string | null; expansion_id: string | null; game: string }>()
 
   if (!product) return { ok: false, error: 'product not found' }
-  const gameSlug = GAME_NAME_TO_SLUG[product.game]
+  const gameSlug = GAME_SLUG_BY_CANONICAL_NAME[product.game]
   if (!gameSlug) return { ok: true, skipped: 'unsupported_game' }
 
   const scrydexCardId = product.scrydex_card_id || deriveScrydexCardId(product.expansion_id, product.number)
