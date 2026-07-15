@@ -77,16 +77,26 @@
  *   One Piece + Gundam: each variant has a unique TCGPlayer product_id + own images
  *   All others (Pokemon, MTG, Lorcana, Riftbound): variants share a product_id
  *
- * Canonical price field mapping (mirrors migration 0060):
+ * Canonical price field mapping (POSITIVE write-time classification, 2026-07-14):
  *   condition ← tier ('NM'|'LP'|'MP'|'HP'|'DM') for raw; NULL for graded
  *   finish    ← variant.name ('foil'|'altArt'|...) or 'normal'
- *   grade     ← the price condition string for graded rows; NULL otherwise
+ *   grade     ← `${company} ${grade}` built from the graded payload fields (the live shape is
+ *               { type:'graded', company, grade } — there is NO combined condition string;
+ *               price.condition is only a legacy fallback); NULL for raw
+ *   company   ← normaliseCompany(price.company); is_signed/is_error/is_perfect ← payload flags
+ *   is_graded ← 1 when price.type === 'graded', else 0 — graded-ness is an EXPLICIT STORED
+ *               attribute from Scrydex's own data shape, NEVER inferred at read time. A graded
+ *               row that resolves NO label is SKIPPED, never written as raw. (The pre-fix
+ *               writer derived grade from price.condition, so EVERY drained graded price
+ *               landed as condition=NULL/grade=NULL — an anonymous "untiered market" row that
+ *               leaked slab prices into the ungraded chain: the ARS 10 leak, Content mig 0099.)
  *   value     ← price.market
  *   trend_*   ← price.trends.days_{1,7,14,30,90}.percent_change
  */
 
 import type { Env } from './worker.js'
 import { ScrydexCreditLimitError } from './lib/scrydexClient.js'
+import { normaliseCompany } from './scrydexEnrich.js'
 import { fetchAllExpansionCards, ScrydexCardsError } from './lib/scrydexCards.js'
 // WP-3 (audit IMG-5): shared canonical-name → slug map. The local SLUG_TO_GAME here once
 // keyed 'Lorcana'/'Riftbound' → the vendor single-card refresh (refreshCardPrices) could
@@ -158,29 +168,61 @@ export class ScrydexFetchError extends Error {
 // ─── Pure helpers (exported for unit testing) ────────────────────────────────
 
 export interface CanonicalPriceFields {
-  condition: string | null
-  finish:    string
-  grade:     string | null
+  condition:  string | null
+  finish:     string
+  grade:      string | null
+  company:    string | null
+  is_signed:  number
+  is_error:   number
+  is_perfect: number
+  is_graded:  number
+}
+
+/** 0/1 coercion for the payload's boolean-ish sub-variant flags (mirrors scrydexEnrich). */
+function subVariantFlag(v: unknown): number {
+  return v === true || v === 1 || v === '1' ? 1 : 0
 }
 
 /**
- * Maps a Scrydex variant price to canonical (condition, finish, grade), matching
- * the values migration 0060 produced from the old scrydex_prices.condition string.
+ * Maps a Scrydex variant price to canonical fields — POSITIVE write-time classification
+ * (2026-07-14, the ARS-10-leak fix; Content migration 0099):
  *
- *   raw    → condition = the tier (price.condition, e.g. 'NM'); grade = NULL
- *   graded → condition = NULL; grade = the price condition string (e.g. 'PSA 10')
+ *   raw    → condition = the tier (price.condition, e.g. 'NM'); grade/company NULL; is_graded 0
+ *   graded → condition = NULL; grade = `${normaliseCompany(company)} ${grade}` from the live
+ *            payload shape { type:'graded', company, grade } (matches scrydexEnrich's
+ *            parseCardPrices; the legacy combined price.condition string is the fallback);
+ *            company + is_signed/is_error/is_perfect captured; is_graded 1. Unknown/new
+ *            grading companies land on the graded side BY CONSTRUCTION (normaliseCompany
+ *            passes any company through). A graded row that resolves NO label returns NULL —
+ *            the caller must SKIP it; it must never fall through to the raw side (that
+ *            fall-through wrote every drained graded price as condition=NULL/grade=NULL,
+ *            leaking slab prices into the ungraded market).
  *   finish → variant.name when it is not 'normal' (e.g. 'foil','altArt'); else 'normal'
  */
 export function deriveCanonicalPriceFields(
-  priceCondition: string | null | undefined,
-  variantName:    string | null | undefined,
-  priceType:      string,
-): CanonicalPriceFields {
+  price:       unknown,
+  variantName: string | null | undefined,
+  priceType:   string,
+): CanonicalPriceFields | null {
+  const p = price as any
   const finish = variantName && variantName !== 'normal' ? variantName : 'normal'
   if (priceType === 'graded') {
-    return { condition: null, finish, grade: priceCondition ?? null }
+    const company  = normaliseCompany(p?.company)
+    const gradeNum = p?.grade != null ? String(p.grade).trim() : null
+    const label    = company && gradeNum ? `${company} ${gradeNum}` : (p?.condition ?? null)
+    if (!label) return null   // unusable graded row — skip, never write as raw
+    return {
+      condition: null, finish, grade: label, company,
+      is_signed:  subVariantFlag(p?.is_signed),
+      is_error:   subVariantFlag(p?.is_error),
+      is_perfect: subVariantFlag(p?.is_perfect),
+      is_graded:  1,
+    }
   }
-  return { condition: priceCondition ?? null, finish, grade: null }
+  return {
+    condition: p?.condition ?? null, finish, grade: null, company: null,
+    is_signed: 0, is_error: 0, is_perfect: 0, is_graded: 0,
+  }
 }
 
 export interface CanonicalTrends {
@@ -694,15 +736,19 @@ export async function refreshCardPrices(env: Env, productId: number): Promise<Re
 
 // ─── Price upsert building ────────────────────────────────────────────────────
 
+// company + the sub-variant flags are part of the uq_prices_identity conflict key; is_graded is
+// NOT identity (Content mig 0099) but is always written so classification is explicit at write
+// time. DO UPDATE keeps is_graded in step for rows the backfill couldn't classify.
 const SCRYDEX_PRICE_SQL = `
   INSERT INTO prices
-    (product_id, source, condition, finish, grade, value,
+    (product_id, source, condition, finish, grade, company, is_signed, is_error, is_perfect, is_graded, value,
      trend_1d, trend_7d, trend_14d, trend_30d, trend_90d, fetched_at)
-  VALUES (?, 'scrydex', ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+  VALUES (?, 'scrydex', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
   ON CONFLICT (product_id, source, COALESCE(condition,''), COALESCE(finish,''), COALESCE(grade,''),
                COALESCE(variant,''), COALESCE(company,''), is_signed, is_error, is_perfect)
   DO UPDATE SET
     value      = excluded.value,
+    is_graded  = excluded.is_graded,
     trend_1d   = excluded.trend_1d,
     trend_7d   = excluded.trend_7d,
     trend_14d  = excluded.trend_14d,
@@ -774,17 +820,21 @@ export async function buildPriceUpserts(
     for (const price of variantPrices) {
       if (price.type !== priceType) continue
 
-      const { condition, finish, grade } = deriveCanonicalPriceFields(
-        price.condition, variantName, priceType
-      )
+      const fields = deriveCanonicalPriceFields(price, variantName, priceType)
+      if (!fields) continue   // graded row with no resolvable label — never write it as raw
       const trends = extractTrends(price.trends)
 
       upserts.push(
         db.prepare(SCRYDEX_PRICE_SQL).bind(
           product.id,
-          condition,
-          finish,
-          grade,
+          fields.condition,
+          fields.finish,
+          fields.grade,
+          fields.company,
+          fields.is_signed,
+          fields.is_error,
+          fields.is_perfect,
+          fields.is_graded,
           price.market ?? null,
           trends.trend_1d,
           trends.trend_7d,

@@ -70,37 +70,62 @@ afterEach(() => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// deriveCanonicalPriceFields — must match what migration 0060 produced.
+// deriveCanonicalPriceFields — POSITIVE write-time classification (the ARS-10-leak
+// fix, Content mig 0099). Graded-ness comes from Scrydex's own price.type; the grade
+// label is built from the live { company, grade } payload fields (price.condition is
+// only the legacy fallback); unknown companies land graded BY CONSTRUCTION; a graded
+// row with no resolvable label is null (skip) — never a raw fall-through.
 // ─────────────────────────────────────────────────────────────────────────────
+const RAW_ZERO = { company: null, is_signed: 0, is_error: 0, is_perfect: 0, is_graded: 0 }
+
 describe('deriveCanonicalPriceFields', () => {
-  it('raw normal → tier condition, normal finish, no grade', () => {
-    expect(deriveCanonicalPriceFields('NM', 'normal', 'raw'))
-      .toEqual({ condition: 'NM', finish: 'normal', grade: null })
+  it('raw normal → tier condition, normal finish, no grade, is_graded 0', () => {
+    expect(deriveCanonicalPriceFields({ condition: 'NM' }, 'normal', 'raw'))
+      .toEqual({ condition: 'NM', finish: 'normal', grade: null, ...RAW_ZERO })
   })
 
   it('raw foil variant → tier condition + foil finish', () => {
-    expect(deriveCanonicalPriceFields('NM', 'foil', 'raw'))
-      .toEqual({ condition: 'NM', finish: 'foil', grade: null })
+    expect(deriveCanonicalPriceFields({ condition: 'NM' }, 'foil', 'raw'))
+      .toEqual({ condition: 'NM', finish: 'foil', grade: null, ...RAW_ZERO })
   })
 
   it('raw altArt variant → tier condition + altArt finish', () => {
-    expect(deriveCanonicalPriceFields('LP', 'altArt', 'raw'))
-      .toEqual({ condition: 'LP', finish: 'altArt', grade: null })
+    expect(deriveCanonicalPriceFields({ condition: 'LP' }, 'altArt', 'raw'))
+      .toEqual({ condition: 'LP', finish: 'altArt', grade: null, ...RAW_ZERO })
   })
 
-  it('graded → null condition, grade = the price condition string', () => {
-    expect(deriveCanonicalPriceFields('PSA 10', 'normal', 'graded'))
-      .toEqual({ condition: null, finish: 'normal', grade: 'PSA 10' })
+  it('graded (live shape: company + grade fields) → combined label + company + is_graded 1', () => {
+    expect(deriveCanonicalPriceFields({ company: 'PSA', grade: '10' }, 'normal', 'graded'))
+      .toEqual({ condition: null, finish: 'normal', grade: 'PSA 10', company: 'PSA', is_signed: 0, is_error: 0, is_perfect: 0, is_graded: 1 })
   })
 
-  it('graded foil → grade carried, foil finish preserved', () => {
-    expect(deriveCanonicalPriceFields('BGS 9.5', 'foil', 'graded'))
-      .toEqual({ condition: null, finish: 'foil', grade: 'BGS 9.5' })
+  it('UNKNOWN grading company (ARS) lands on the graded side by construction', () => {
+    expect(deriveCanonicalPriceFields({ company: 'ARS', grade: 10 }, 'holofoil', 'graded'))
+      .toEqual({ condition: null, finish: 'holofoil', grade: 'ARS 10', company: 'ARS', is_signed: 0, is_error: 0, is_perfect: 0, is_graded: 1 })
+  })
+
+  it('graded sub-variant flags are captured', () => {
+    expect(deriveCanonicalPriceFields({ company: 'BGS', grade: '10', is_error: true }, 'foil', 'graded'))
+      .toEqual({ condition: null, finish: 'foil', grade: 'BGS 10', company: 'BGS', is_signed: 0, is_error: 1, is_perfect: 0, is_graded: 1 })
+  })
+
+  it('legacy combined condition string still resolves the graded label (fallback)', () => {
+    expect(deriveCanonicalPriceFields({ condition: 'BGS 9.5' }, 'foil', 'graded'))
+      .toEqual({ condition: null, finish: 'foil', grade: 'BGS 9.5', company: null, is_signed: 0, is_error: 0, is_perfect: 0, is_graded: 1 })
+  })
+
+  it('graded row with NO resolvable label → null (caller skips) — NEVER a raw fall-through', () => {
+    expect(deriveCanonicalPriceFields({ market: 230 }, 'holofoil', 'graded')).toBeNull()
+  })
+
+  it('CGS legacy typo normalises to CGC in the label', () => {
+    expect(deriveCanonicalPriceFields({ company: 'cgs', grade: '9' }, 'normal', 'graded'))
+      .toMatchObject({ grade: 'CGC 9', company: 'CGC', is_graded: 1 })
   })
 
   it('missing/undefined variant name defaults finish to normal', () => {
-    expect(deriveCanonicalPriceFields('NM', undefined, 'raw'))
-      .toEqual({ condition: 'NM', finish: 'normal', grade: null })
+    expect(deriveCanonicalPriceFields({ condition: 'NM' }, undefined, 'raw'))
+      .toEqual({ condition: 'NM', finish: 'normal', grade: null, ...RAW_ZERO })
   })
 })
 
@@ -154,10 +179,43 @@ describe('buildPriceUpserts', () => {
     })
     const upserts = await buildPriceUpserts(db as any, rawCard, 'exp1', 'raw') as unknown as FakeStmt[]
     expect(upserts).toHaveLength(1)
-    // product_id, condition, finish, grade, value, trend_1d, 7d, 14d, 30d, 90d
-    expect(upserts[0].args).toEqual([42, 'NM', 'normal', null, 1.5, 2, null, null, null, null])
+    // product_id, condition, finish, grade, company, is_signed, is_error, is_perfect, is_graded,
+    // value, trend_1d, 7d, 14d, 30d, 90d
+    expect(upserts[0].args).toEqual([42, 'NM', 'normal', null, null, 0, 0, 0, 0, 1.5, 2, null, null, null, null])
     expect(upserts[0].sql).toContain("'scrydex'")
     expect(upserts[0].sql).toContain('ON CONFLICT')
+    expect(upserts[0].sql).toContain('is_graded')
+  })
+
+  it('graded ARS payload row → labelled graded row (is_graded 1), never an anonymous market row', async () => {
+    // The ARS-10-leak reproduction: the live graded shape has NO condition string. The old
+    // writer bound grade=NULL/condition=NULL here (an anonymous untiered "market" row that the
+    // ungraded chain then served as the raw price). It must now bind the combined label + flag.
+    const gradedCard = {
+      number: '115',
+      variants: [{
+        name: 'holofoil',
+        marketplaces: [{ name: 'tcgplayer', product_id: '655891' }],
+        prices: [{ type: 'graded', company: 'ARS', grade: 10, market: 230 }],
+      }],
+    }
+    const db = makeFakeDB({ first: () => ({ id: 154256 }) })
+    const upserts = await buildPriceUpserts(db as any, gradedCard, 'm2', 'graded') as unknown as FakeStmt[]
+    expect(upserts).toHaveLength(1)
+    expect(upserts[0].args).toEqual([154256, null, 'holofoil', 'ARS 10', 'ARS', 0, 0, 0, 1, 230, null, null, null, null, null])
+  })
+
+  it('graded row with no resolvable label is SKIPPED — never written as raw', async () => {
+    const degenerate = {
+      number: '115',
+      variants: [{
+        name: 'holofoil',
+        marketplaces: [{ name: 'tcgplayer', product_id: '655891' }],
+        prices: [{ type: 'graded', market: 230 }],   // no company, no grade, no condition
+      }],
+    }
+    const db = makeFakeDB({ first: () => ({ id: 154256 }) })
+    await expect(buildPriceUpserts(db as any, degenerate, 'm2', 'graded')).resolves.toEqual([])
   })
 
   it('falls back to number + scrydex_expansion_id (R2) when the product_id does not resolve', async () => {

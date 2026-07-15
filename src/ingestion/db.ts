@@ -208,10 +208,10 @@ export async function upsertProductSourceImages(
 // an unresolved sub-select would violate the NOT NULL FK; the sequencing guarantees it.
 const PRICE_SQL = `
   INSERT INTO prices
-    (product_id, source, condition, finish, grade, value, low, mid, high, direct_low, fetched_at)
+    (product_id, source, condition, finish, grade, is_graded, value, low, mid, high, direct_low, fetched_at)
   VALUES (
     (SELECT id FROM products WHERE tcgplayer_product_id = ?),
-    'tcgplayer', NULL, ?, NULL, ?, ?, ?, ?, ?, ?)
+    'tcgplayer', NULL, ?, NULL, 0, ?, ?, ?, ?, ?, ?)
   ON CONFLICT (product_id, source, COALESCE(condition,''), COALESCE(finish,''), COALESCE(grade,''),
                COALESCE(variant,''), COALESCE(company,''), is_signed, is_error, is_perfect)
   DO UPDATE SET

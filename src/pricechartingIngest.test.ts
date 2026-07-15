@@ -22,14 +22,37 @@ function makeKV() {
   }
 }
 
-interface Product { id: number; tcgplayer_product_id: number; name: string; number: string; category: number }
+interface Product {
+  id: number; tcgplayer_product_id: number | null; name: string; number: string; category: number
+  kind?: 'card' | 'sealed'   // product_kind (default 'card') — gates the number-less candidate pool
+  setName?: string           // sets.name — console↔set corroboration for the number-less rung
+}
 
 function makeFakeDb(products: Product[]) {
   const prices = new Map<string, number>()                       // `${productId}|${grade}` → value
-  const pcMap = new Map<string, { canonical_product_id: number | null }>()
+  const pcMap = new Map<string, { canonical_product_id: number | null; match_method: string | null }>()
 
   function query(sql: string, args: any[]) {
-    // The only read: loadProductIndex's paginated product pull (scoped by category). One page.
+    // loadExistingMatches: keyset-paginated already-matched map (mint stamps / prior runs).
+    if (sql.includes('FROM pricecharting_products')) {
+      const cursor = String(args[1] ?? '')
+      const rows = [...pcMap.entries()]
+        .filter(([id, v]) => v.canonical_product_id != null && id > cursor)
+        .sort(([a], [b]) => (a < b ? -1 : 1))
+        .map(([pcId, v]) => ({ pcId, productId: v.canonical_product_id }))
+      return { results: rows }
+    }
+    // loadProductIndex: number-less candidate pool (cards only, with set name).
+    if (sql.includes('p.number IS NULL')) {
+      const cats = args.map(Number)
+      const offsetMatch = sql.match(/OFFSET (\d+)/)
+      const offset = offsetMatch ? Number(offsetMatch[1]) : 0
+      if (offset > 0) return { results: [] }
+      return { results: products
+        .filter((p) => cats.includes(p.category) && !p.number && (p.kind ?? 'card') === 'card')
+        .map((p) => ({ id: p.id, name: p.name, setName: p.setName ?? '' })) }
+    }
+    // loadProductIndex: the paginated primary product pull (scoped by category). One page.
     if (sql.includes('FROM products p') && sql.includes('JOIN canonical_games')) {
       const cats = args.map(Number)
       const offsetMatch = sql.match(/OFFSET (\d+)/)
@@ -42,11 +65,19 @@ function makeFakeDb(products: Product[]) {
   }
   function write(sql: string, args: any[]) {
     if (sql.includes('INTO pricecharting_products')) {
-      const pcId = String(args[0]); const canonical = args[2]
+      const pcId = String(args[0]); const canonical = args[2]; const method = args[3]
       const prev = pcMap.get(pcId)
-      pcMap.set(pcId, { canonical_product_id: canonical ?? prev?.canonical_product_id ?? null })
+      // Mirrors the real upsert's COALESCE semantics: a NULL excluded value preserves the
+      // stored canonical_product_id / match_method (the mint-stamp survival contract).
+      pcMap.set(pcId, {
+        canonical_product_id: canonical ?? prev?.canonical_product_id ?? null,
+        match_method:         method ?? prev?.match_method ?? null,
+      })
     } else if (sql.includes('INTO prices')) {
-      prices.set(`${args[0]}|${args[3] ?? ''}`, args[4])
+      // binds: productId, condition, finish, grade, is_graded, value, retail_buy, retail_sell
+      const grade = args[3] ?? null
+      if ((grade == null ? 0 : 1) !== args[4]) throw new Error('is_graded bind out of step with grade label')
+      prices.set(`${args[0]}|${grade ?? ''}`, args[5])
     } else throw new Error('unhandled write SQL: ' + sql.slice(0, 60))
   }
   const db = {
@@ -123,7 +154,7 @@ function row(vals: Partial<Record<string, string>>): string {
 const PRODUCTS: Product[] = [
   { id: 7,  tcgplayer_product_id: 12345, name: 'Charizard ex', number: '125/197', category: 3 },
   { id: 8,  tcgplayer_product_id: 99999, name: 'Pikachu',      number: '58/197',  category: 3 },
-  { id: 20, tcgplayer_product_id: 55555, name: 'Booster Box',  number: '',        category: 3 },
+  { id: 20, tcgplayer_product_id: 55555, name: 'Booster Box',  number: '',        category: 3, kind: 'sealed' },
 ]
 
 function buildCsv() {
@@ -218,7 +249,7 @@ describe('processPriceChartingWindow', () => {
     expect(db._prices.get('20|')).toBe(120)     // D (sealed) ungraded ONLY
     expect(db._prices.has('20|PSA 10')).toBe(false)
     // Unmatched row C recorded (null), matched rows persisted.
-    expect(db._pcMap.get('pcC')).toEqual({ canonical_product_id: null })
+    expect(db._pcMap.get('pcC')).toEqual({ canonical_product_id: null, match_method: null })
     expect(db._pcMap.get('pcA')?.canonical_product_id).toBe(7)
     expect(db._pcMap.get('pcB')?.canonical_product_id).toBe(8)
   })
@@ -335,6 +366,78 @@ describe('big category — ONE download, then full ingest across many windows', 
     await drainChain(env, key)
     expect(fetchSpy).toHaveBeenCalledTimes(1)
     expect(db._prices.size).toBe(2500)
+  })
+})
+
+// ── Number-less rung (DON!!s) + mint-stamp skip (2026-07-15) ────────────────────
+describe('number-less set-corroborated matching (One Piece DON!!s)', () => {
+  // Real prod shape (DIAGNOSTIC_DON_AND_GEMPACK A3): pc_id 13256449 "DON!! Card [Dodgers]",
+  // console "One Piece Promo", NO tcg-id, NO digit token → structurally unmatchable before
+  // this rung. Canonical 'DON!! Card (Dodgers)' has number NULL by Bandai design.
+  const OP_PRODUCTS: Product[] = [
+    { id: 30, tcgplayer_product_id: 619417, name: 'DON!! Card (Dodgers)', number: '', category: 68,
+      setName: 'One Piece Promotion Cards' },
+    // Same base name, different set — must NOT corroborate against the Promo console.
+    { id: 31, tcgplayer_product_id: 619500, name: 'DON!! Card', number: '', category: 68,
+      setName: 'Starter Deck 01' },
+  ]
+  const opCsv = [
+    HEADER,
+    row({ id: 'pcDON', 'console-name': 'One Piece Promo', 'product-name': 'DON!! Card [Dodgers]',
+          'loose-price': '$50.00', 'graded-price': '$80.00', genre: 'One Piece Card', 'tcg-id': '' }),
+  ].join('\n')
+  const opMsg = (key: string): PcProcessMessage =>
+    ({ kind: 'pricecharting-process', category: 'one-piece-cards', key, offset: 0 })
+
+  it('matches the Dodgers DON via the number-less rung (loose + graded prices written)', async () => {
+    const r2 = makeR2(); const key = rawKeyFor('one-piece-cards', today()); r2._store.set(key, opCsv)
+    const db = makeFakeDb(OP_PRODUCTS)
+    const c = await processPriceChartingWindow({ DB: db, IMAGES_BUCKET: r2 } as any, opMsg(key))
+    expect(c.matchedNumberless).toBe(1)
+    expect(c.numberlessAttempts).toBe(1)
+    expect(c.unmatched).toBe(0)
+    expect(db._pcMap.get('pcDON')).toEqual({ canonical_product_id: 30, match_method: 'numberless' })
+    expect(db._prices.get('30|')).toBe(50)          // loose/ungraded
+    expect(db._prices.get('30|Grade 9')).toBe(80)   // graded bucket flows too
+  })
+
+  it('a digit-bearing Chinese Gem Pack row NEVER enters the number-less rung (no English cross-match)', async () => {
+    const r2 = makeR2(); const key = rawKeyFor('pokemon-cards', today())
+    r2._store.set(key, [
+      HEADER,
+      row({ id: 'pcGP', 'console-name': 'Pokemon Chinese Gem Pack', 'product-name': 'Gengar #307',
+            'loose-price': '$14.00', genre: 'Pokemon Card', 'tcg-id': '' }),
+    ].join('\n'))
+    // English catalogue: a numbered Gengar (different number) AND a number-less English Gengar —
+    // neither may capture the Chinese row (the digit token keeps it on the numeric rung).
+    const db = makeFakeDb([
+      { id: 40, tcgplayer_product_id: 88001, name: 'Gengar', number: '226/264', category: 3 },
+      { id: 41, tcgplayer_product_id: null,  name: 'Gengar', number: '', category: 3, setName: 'Pokemon Promo' },
+    ])
+    const c = await processPriceChartingWindow({ DB: db, IMAGES_BUCKET: r2 } as any, procMsg(key))
+    expect(c.numberlessAttempts).toBe(0)   // digit token → number-less rung never fires
+    expect(c.matchedNumberless).toBe(0)
+    expect(c.unmatched).toBe(1)            // pre-mint: recorded unmatched, never mispriced
+    expect(db._pcMap.get('pcGP')?.canonical_product_id).toBeNull()
+    expect(db._prices.size).toBe(0)
+  })
+
+  it('a pre-stamped (minted) row skips the matcher, keeps its method, and gets prices written', async () => {
+    const r2 = makeR2(); const key = rawKeyFor('pokemon-cards', today())
+    r2._store.set(key, [
+      HEADER,
+      row({ id: 'pcMINT', 'console-name': 'Pokemon Chinese Gem Pack', 'product-name': 'Gengar #307',
+            'loose-price': '$12.00', 'manual-only-price': '$99.00', genre: 'Pokemon Card', 'tcg-id': '' }),
+    ].join('\n'))
+    const db = makeFakeDb([])   // minted product is NOT in the matcher index — the stamp alone carries it
+    db._pcMap.set('pcMINT', { canonical_product_id: 500, match_method: 'minted' })
+    const c = await processPriceChartingWindow({ DB: db, IMAGES_BUCKET: r2 } as any, procMsg(key))
+    expect(c.matchedExisting).toBe(1)
+    expect(c.unmatched).toBe(0)
+    // The stamp survives (matcher never fights it) and the ordinary price write path fires.
+    expect(db._pcMap.get('pcMINT')).toEqual({ canonical_product_id: 500, match_method: 'minted' })
+    expect(db._prices.get('500|')).toBe(12)
+    expect(db._prices.get('500|PSA 10')).toBe(99)
   })
 })
 

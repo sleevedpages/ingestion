@@ -22,6 +22,7 @@ import { PRICECHARTING_CATEGORIES, type PriceChartingCategory } from './lib/pric
 import { backfillR2ImageUrls, backfillVariantImages, seedVariantProducts } from './backfillR2Urls.js';
 import { purgePlaceholderMirrors } from './purgePlaceholderMirrors.js';
 import { sweepDeadSourceUrls } from './deadSourceUrlSweep.js';
+import { mintPcConsole } from './mintPcConsole.js';
 import { runNewsPoll } from './newsPoll.js';
 import {
   ADMIN_JOB_IDS,
@@ -546,6 +547,35 @@ export default {
         return json({ ok: true, ...result });
       } catch (err) {
         logger.error('dead-url-sweep failed', { error: String(err) });
+        return json({ ok: false, error: String(err) }, 500);
+      }
+    }
+
+    // POST /admin/mint-pc-console — mint canonical set+products rows from a PriceCharting-only
+    // console's unmatched map rows (Chinese Gem Packs are the archetype; see mintPcConsole.ts).
+    // Body { console_name, game (PC category, e.g. 'pokemon-cards'), set_code?, set_name? }.
+    // BLOCKING + idempotent (returns the mint counts so the operator can audit each run).
+    // Writes NO product_images row — the documented PC-mint carve-out; art arrives later via
+    // the Content admin per-product image upload.
+    if (pathname === '/admin/mint-pc-console' && request.method === 'POST') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      const body = await request.json().catch(() => ({})) as {
+        console_name?: string; game?: string; set_code?: string; set_name?: string;
+      };
+      if (!body.console_name?.trim() || !body.game?.trim()) {
+        return json({ ok: false, error: 'console_name and game (PC category) are required' }, 400);
+      }
+      try {
+        const result = await mintPcConsole(env, {
+          gameCategory: body.game, consoleName: body.console_name,
+          setCode: body.set_code ?? null, setName: body.set_name ?? null,
+        });
+        return json(result, result.ok ? 200 : 400);
+      } catch (err) {
+        logger.error('mint-pc-console failed', { error: String(err), console: body.console_name });
         return json({ ok: false, error: String(err) }, 500);
       }
     }

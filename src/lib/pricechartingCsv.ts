@@ -217,26 +217,42 @@ export function cleanNumber(n: unknown): string {
  * VALIDATE a tcg-id join: the CSV `product-name` (name + number) must share enough with
  * the canonical product to confirm the TCGPlayer-id join is the right card — a guard
  * against a tcg-id that means something other than the TCGPlayer product id, or stale
- * id reuse. Requires every length≥3 token of the canonical name to appear in the CSV
- * product-name + console-name haystack. PURE.
+ * id reuse. PURE.
  *
- * Deliberately lenient on punctuation/number formatting (PriceCharting writes names
- * differently than the canonical catalogue) but strict on the name tokens, which is what
- * actually discriminates a wrong join.
+ * Parenthetical-aware (2026-07-15, DIAGNOSTIC_DON_AND_GEMPACK A3): PriceCharting
+ * routinely omits our parenthetical qualifiers (canonical "DON!! Card (Gol.D.Roger)
+ * (Gold)" appears on PC as "DON!! Card [Gold Alternate Art]" — `roger` never in the
+ * haystack), so requiring EVERY canonical token rejected 33 rows whose tcg-id was
+ * CORRECT. The rule now splits the canonical name:
+ *   - BASE tokens (outside parentheses) — ALL must appear in the PC product-name +
+ *     console-name haystack (unchanged strictness: this is what discriminates a
+ *     wrong join — a different card's name never matches).
+ *   - PARENTHETICAL qualifier tokens — a MAJORITY (≥ half) must appear. Losing one
+ *     omitted qualifier no longer kills a correct id, but a candidate whose
+ *     qualifiers are mostly absent (a different variant / wrong card) still fails.
+ * Names without parentheses behave exactly as before (all tokens required).
+ * (Chosen over plain reverse containment, which fails the motivating case: PC's own
+ * bracket qualifiers — "alternate art" — are absent from the canonical name.)
  */
 export function validateTcgIdMatch(
   csvRow: { 'product-name'?: string; 'console-name'?: string },
   canonical: { name?: string | null },
 ): boolean {
-  const canonName = norm(canonical?.name)
-  if (!canonName) return false
-  const tokens = canonName.split(' ').filter((t) => t.length >= 3)
-  if (tokens.length === 0) {
+  const rawName = String(canonical?.name ?? '')
+  if (!norm(rawName)) return false
+  const baseTokens = norm(rawName.replace(/\([^)]*\)/g, ' ')).split(' ').filter((t) => t.length >= 3)
+  const qualTokens = norm((rawName.match(/\(([^)]*)\)/g) ?? []).join(' ')).split(' ').filter((t) => t.length >= 3)
+  if (baseTokens.length === 0 && qualTokens.length === 0) {
     // Pure short/numeric name (rare) — accept; the tcg-id itself is strong evidence.
     return true
   }
   const hay = `${norm(csvRow?.['product-name'])} ${norm(csvRow?.['console-name'])}`.trim()
-  return tokens.every((t) => hay.includes(t))
+  if (!baseTokens.every((t) => hay.includes(t))) return false
+  if (qualTokens.length > 0) {
+    const hits = qualTokens.filter((t) => hay.includes(t)).length
+    return hits * 2 >= qualTokens.length
+  }
+  return true
 }
 
 export interface FuzzyCandidate { id: number; name: string | null; number: string | null }
@@ -280,4 +296,59 @@ export function pickBestCanonicalMatch(
     if (best == null || score > best.score) best = { id: c.id, score }
   }
   return best && best.score >= 5 ? best.id : null
+}
+
+// ── Number-less matching (2026-07-15, DIAGNOSTIC_DON_AND_GEMPACK A2) ─────────────
+
+/** A number-less canonical candidate (products.number NULL/empty, product_kind='card'),
+ * carrying its set name for console↔set corroboration. */
+export interface NumberlessCandidate { id: number; name: string | null; setName: string | null }
+
+/**
+ * Match a PC CSV row that carries NO digit token in its product-name (so the numeric
+ * fuzzy rung structurally can't fire) against the number-less canonical candidate pool
+ * (One Piece DON!!s are the archetype: 239/242 have `number` NULL by Bandai design). PURE.
+ *
+ * Mirrors the on-demand API path's set-corroboration rung (pricechartingClient.ts
+ * pickBestPcMatch `setHit`), tightened for the bulk path:
+ *   - ALL canonical name tokens (≥3 chars, pure-numeric excluded — the same definition
+ *     pickBestCanonicalMatch uses; the real Dodgers canonical is "DON!! Card (LA Dodgers
+ *     2026 Promo)" and PC never carries the `2026`) must appear in the PC product-name +
+ *     console-name haystack (discriminates variants: a non-"Dodgers" print lacks the
+ *     `dodgers` token), AND
+ *   - console↔set corroboration: at least one canonical set-name token appears in the
+ *     PC console-name, or vice versa (bidirectional so "Promo" ⊂ "Promotion Cards"
+ *     corroborates either way), AND
+ *   - the accepting candidate is UNIQUE — two candidates passing both gates is
+ *     ambiguous and returns null. Name alone never settles anything; the worst case
+ *     stays "unmatched", never "wrong price".
+ */
+export function pickNumberlessCanonicalMatch(
+  csvRow: { 'product-name'?: string; 'console-name'?: string },
+  candidates: NumberlessCandidate[],
+): number | null {
+  if (!Array.isArray(candidates) || candidates.length === 0) return null
+  const pcName = norm(csvRow?.['product-name'])
+  const pcConsole = norm(csvRow?.['console-name'])
+  if (!pcName) return null
+  const hay = `${pcName} ${pcConsole}`.trim()
+  const consoleTokens = pcConsole.split(' ').filter((t) => t.length >= 3)
+
+  let acceptedId: number | null = null
+  for (const c of candidates) {
+    const candName = norm(c?.name)
+    if (!candName) continue
+    const nameTokens = candName.split(' ').filter((t) => t.length >= 3 && !/^\d+$/.test(t))
+    if (nameTokens.length === 0) continue
+    if (!nameTokens.every((t) => hay.includes(t))) continue
+    const setNorm = norm(c?.setName)
+    const setTokens = setNorm.split(' ').filter((t) => t.length >= 3)
+    const setHit =
+      (setTokens.length > 0 && setTokens.some((t) => pcConsole.includes(t))) ||
+      (consoleTokens.length > 0 && setNorm.length > 0 && consoleTokens.some((t) => setNorm.includes(t)))
+    if (!setHit) continue
+    if (acceptedId != null && acceptedId !== c.id) return null   // ambiguous → unmatched
+    acceptedId = c.id
+  }
+  return acceptedId
 }

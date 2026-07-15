@@ -41,7 +41,7 @@ import { variantFinish, tcgProductIdOf } from './lib/variantCapture.js'
 // JP card never rides the English slug. See lib/gameNames.ts (the drift anchor).
 import { GAME_SLUG_BY_CANONICAL_NAME } from './lib/gameNames.js'
 
-const BATCH_SIZE          = 90    // D1 binds <= 100 params/statement; the prices upsert binds 21, batch by statement count
+const BATCH_SIZE          = 90    // D1 binds <= 100 params/statement; the prices upsert binds 22, batch by statement count
 const LISTINGS_RETENTION_DAYS = 180
 const HISTORY_RETENTION_DAYS  = 365
 
@@ -116,6 +116,7 @@ export interface ParsedPriceRow {
   is_signed:    number
   is_error:     number
   is_perfect:   number
+  is_graded:    number          // 1 ⇔ price.type === 'graded' — positive write-time classification (mig 0099)
   value:        number | null   // market
   low:          number | null
   mid:          number | null
@@ -151,14 +152,14 @@ export function parseCardPrices(card: unknown): ParsedPriceRow[] {
         const label    = company && gradeNum ? `${company} ${gradeNum}` : (price?.condition ?? null)
         if (!label) continue   // a graded row with no resolvable grade label is unusable
         out.push({
-          ...base, condition: null, grade: label, company,
+          ...base, condition: null, grade: label, company, is_graded: 1,
           is_signed: flag(price?.is_signed), is_error: flag(price?.is_error), is_perfect: flag(price?.is_perfect),
         })
       } else {
         // raw (ungraded) tier
         const cond = price?.condition ? String(price.condition).trim().toUpperCase() : null
         out.push({
-          ...base, condition: cond, grade: null, company: null,
+          ...base, condition: cond, grade: null, company: null, is_graded: 0,
           is_signed: 0, is_error: 0, is_perfect: 0,
         })
       }
@@ -334,12 +335,13 @@ export function parsePriceHistory(resp: unknown): ParsedHistoryPoint[] {
 const ENRICH_PRICE_SQL = `
   INSERT INTO prices
     (product_id, source, condition, finish, grade, value, low, mid, high, variant, company,
-     is_signed, is_error, is_perfect, trend_1d, trend_7d, trend_14d, trend_30d, trend_90d, trend_180d, trends_json, fetched_at)
-  VALUES (?, 'scrydex', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+     is_signed, is_error, is_perfect, is_graded, trend_1d, trend_7d, trend_14d, trend_30d, trend_90d, trend_180d, trends_json, fetched_at)
+  VALUES (?, 'scrydex', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
   ON CONFLICT (product_id, source, COALESCE(condition,''), COALESCE(finish,''), COALESCE(grade,''),
                COALESCE(variant,''), COALESCE(company,''), is_signed, is_error, is_perfect)
   DO UPDATE SET
     value = excluded.value, low = excluded.low, mid = excluded.mid, high = excluded.high,
+    is_graded = excluded.is_graded,
     trend_1d = excluded.trend_1d, trend_7d = excluded.trend_7d, trend_14d = excluded.trend_14d,
     trend_30d = excluded.trend_30d, trend_90d = excluded.trend_90d, trend_180d = excluded.trend_180d,
     trends_json = excluded.trends_json, fetched_at = excluded.fetched_at`
@@ -374,7 +376,7 @@ const HISTORY_UPSERT_SQL = `
 function priceUpsert(db: D1Database, productId: number, r: ParsedPriceRow): D1PreparedStatement {
   return db.prepare(ENRICH_PRICE_SQL).bind(
     productId, r.condition, r.finish, r.grade, r.value, r.low, r.mid, r.high, r.variant, r.company,
-    r.is_signed, r.is_error, r.is_perfect,
+    r.is_signed, r.is_error, r.is_perfect, r.is_graded,
     r.trends.trend_1d, r.trends.trend_7d, r.trends.trend_14d, r.trends.trend_30d, r.trends.trend_90d, r.trends.trend_180d,
     r.trends.trends_json,
   )

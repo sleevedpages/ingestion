@@ -9,6 +9,7 @@ import {
   csvRowToPriceRows,
   validateTcgIdMatch,
   pickBestCanonicalMatch,
+  pickNumberlessCanonicalMatch,
   PC_PRICE_COLUMNS,
   PC_GRADED_COLUMNS,
   PRICECHARTING_CATEGORIES,
@@ -194,6 +195,75 @@ describe('validateTcgIdMatch', () => {
       { 'product-name': 'Pikachu #25', 'console-name': 'Pokemon Base' },
       { name: 'Charizard ex' },
     )).toBe(false)
+  })
+
+  // Parenthetical-aware softening (2026-07-15) — the 33-row DON shape: PriceCharting omits
+  // our parenthetical qualifiers, so a CORRECT tcg-id used to be rejected on one missing token.
+  it('accepts the real Gol.D.Roger case (correct id; PC omits `roger`, majority of qualifiers hit)', () => {
+    // pc 11018417 → canonical 118759 "DON!! Card (Gol.D.Roger) (Gold)": qualifiers
+    // {gol, roger, gold} — gol + gold present (gol ⊂ gold), roger absent → 2/3 majority → accept.
+    expect(validateTcgIdMatch(
+      { 'product-name': 'DON!! Card [Gold Alternate Art]', 'console-name': 'One Piece Carrying on His Will' },
+      { name: 'DON!! Card (Gol.D.Roger) (Gold)' },
+    )).toBe(true)
+  })
+  it('still rejects a WRONG tcg-id (different card entirely — base name absent)', () => {
+    expect(validateTcgIdMatch(
+      { 'product-name': 'Pikachu #25', 'console-name': 'Pokemon Base' },
+      { name: 'DON!! Card (Gol.D.Roger) (Gold)' },
+    )).toBe(false)
+  })
+  it('still rejects a wrong DON VARIANT (base matches but qualifiers mostly absent)', () => {
+    expect(validateTcgIdMatch(
+      { 'product-name': 'DON!! Card [Gold Alternate Art]', 'console-name': 'One Piece Carrying on His Will' },
+      { name: 'DON!! Card (Monkey.D.Luffy) (Vol. 7)' },   // qualifiers {monkey, luffy, vol}: 0/3
+    )).toBe(false)
+  })
+  it('names WITHOUT parentheses keep the original all-tokens rule', () => {
+    expect(validateTcgIdMatch(
+      { 'product-name': 'Charizard #4', 'console-name': 'Pokemon Base' },
+      { name: 'Dark Charizard' },   // `dark` missing → still a full-strictness reject
+    )).toBe(false)
+  })
+})
+
+// ── number-less set-corroborated matcher (2026-07-15, DON!! rung) ────────────────
+describe('pickNumberlessCanonicalMatch', () => {
+  // The highest-velocity unmatched DON on PriceCharting (pc 13256449, sales 4,920/yr).
+  const dodgersRow = { 'product-name': 'DON!! Card [Dodgers]', 'console-name': 'One Piece Promo' }
+  const dodgersCand = { id: 30, name: 'DON!! Card (Dodgers)', setName: 'One Piece Promotion Cards' }
+
+  it('accepts on all-name-tokens + console↔set corroboration (Dodgers DON)', () => {
+    expect(pickNumberlessCanonicalMatch(dodgersRow, [dodgersCand])).toBe(30)
+  })
+  it('accepts the REAL prod canonical row (pure-numeric tokens excluded, like the numeric matcher)', () => {
+    // Verified in prod 2026-07-15: canonical 6650780 "DON!! Card (LA Dodgers 2026 Promo)"
+    // (number NULL, rarity DON!!, set "One Piece Promotion Cards") IS present — pc 13256449
+    // must match it. `la` (<3 chars) and `2026` (pure-numeric) are excluded from the token set.
+    expect(pickNumberlessCanonicalMatch(dodgersRow, [
+      { id: 6650780, name: 'DON!! Card (LA Dodgers 2026 Promo)', setName: 'One Piece Promotion Cards' },
+    ])).toBe(6650780)
+  })
+  it('rejects when a canonical name token is missing from the haystack (variant discrimination)', () => {
+    // A plain "DON!! Card" PC row must not capture the Dodgers variant (`dodgers` absent).
+    expect(pickNumberlessCanonicalMatch(
+      { 'product-name': 'DON!! Card', 'console-name': 'One Piece Promo' },
+      [dodgersCand],
+    )).toBeNull()
+  })
+  it('rejects on name alone — console↔set corroboration is mandatory', () => {
+    expect(pickNumberlessCanonicalMatch(dodgersRow, [
+      { id: 31, name: 'DON!! Card (Dodgers)', setName: 'Starter Deck 01' },   // wrong set
+    ])).toBeNull()
+  })
+  it('returns null when TWO candidates both accept (ambiguity → unmatched, never a guess)', () => {
+    expect(pickNumberlessCanonicalMatch(dodgersRow, [
+      dodgersCand,
+      { id: 99, name: 'DON!! Card (Dodgers)', setName: 'One Piece Promotion Cards' },
+    ])).toBeNull()
+  })
+  it('returns null for empty candidate pools', () => {
+    expect(pickNumberlessCanonicalMatch(dodgersRow, [])).toBeNull()
   })
 })
 
