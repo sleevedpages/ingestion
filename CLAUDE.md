@@ -88,6 +88,8 @@ src/
 
 scripts/
   mirror-local.mjs    # Fetches images from local IP → uploads to Worker → R2
+  mint-gem-packs.mjs  # Runbook for POST /admin/mint-pc-console: mints the 5 Gem Pack consoles (or --console <any>), prints the rollback map; --process enqueues the pokemon+one-piece re-PROCESS. Needs INGESTION_WORKER_SECRET env (never hardcoded).
+  update-prices.mjs   # On-demand price ingest: PROCESS the cached R2 CSVs (default all 4 categories; --category a,b to scope; --sync = one inline window with match counts incl. numberless/pre-stamped; --fetch = fresh download, cooldown-aware → falls back to cached on 429). Safe + idempotent.
 
 db/migrations/
   001_initial.sql             # Core schema: tcg_categories, tcg_sets, tcg_products, tcg_prices, tcg_sync_log
@@ -144,7 +146,8 @@ The `0 3 * * SUN` and `0 4 * * *` (Scrydex) crons are not registered in the UAT 
 | `GET` | `/tcggo/artists/:artistId/cards?cardsCount=` | `x-worker-secret` | Paginates **ALL** of an artist's cards (bounded by cards_count / short final page / 40-page free-tier cap) → `{ ok, artistId, count, cards:[{name,card_number,rarity,episode,image,tcgplayer_id,tcgid}], requests }`. Content maps these → canonical products + mints an owned template binder. |
 | `POST` | `/admin/purge-placeholder-mirrors` | `x-worker-secret` | **CARD-BACK CLEANUP SWEEP** (2026-07-08). Body `{ cursor?, limit? }`. **Synchronous + cursor-based** (NOT fire-and-forget): runs ONE bounded batch and returns `{ ok, scanned, purged, repaired, remaining, hasMore, cursorNext }`; the caller loops (pass `cursorNext` back as `cursor`) until `hasMore:false` — same loop shape as bulk-enrich / FETCH-PROCESS. Reads each `product_images.r2_url` object straight from R2, SHA-256s it, and on a `PLACEHOLDER_IMAGE_HASHES` match deletes the R2 object + repairs the row (source_url → reconstructed TCGplayer `_in_1000x1000`, r2_url/mirrored_at → NULL, source → NULL). Data changes are regenerable (rows self-repair on the next mirror), never destructive. Loop it with `scripts/purge-placeholder-mirrors.mjs`, or the Content admin panel's "Purge card-back placeholders" card. See **Card-back placeholder guard** below. |
 | `POST` | `/admin/dead-url-sweep` | `x-worker-secret` | **WP-6 DEAD SOURCE_URL SWEEP** (2026-07-08, audit IMG-7). Body `{ cursor?, limit? }`. **Synchronous + cursor-based**, same shape as purge-placeholder-mirrors: `{ ok, scanned, alive, dead, repaired, remaining, hasMore, cursorNext }`. Manual-trigger only — **no cron**. Probes `product_images` rows with NO `r2_url` (source_url is their only serving path) and hashes every response (a bare 200 isn't proof of life — Scrydex serves its card-back placeholder at 200); a placeholder match repairs via the SAME `tcgplayerPlaceholderFallback` path the mirror uses; a plain-dead probe (non-2xx/network error/empty body) marks the row via the EXISTING `mirror_attempts`/`mirror_last_attempt_at` bookkeeping (mig 0086) — no new column. `src/deadSourceUrlSweep.ts`. See **Dead source_url sweep (WP-6)** below. |
-| `POST` | `/admin/mint-pc-console` | `x-worker-secret` | **PC-CONSOLE MINT JOB** (2026-07-15, DIAGNOSTIC_DON_AND_GEMPACK B). Body `{ console_name, game (PC category e.g. 'pokemon-cards'), set_code?, set_name? }`. Mints ONE canonical `sets` row (game_id = the canonical game spine row; NO tcgplayer_group_id) + `products` rows from the console's still-unmatched `pricecharting_products` rows (name+`#NNN` parsed from product_name; genre/`Booster Box|Pack`-shaped → `product_kind='sealed'`; NO external ids), then stamps `canonical_product_id` + `match_method='minted'` so the next daily PROCESS writes prices with ZERO write-path changes (the matcher skips stamped rows). **Writes NO `product_images` row — the documented PC-mint image carve-out**; art arrives via the Content admin per-product upload. BLOCKING + IDEMPOTENT (upserts by set `(game_id,name)` / product `(set_id,name,number)`; re-run = no dupes; returns counts + the minted `productIds` range for rollback). Archetype: the 5 Chinese Gem Pack consoles (CBB1C–CBB5C); the one-piece/yugioh unmatched pools are future candidates. `src/mintPcConsole.ts`; tests `src/mintPcConsole.test.ts`. |
+| `POST` | `/admin/scrydex-image-repair` | `x-worker-secret` | **BANDAI IMAGE REPAIR** (2026-07-17, WP-1 re-scoped). Body `{ cursor? }`. **Synchronous + cursor-based**: re-syncs Scrydex art (+prices, force) for ONE mapped set of a `'scrydex'`-preferred game (mig 0104 — One Piece, Gundam) per call via `syncSingleSet`, → `{ ok, set?, setsRepaired, imagesUpdated, requests, remaining, hasMore, cursorNext, creditLimited? }`; the Content admin panel loops (CursorLoopCard "Bandai Scrydex image repair"). Repairs the pre-2026-07-07 TCGCSV clobber damage (watermarked TCGPlayer SAMPLE art). Idempotent; credit-guarded (a guard trip → 503 `creditLimited:true` WITHOUT advancing the cursor). Unmapped sets untouched (manual-image residual). `src/scrydexImageRepair.ts`; tests `src/scrydexImageRepair.test.ts`. |
+| `POST` | `/admin/mint-pc-console` | `x-worker-secret` | **PC-CONSOLE MINT JOB** (2026-07-15, DIAGNOSTIC_DON_AND_GEMPACK B). Body `{ console_name, game (PC category e.g. 'pokemon-cards'), set_code?, set_name? }`. Mints ONE canonical `sets` row (game_id = the canonical game spine row; NO tcgplayer_group_id) + `products` rows from the console's still-unmatched `pricecharting_products` rows (name+`#NNN` parsed from product_name; genre/`Booster Box|Pack`-shaped → `product_kind='sealed'`; NO external ids), then stamps `canonical_product_id` + `match_method='minted'` so the next daily PROCESS writes prices with ZERO write-path changes (the matcher skips stamped rows). **Writes NO `product_images` row — the documented PC-mint image carve-out**; art arrives via the Content admin per-product upload. BLOCKING + IDEMPOTENT (upserts by set `(game_id,name)` / product `(set_id,name,number)`; re-run = no dupes; returns counts + the minted `productIds` range for rollback). Archetype: the 5 Chinese Gem Pack consoles (CBB1C–CBB5C); the one-piece/yugioh unmatched pools are future candidates. `src/mintPcConsole.ts`; tests `src/mintPcConsole.test.ts`. **Runbook: `node scripts/mint-gem-packs.mjs`** (all five + rollback map; `--process` chains the re-PROCESS; `--url` for UAT). |
 | `POST` | `/admin/run-job` | `x-worker-secret` | **MANUAL CRON-JOB TRIGGER** (2026-06-19). Body `{ job: 'tcg-sync'\|'image-mirror'\|'scrydex-drain'\|'pricecharting-csv'\|'pricecharting-download', force? }`. Runs the SAME function the matching cron calls (`src/adminJobs.ts`), **fire-and-forget via `waitUntil`** → `{ ok, job, started:true, category? }`. Per-job prereqs: scrydex-drain needs Scrydex keys → 503; **pricecharting-download** (the ONLY download) needs `PRICECHARTING_TOKEN` → 503; **pricecharting-csv** PROCESSes the cached R2 file (no token, no download); image-mirror runs without Scrydex keys. **Double-fire guard:** best-effort KV lock `ingestion_job_lock:{job}` (shared `SLEEVEDPAGES_KV`) → **409** `{alreadyRunning:true}`. **pricecharting-download extra guard:** a download cooldown `ingestion_pc_csv_cooldown` (~10 min, set by ANY download — manual or cron) → **429** `{cooldown:true, retryAfterSec}` (PriceCharting CSV download is hard rate-limited ~1/10min, abuse → account revocation). `pricecharting-csv` (re-process) is NOT cooldown-gated — unlimited + safe. Content proxies this **admin-only** via `POST /api/admin/ingestion/trigger`; status via `GET /api/admin/ingestion/jobs`. See **Manual Cron-Job Triggers** below. |
 
 Scrydex endpoints are called from the Admin panel via Content app proxy (`POST /api/admin/scrydex/trigger`). Direct calls require `x-worker-secret: <INGESTION_WORKER_SECRET>` header.
@@ -514,11 +517,30 @@ Scrydex expansion id (e.g. `OP09`, `GD04`), which is what `q=expansion.id:` matc
   the daily refresh for every other card in the set). Content gates it (vendor access + ownership + 1/hour
   rate limit) and proxies here. See Content/CLAUDE.md.
 
+### Per-game image source preference (mig 0104 — WP-1 RE-SCOPED, operator decision 2026-07-17)
+- **TCGPlayer/TCGCSV is the PREFERRED image source platform-wide** (higher res, full set
+  coverage); the **Bandai-published games (One Piece, Gundam) are `'scrydex'`-preferred** —
+  TCGPlayer's card art there carries a customer-facing SAMPLE watermark. The flag is
+  `tcg_supported_games.image_source_preference` ('tcgplayer' default | 'scrydex'), edited in
+  Content Admin → Supported Games — **a future Bandai title is one config row, no deploy**.
+- The TCGCSV writer (`upsertProductSourceImages` → `sourceUrlUpsertByProductId(..., preference)`)
+  consults it per group message (`tcgLabel` → `lib/imagePreference.ts`): 'scrydex' games go
+  through `SOURCE_URL_PRECEDENCE_CASE` (stored Scrydex url PRESERVED; NULL still filled — a
+  watermarked image beats no image); 'tcgplayer' games plainly overwrite (TCGCSV wins BY DESIGN —
+  do not "protect" Scrydex urls for them). JS spec: `resolveSourceUrl(existing, incoming, pref)`.
+- `syncScrydexImages()` (cron path, no `game` arg) processes **ONLY 'scrydex'-preferred games**
+  — writing Scrydex urls for tcgplayer-preferred games is pointless (the daily sync overwrites
+  them) and was the credit/budget sink that starved the stage before it ever reached the Bandai
+  sets (2026-07-12: 435 credits on Magic/Pokémon, invocation killed, 0 Bandai sets written). An
+  explicit `game` argument (manual `/scrydex/sync-images`) bypasses the filter.
+- Mig 0104 is **BLOCKING for the worker deploy** (the worker reads the column; fail-closed).
+
 ### Image Sync
 - `syncScrydexImages()` runs weekly AFTER the R2 mirror stage (WP-2 mirror-first order — the
   mirror consumes last week's URLs; this refreshes them for the next run); writes
-  `product_images.source_url`. Since WP-1, its Scrydex CDN urls SURVIVE the daily TCGCSV sync
-  (the `SOURCE_URL_PRECEDENCE_CASE` rule: scrydex > tcgplayer). Game keys come from the shared
+  `product_images.source_url`. Scope: **'scrydex'-preferred games only** (mig 0104 — see
+  "Per-game image source preference" above); their Scrydex CDN urls SURVIVE the daily TCGCSV
+  sync (`SOURCE_URL_PRECEDENCE_CASE`). Game keys come from the shared
   `lib/gameNames.ts` map (WP-3 — 'Lorcana TCG' + the full Riftbound name; 'Pokemon Japan' absent).
 - One Piece + Gundam: each variant has a unique TCGPlayer product_id → write `variant.images[front].large`
   keyed on the `tcgplayer_product_id` bridge (per-variant), AND capture `scrydex_card_id`/
@@ -678,10 +700,24 @@ cron and looping to finish tripped the limit. Now:
   (operator-confirmed 2026-06-19). The FETCH/PROCESS split above means this download happens **at most once
   per category per day** (the cron, or an explicit cooldown-gated `POST /pricecharting/fetch`); processing
   the cached file never re-downloads. The cron pulls **ONE category per run, rotated by day** (4-day cycle).
-- **Format: TAB-separated** (operator-confirmed) with **unquoted thousands commas** in the dollar fields
-  (`$2,200.00`) and trailing spaces. The parser **auto-detects the delimiter** from the header
-  (`detectDelimiter` — tab vs comma) so a comma split never shreds a priced row; `parseDollarsToCents`
-  strips `$`/`,`/space. `tcg-id` = the TCGPlayer product id; `genre`="Sealed Product" flags sealed.
+- **Format — BOTH shapes observed; the parser auto-detects** (`detectDelimiter`, tab vs comma) so
+  neither shreds a priced row. The operator's 2026-06 sample was TAB-separated with unquoted
+  thousands commas (`$2,200.00 `, trailing spaces); the LIVE downloads (verified from the cached R2
+  files, all 4 categories, 2026-07-15) are **COMMA-separated, RFC-quoted, with NO thousands
+  separators** (`$2050.00`). `parseDollarsToCents` strips `$`/`,`/space either way. `tcg-id` = the
+  TCGPlayer product id — but is OCCASIONALLY a full `tcgplayer.com/product/...` URL instead of the
+  numeric id (junk rows; `Number()` → NaN → the row safely falls through to the fuzzy/number-less
+  rungs). `genre`="Sealed Product" flags sealed.
+- **Verified column list (B3-pre checkpoint, 2026-07-15 — IDENTICAL across all 4 categories; NO
+  image column exists,** which is the primary-data justification for the PC-mint manual-image
+  posture): `id, console-name, product-name, loose-price, cib-price, new-price, graded-price,
+  box-only-price, manual-only-price, bgs-10-price, condition-17-price, condition-18-price,
+  gamestop-price, gamestop-trade-price, retail-loose-buy, retail-loose-sell, retail-cib-buy,
+  retail-cib-sell, retail-new-buy, retail-new-sell, upc, sales-volume, genre, tcg-id, asin, epid,
+  release-date`. We CONSUME: id, console-name, product-name, genre, tcg-id, sales-volume,
+  loose-price + the 8 graded buckets (cib/new/graded/box-only/manual-only/bgs-10/condition-17/
+  condition-18) + retail-loose-buy/sell. NOT consumed: gamestop-*, retail-cib-*, retail-new-*,
+  upc, asin, epid, release-date.
 - **CSV prices are DOLLAR strings** ("$46.47", "$2,200.00") — parse → integer cents (exact) → store
   **dollars** in canonical `prices.value` (matches the scrydex/tcgplayer rows the serving reads;
   `value` is dollars, NOT cents, despite the /api JSON returning pennies).

@@ -39,7 +39,7 @@ const row = (over: Record<string, unknown> = {}) => ({
 describe('upsertProductSourceImages — TCGPlayer image url -> product_images.source_url', () => {
   it('writes a source_url upsert per product that has an image_url', async () => {
     const db = makeFakeDB()
-    await upsertProductSourceImages(db as any, [row({ tcgplayer_product_id: 1 }), row({ tcgplayer_product_id: 2 })])
+    await upsertProductSourceImages(db as any, [row({ tcgplayer_product_id: 1 }), row({ tcgplayer_product_id: 2 })], 'tcgplayer')
     expect(db._batched).toHaveLength(2)
     // Targets product_images via INSERT ... SELECT FROM products (resolves products.id),
     // and source is bound NULL (pre-mirror, stays mirror-eligible).
@@ -52,13 +52,13 @@ describe('upsertProductSourceImages — TCGPlayer image url -> product_images.so
 
   it('skips products with no image_url (no source to mirror)', async () => {
     const db = makeFakeDB()
-    await upsertProductSourceImages(db as any, [row({ image_url: null }), row({ image_url: '' })])
+    await upsertProductSourceImages(db as any, [row({ image_url: null }), row({ image_url: '' })], 'tcgplayer')
     expect(db._batched).toHaveLength(0)
   })
 
   it('is a no-op for an empty list', async () => {
     const db = makeFakeDB()
-    await upsertProductSourceImages(db as any, [])
+    await upsertProductSourceImages(db as any, [], 'tcgplayer')
     expect(db._batched).toHaveLength(0)
   })
 })

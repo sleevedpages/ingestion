@@ -5,6 +5,7 @@ import { fetchGroups } from './sets.js';
 import { fetchGroupData } from './products.js';
 import { transformCategory, transformGroup, transformGroupData } from './transformer.js';
 import { loadPriceConfig } from './price-config.js';
+import { loadImagePreferences, preferenceForLabel } from '../lib/imagePreference.js';
 import {
   upsertCategory,
   upsertSetsBatch,
@@ -330,8 +331,15 @@ async function processGroupInline(
   // external id directly and could run in parallel — canonical cannot).
   const productsUpserted = await upsertProducts(config.db, productRows);
   // Relocate the TCGPlayer original image url into product_images.source_url (the old
-  // tcg_products.image_url write) so the R2 mirror has a source to fetch.
-  await upsertProductSourceImages(config.db, productRows);
+  // tcg_products.image_url write) so the R2 mirror has a source to fetch. The write
+  // consults the game's image_source_preference (mig 0104, keyed by the message's
+  // tcgLabel): 'scrydex'-preferred (Bandai) games PRESERVE stored Scrydex art.
+  const preferences = await loadImagePreferences(config.db);
+  await upsertProductSourceImages(
+    config.db,
+    productRows,
+    preferenceForLabel(preferences, message.tcgLabel)
+  );
   const pricesUpserted = await upsertPrices(config.db, priceRows);
 
   return { productsUpserted, pricesUpserted };

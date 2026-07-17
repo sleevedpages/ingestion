@@ -18,19 +18,34 @@
  * versa). `source` is COALESCE-preserved on the source_url paths so a NULL source
  * (the all-other-games card-level path) never nulls an existing source.
  *
- * SOURCE_URL PRECEDENCE (WP-1, audit IMG-2 — the daily-TCGCSV-clobber fix):
- * source_url writes resolve through ONE precedence rule (scrydex > tcgplayer),
- * encoded once in SOURCE_URL_PRECEDENCE_CASE below and mirrored 1:1 by the pure
- * resolveSourceUrl() (the unit-tested spec). An incoming URL replaces the stored
- * one ONLY when it doesn't lose quality:
- *   1. an incoming Scrydex-CDN URL always wins (highest-quality per-variant art;
- *      a Scrydex→Scrydex refresh is also allowed through);
- *   2. an empty/NULL stored URL is always filled;
- *   3. a stored TCGPlayer-CDN URL may be replaced by anything (lowest rank);
- *   4. otherwise the stored URL is PRESERVED — the daily TCGCSV sync (which only
- *      ever carries tcgplayer-cdn URLs) can never clobber a Scrydex CDN URL again.
- * Do NOT re-inline `source_url = excluded.source_url` in any writer.
+ * SOURCE_URL PRECEDENCE (WP-1, audit IMG-2; RE-SCOPED per-game 2026-07-17):
+ * source_url writes resolve through the per-game image_source_preference flag
+ * (tcg_supported_games, Content migration 0104 — operator decision 2026-07-17):
+ *
+ *   'scrydex' (Bandai games — One Piece, Gundam; TCGPlayer art carries a
+ *   customer-facing SAMPLE watermark there): SOURCE_URL_PRECEDENCE_CASE below,
+ *   mirrored 1:1 by the pure resolveSourceUrl() (the unit-tested spec). An
+ *   incoming URL replaces the stored one ONLY when it doesn't lose quality:
+ *     1. an incoming Scrydex-CDN URL always wins (highest-quality per-variant
+ *        art; a Scrydex→Scrydex refresh is also allowed through);
+ *     2. an empty/NULL stored URL is always filled (a watermarked TCGPlayer
+ *        image beats no image);
+ *     3. a stored TCGPlayer-CDN URL may be replaced by anything (lowest rank);
+ *     4. otherwise the stored URL is PRESERVED — the daily TCGCSV sync (which
+ *        only ever carries tcgplayer-cdn URLs) can never clobber Scrydex art.
+ *
+ *   'tcgplayer' (every other game — the platform-wide default; higher-res, full
+ *   set coverage): the incoming URL plainly overwrites. TCGCSV wins by design —
+ *   do NOT "protect" Scrydex urls for these games; the operator prefers
+ *   TCGPlayer art there, and the weekly Scrydex image sync skips them entirely.
+ *
+ * Scrydex-side writers (image sync / variant capture / per-set sync) always use
+ * the 'scrydex' CASE — they only run for scrydex-preferred games (plus explicit
+ * manual per-set syncs). Only the TCGCSV writer consults the flag.
+ * Never hand-roll `source_url = ...` in a writer — go through these helpers.
  */
+
+export type ImageSourcePreference = 'tcgplayer' | 'scrydex'
 
 // Host fragments used to rank a source_url. Kept as plain substrings so the SQL
 // LIKE patterns and the JS mirror classify identically.
@@ -48,11 +63,16 @@ export function isTcgplayerCdnUrl(url: string | null | undefined): boolean {
 }
 
 /**
- * Pure JS mirror of SOURCE_URL_PRECEDENCE_CASE — the testable spec of the
- * precedence rule. Returns the url the row should hold after an upsert of
- * `incoming` over `existing`. Keep in exact step with the SQL fragment.
+ * Pure JS mirror of the per-preference conflict SQL — the testable spec.
+ * Returns the url the row should hold after an upsert of `incoming` over
+ * `existing`. Keep in exact step with the SQL fragments.
  */
-export function resolveSourceUrl(existing: string | null | undefined, incoming: string): string {
+export function resolveSourceUrl(
+  existing:   string | null | undefined,
+  incoming:   string,
+  preference: ImageSourcePreference = 'scrydex',
+): string {
+  if (preference === 'tcgplayer')        return incoming   // TCGCSV wins by policy
   if (isScrydexImageUrl(incoming))       return incoming   // scrydex always wins
   if (!existing || existing === '')      return incoming   // fill an empty slot
   if (isTcgplayerCdnUrl(existing))       return incoming   // tcgplayer is replaceable
@@ -87,14 +107,23 @@ const R2_PRESERVE_SOURCE_SQL = `
     r2_url      = excluded.r2_url,
     mirrored_at = excluded.mirrored_at`
 
+// The conflict expression for source_url, per game preference (mig 0104):
+// 'scrydex' → the WP-1 precedence CASE (Scrydex art protected);
+// 'tcgplayer' → plain overwrite (the operator-blessed TCGCSV-wins behavior).
+function sourceUrlConflictExpr(preference: ImageSourcePreference): string {
+  return preference === 'scrydex' ? SOURCE_URL_PRECEDENCE_CASE : 'excluded.source_url'
+}
+
 // Pre-mirror source_url write by TCGPlayer product id. `source` is COALESCE-preserved;
-// source_url resolves through the WP-1 precedence rule (scrydex > tcgplayer).
-const SOURCE_URL_BY_PID_SQL = `
+// source_url resolves per the game's image_source_preference (see header comment).
+function sourceUrlByPidSql(preference: ImageSourcePreference): string {
+  return `
   INSERT INTO product_images (product_id, source, source_url)
   SELECT id, ?, ? FROM products WHERE tcgplayer_product_id = ?
   ON CONFLICT (product_id) DO UPDATE SET
-    source_url = ${SOURCE_URL_PRECEDENCE_CASE},
+    source_url = ${sourceUrlConflictExpr(preference)},
     source     = COALESCE(excluded.source, product_images.source)`
+}
 
 // Pre-mirror source_url write by group + card number (card-level / fallback paths).
 // May match multiple product rows (variants sharing a number) — each upserts its own
@@ -135,14 +164,17 @@ export async function writeR2Image(
   await r2ImageUpsert(db, tcgProductId, r2Url, source).run()
 }
 
-/** Build a pre-mirror source_url upsert keyed by TCGPlayer product id. */
+/** Build a pre-mirror source_url upsert keyed by TCGPlayer product id.
+ *  `preference` defaults to 'scrydex' (the protective CASE) — the Scrydex-side
+ *  writers keep it; ONLY the TCGCSV writer passes the game's actual flag. */
 export function sourceUrlUpsertByProductId(
   db:           D1Database,
   tcgProductId: number,
   sourceUrl:    string,
   source:       'scrydex' | 'tcgplayer' | null,
+  preference:   ImageSourcePreference = 'scrydex',
 ): D1PreparedStatement {
-  return db.prepare(SOURCE_URL_BY_PID_SQL).bind(source, sourceUrl, tcgProductId)
+  return db.prepare(sourceUrlByPidSql(preference)).bind(source, sourceUrl, tcgProductId)
 }
 
 // Mirror-attempt bookkeeping (WP-2, audit IMG-4): every mirror attempt — success,

@@ -27,7 +27,7 @@ const arg = (name, dflt) => {
 
 const WORKER_URL = arg('--url', 'https://sleevedpages-ingestion.sleevedpages.workers.dev')
 const LIMIT = parseInt(arg('--limit', '100'), 10) || 100
-const WORKER_SECRET = '07187f62289de8634ddb384a1b466374ada4bc60ad0e6216cd90797a10c0cea7'
+const WORKER_SECRET = ''
 if (!WORKER_SECRET) {
   console.error("  ✗ INGESTION_WORKER_SECRET env var is required (matches the worker's secret).")
   process.exit(1)

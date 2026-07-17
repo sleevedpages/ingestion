@@ -22,6 +22,7 @@ import { PRICECHARTING_CATEGORIES, type PriceChartingCategory } from './lib/pric
 import { backfillR2ImageUrls, backfillVariantImages, seedVariantProducts } from './backfillR2Urls.js';
 import { purgePlaceholderMirrors } from './purgePlaceholderMirrors.js';
 import { sweepDeadSourceUrls } from './deadSourceUrlSweep.js';
+import { runScrydexImageRepairBatch } from './scrydexImageRepair.js';
 import { mintPcConsole } from './mintPcConsole.js';
 import { runNewsPoll } from './newsPoll.js';
 import {
@@ -547,6 +548,29 @@ export default {
         return json({ ok: true, ...result });
       } catch (err) {
         logger.error('dead-url-sweep failed', { error: String(err) });
+        return json({ ok: false, error: String(err) }, 500);
+      }
+    }
+
+    // POST /admin/scrydex-image-repair — Bandai image repair (WP-1 re-scoped, 2026-07-17).
+    // Re-syncs Scrydex art for ONE mapped set of a 'scrydex'-preferred game (mig 0104)
+    // per call via the existing per-set sync machinery (force:true), repairing the
+    // pre-WP-1 TCGCSV clobber damage (watermarked TCGPlayer art on One Piece/Gundam).
+    // SYNCHRONOUS + cursor-based: body { cursor? } → { ok, set?, hasMore, cursorNext,
+    // remaining, creditLimited? } — the admin panel loops (cursorNext back as cursor)
+    // until hasMore is false. Idempotent; credit-guarded; a guard trip does NOT
+    // advance the cursor. Manual-trigger only — no cron.
+    if (pathname === '/admin/scrydex-image-repair' && request.method === 'POST') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      const body = await request.json().catch(() => ({})) as { cursor?: number };
+      try {
+        const result = await runScrydexImageRepairBatch(env, body.cursor ?? 0);
+        return json(result, result.ok ? 200 : (result.creditLimited ? 503 : 500));
+      } catch (err) {
+        logger.error('scrydex-image-repair failed', { error: String(err) });
         return json({ ok: false, error: String(err) }, 500);
       }
     }

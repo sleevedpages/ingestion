@@ -5,7 +5,7 @@ import type {
   TcgPriceRow,
   SyncStatus,
 } from '../types/db.js';
-import { sourceUrlUpsertByProductId } from '../lib/productImages.js';
+import { sourceUrlUpsertByProductId, type ImageSourcePreference } from '../lib/productImages.js';
 
 // D1 batch() is limited to 100 statements per call
 const BATCH_SIZE = 100;
@@ -174,16 +174,22 @@ export async function upsertProducts(
 // "never mirrored"). The merge-upsert never touches r2_url, so an already-mirrored
 // row keeps its R2 url + source. MUST run AFTER upsertProducts (resolves products.id
 // by tcgplayer_product_id via INSERT ... SELECT — an unresolved product writes 0 rows).
+//
+// `preference` = the game's image_source_preference (mig 0104): 'tcgplayer' games
+// plainly overwrite (TCGCSV wins, the operator-blessed platform default);
+// 'scrydex' games (Bandai — One Piece, Gundam) go through the WP-1 precedence CASE
+// so a stored Scrydex-CDN source_url is PRESERVED (a NULL slot is still filled).
 export async function upsertProductSourceImages(
   db: D1Database,
-  rows: TcgProductRow[]
+  rows: TcgProductRow[],
+  preference: ImageSourcePreference
 ): Promise<void> {
   const withImage = rows.filter((r) => r.image_url);
   if (withImage.length === 0) return;
   for (const batch of chunk(withImage, BATCH_SIZE)) {
     await db.batch(
       batch.map((r) =>
-        sourceUrlUpsertByProductId(db, r.tcgplayer_product_id, r.image_url as string, null)
+        sourceUrlUpsertByProductId(db, r.tcgplayer_product_id, r.image_url as string, null, preference)
       )
     );
   }

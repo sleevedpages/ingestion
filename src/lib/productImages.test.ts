@@ -77,16 +77,57 @@ describe('resolveSourceUrl — the WP-1 precedence rule (scrydex > tcgplayer)', 
   })
 })
 
-describe('SQL statements carry the ONE precedence fragment (never a bare overwrite)', () => {
-  it('both source_url writers interpolate SOURCE_URL_PRECEDENCE_CASE', () => {
+describe('resolveSourceUrl — per-game preference (mig 0104, operator decision 2026-07-17)', () => {
+  it("'scrydex'-preferred (Bandai): a stored Scrydex url is PRESERVED against TCGCSV", () => {
+    expect(resolveSourceUrl(SCRYDEX_URL, TCG_URL, 'scrydex')).toBe(SCRYDEX_URL)
+  })
+
+  it("'tcgplayer'-preferred: the incoming url plainly overwrites — even a stored Scrydex url", () => {
+    expect(resolveSourceUrl(SCRYDEX_URL, TCG_URL, 'tcgplayer')).toBe(TCG_URL)
+    expect(resolveSourceUrl(OTHER_URL, TCG_URL, 'tcgplayer')).toBe(TCG_URL)
+    expect(resolveSourceUrl(TCG_URL, TCG_URL_2, 'tcgplayer')).toBe(TCG_URL_2)
+  })
+
+  it('a NULL/empty slot is filled under BOTH preferences (a watermarked image beats no image)', () => {
+    expect(resolveSourceUrl(null, TCG_URL, 'scrydex')).toBe(TCG_URL)
+    expect(resolveSourceUrl(null, TCG_URL, 'tcgplayer')).toBe(TCG_URL)
+    expect(resolveSourceUrl('', TCG_URL, 'scrydex')).toBe(TCG_URL)
+    expect(resolveSourceUrl('', TCG_URL, 'tcgplayer')).toBe(TCG_URL)
+  })
+
+  it("the default preference is 'scrydex' (the protective CASE) for all Scrydex-side writers", () => {
+    expect(resolveSourceUrl(SCRYDEX_URL, TCG_URL)).toBe(SCRYDEX_URL)
+  })
+})
+
+describe('SQL statements carry the right conflict expression per preference', () => {
+  it("both source_url writers default to SOURCE_URL_PRECEDENCE_CASE (the 'scrydex' rule)", () => {
     const db = makeFakeDB()
     sourceUrlUpsertByProductId(db, 1, TCG_URL, null)
     sourceUrlUpsertByGroupNumber(db, 100, '58/102', SCRYDEX_URL, 'scrydex')
     for (const stmt of db.prepared) {
       expect(stmt.sql).toContain(SOURCE_URL_PRECEDENCE_CASE)
-      // the pre-WP-1 unconditional overwrite must be gone
+      // no unconditional overwrite under the protective rule
       expect(stmt.sql).not.toMatch(/source_url\s*=\s*excluded\.source_url\s*,/)
     }
+  })
+
+  it("an explicit 'scrydex' preference keeps the protective CASE (the Bandai TCGCSV path)", () => {
+    const db = makeFakeDB()
+    sourceUrlUpsertByProductId(db, 1, TCG_URL, null, 'scrydex')
+    expect(db.prepared[0].sql).toContain(SOURCE_URL_PRECEDENCE_CASE)
+  })
+
+  it("a 'tcgplayer' preference produces the plain overwrite (TCGCSV wins by policy)", () => {
+    const db = makeFakeDB()
+    sourceUrlUpsertByProductId(db, 1, TCG_URL, null, 'tcgplayer')
+    const { sql, args } = db.prepared[0]
+    expect(sql).not.toContain(SOURCE_URL_PRECEDENCE_CASE)
+    expect(sql).toMatch(/source_url\s*=\s*excluded\.source_url\s*,/)
+    // still never touches r2_url, and source stays COALESCE-preserved (0063 guarantee)
+    expect(sql).not.toContain('r2_url')
+    expect(sql).toContain('source     = COALESCE(excluded.source, product_images.source)')
+    expect(args).toEqual([null, TCG_URL, 1])
   })
 
   it('the CASE branches mirror resolveSourceUrl exactly (order + hosts)', () => {

@@ -24,6 +24,7 @@ import type { Env } from './worker.js'
 import { ScrydexCreditLimitError } from './lib/scrydexClient.js'
 import { fetchAllExpansionCards, ScrydexCardsError } from './lib/scrydexCards.js'
 import { sourceUrlUpsertByProductId, sourceUrlUpsertByGroupNumber } from './lib/productImages.js'
+import { loadImagePreferences, preferenceForCanonicalGameName } from './lib/imagePreference.js'
 import {
   collectVariantEntries,
   fetchExistingProducts,
@@ -79,15 +80,6 @@ export async function syncScrydexImages(env: Env, game?: string): Promise<SyncRe
         JOIN   canonical_games g ON g.id = s.game_id
         WHERE  s.scrydex_expansion_id IS NOT NULL
         AND    g.name = ?
-        AND (
-          g.name IN ('One Piece Card Game', 'Gundam Card Game')
-          OR EXISTS (
-            SELECT 1 FROM products p2
-            LEFT JOIN product_images pi2 ON pi2.product_id = p2.id
-            WHERE  p2.set_id = s.id
-            AND    pi2.r2_url IS NULL
-          )
-        )
         ORDER BY s.id ASC
       `).bind(game)
     : env.DB.prepare(`
@@ -96,19 +88,35 @@ export async function syncScrydexImages(env: Env, game?: string): Promise<SyncRe
         FROM   sets s
         JOIN   canonical_games g ON g.id = s.game_id
         WHERE  s.scrydex_expansion_id IS NOT NULL
-        AND (
-          g.name IN ('One Piece Card Game', 'Gundam Card Game')
-          OR EXISTS (
-            SELECT 1 FROM products p2
-            LEFT JOIN product_images pi2 ON pi2.product_id = p2.id
-            WHERE  p2.set_id = s.id
-            AND    pi2.r2_url IS NULL
-          )
-        )
         ORDER BY s.id ASC
       `)
 
-  const { results: sets } = await setsStmt.all()
+  const { results: allSets } = await setsStmt.all()
+
+  // Per-game image source preference (mig 0104, operator decision 2026-07-17):
+  // the cron/pipeline run (no `game` filter) processes ONLY 'scrydex'-preferred
+  // games (Bandai — One Piece, Gundam, + any future config row). Writing Scrydex
+  // urls for 'tcgplayer'-preferred games is pointless (the daily TCGCSV sync
+  // overwrites them by design) and was the budget/credit sink that starved this
+  // stage before it ever reached the Bandai sets (the 2026-07-12 death: 435
+  // credits on Magic/Pokémon, invocation killed, 0 Bandai sets processed).
+  // An EXPLICIT `game` argument (the manual /scrydex/sync-images call) bypasses
+  // the preference filter — an operator asking for a specific game gets it.
+  // (This also replaces the old hardcoded r2-prefilter special case — Bandai
+  // games are CDN-as-final, so an R2-based skip never applied to them anyway.)
+  let sets = allSets
+  if (!game) {
+    const prefs = await loadImagePreferences(env.DB)
+    sets = allSets.filter(
+      (s: any) => preferenceForCanonicalGameName(prefs, s.game as string) === 'scrydex'
+    )
+    const skipped = allSets.length - sets.length
+    if (skipped > 0) {
+      console.log(
+        `[ImageSync] ${skipped} mapped sets in tcgplayer-preferred games skipped by policy (mig 0104)`
+      )
+    }
+  }
 
   // Many canonical sets share one scrydex_expansion_id — cache each expansion's /cards
   // response by scrydex_set_id so it is fetched at most once per run (saves credits +
