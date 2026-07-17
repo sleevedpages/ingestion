@@ -518,11 +518,15 @@ Scrydex expansion id (e.g. `OP09`, `GD04`), which is what `q=expansion.id:` matc
   rate limit) and proxies here. See Content/CLAUDE.md.
 
 ### Per-game image source preference (mig 0104 — WP-1 RE-SCOPED, operator decision 2026-07-17)
-- **TCGPlayer/TCGCSV is the PREFERRED image source platform-wide** (higher res, full set
-  coverage); the **Bandai-published games (One Piece, Gundam) are `'scrydex'`-preferred** —
-  TCGPlayer's card art there carries a customer-facing SAMPLE watermark. The flag is
-  `tcg_supported_games.image_source_preference` ('tcgplayer' default | 'scrydex'), edited in
-  Content Admin → Supported Games — **a future Bandai title is one config row, no deploy**.
+- The flag is `tcg_supported_games.image_source_preference` ('tcgplayer' default | 'scrydex'),
+  edited in Content Admin → Supported Games — a per-game image policy is **one config row, no
+  deploy**. **CURRENT STATE (2026-07-17, same-day revert): ALL games 'tcgplayer'.** The Bandai
+  (One Piece/Gundam) 'scrydex' seeding was reverted hours after the repair ran: Scrydex's Bandai
+  art is ALSO SAMPLE-watermarked (verified 8/8 across OP01→OP16 + GD01, base AND alt variants —
+  Bandai press-kit assets feed BOTH services; TCGPlayer is mixed and sometimes clean, Scrydex
+  looked uniformly stamped). Before ever re-flipping a Bandai game to 'scrydex', spot-check a
+  live `images.scrydex.com` url for the watermark first; if clean, re-flip + re-run the repair
+  loop (~90 credits). Per-card watermark fixes today = vendor photos / Manual Product Image.
 - The TCGCSV writer (`upsertProductSourceImages` → `sourceUrlUpsertByProductId(..., preference)`)
   consults it per group message (`tcgLabel` → `lib/imagePreference.ts`): 'scrydex' games go
   through `SOURCE_URL_PRECEDENCE_CASE` (stored Scrydex url PRESERVED; NULL still filled — a
