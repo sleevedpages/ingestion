@@ -91,7 +91,9 @@ id      = "d8b69df87a0143b699e8dc75d286cdcb"
 # each daily run no-ops against its own prior run and prices silently freeze. Do NOT raise
 # it to ≥24h while this is a daily cron. (scrydexProcessor.freshnessSafeForDrain guards/warns.)
 [triggers]
-crons = ["0 6 * * *", "0 3 * * SUN", "0 4 * * *", "0 5 * * *", "0 7 * * *"]
+# 0 2 * * * — daily perceptual-hash corpus sweep + packed index rebuild (bulk scan intake;
+# bounded batch/run, self-advancing anti-join; the initial backfill is admin-loop-driven).
+crons = ["0 2 * * *", "0 6 * * *", "0 3 * * SUN", "0 4 * * *", "0 5 * * *", "0 7 * * *"]
 
 [vars]
 TCGCSV_BASE_URL = "https://tcgcsv.com"

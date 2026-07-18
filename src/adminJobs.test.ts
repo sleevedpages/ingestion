@@ -28,10 +28,12 @@ describe('ADMIN_JOB_IDS / isAdminJobId', () => {
   it('lists the cron jobs plus the explicit PriceCharting download job', () => {
     expect(ADMIN_JOB_IDS).toEqual([
       'tcg-sync', 'image-mirror', 'scrydex-drain', 'pricecharting-csv', 'pricecharting-download', 'news-poll',
+      'hash-product-images',
     ])
   })
   it('accepts known ids and rejects everything else', () => {
     expect(isAdminJobId('tcg-sync')).toBe(true)
+    expect(isAdminJobId('hash-product-images')).toBe(true)
     expect(isAdminJobId('pricecharting-csv')).toBe(true)
     expect(isAdminJobId('pricecharting-download')).toBe(true)
     expect(isAdminJobId('mirror')).toBe(false)

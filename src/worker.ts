@@ -25,6 +25,7 @@ import { sweepDeadSourceUrls } from './deadSourceUrlSweep.js';
 import { runScrydexImageRepairBatch } from './scrydexImageRepair.js';
 import { mintPcConsole } from './mintPcConsole.js';
 import { runNewsPoll } from './newsPoll.js';
+import { runHashProductImages, HASH_SWEEP_MAX_LIMIT } from './hashProductImages.js';
 import {
   ADMIN_JOB_IDS,
   isAdminJobId,
@@ -552,6 +553,32 @@ export default {
       }
     }
 
+    // POST /admin/hash-product-images — perceptual-hash corpus sweep (bulk scan intake,
+    // Content mig 0107). SYNCHRONOUS + cursor-based, the purge/dead-url-sweep loop shape:
+    // body { cursor?, limit? } → { ok, scanned, hashed, undecodable, transientFailures,
+    // circuitBroken, remaining, excludedTcgplayerCdn, gamesRepacked, hasMore, cursorNext }.
+    // The admin panel loops (cursorNext back as cursor) until hasMore is false — this is
+    // the initial-backfill driver; the daily 02:00 cron keeps up with new catalogue rows.
+    // The anti-join is self-advancing, so cursor 0 is always safe. No API key needed.
+    if (pathname === '/admin/hash-product-images' && request.method === 'POST') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      const body = await request.json().catch(() => ({})) as { cursor?: number; limit?: number };
+      try {
+        const result = await runStage(env.DB, 'hash-product-images', 'hash', () =>
+          runHashProductImages(env, {
+            cursor: body.cursor,
+            limit: Math.min(body.limit ?? HASH_SWEEP_MAX_LIMIT, HASH_SWEEP_MAX_LIMIT),
+          }));
+        return json({ ok: true, ...result });
+      } catch (err) {
+        logger.error('hash-product-images failed', { error: String(err) });
+        return json({ ok: false, error: String(err) }, 500);
+      }
+    }
+
     // POST /admin/scrydex-image-repair — Bandai image repair (WP-1 re-scoped, 2026-07-17).
     // Re-syncs Scrydex art for ONE mapped set of a 'scrydex'-preferred game (mig 0104)
     // per call via the existing per-set sync machinery (force:true), repairing the
@@ -682,6 +709,12 @@ export default {
               case 'news-poll':
                 // poll DotGG RSS → news_items (no key needed)
                 await runStage(env.DB, 'news-poll', 'poll', () => runNewsPoll(env));
+                break;
+              case 'hash-product-images':
+                // one bounded perceptual-hash sweep batch + per-game index repack
+                // (bulk scan intake; no API key). Converges over repeated runs —
+                // re-fire until the run-log counts show remaining: 0.
+                await runStage(env.DB, 'hash-product-images', 'hash', () => runHashProductImages(env));
                 break;
             }
           } catch (err) {
@@ -814,6 +847,19 @@ export default {
             )
           );
         }
+        break;
+
+      case '0 2 * * *':
+        // DAILY: perceptual-hash corpus sweep + packed per-game index rebuild (bulk scan
+        // intake). One bounded batch/run — the anti-join is self-advancing, so the daily
+        // cron slowly converges on new catalogue rows; the initial backfill is driven from
+        // the admin panel (repeat runs). No API key needed. Prod only. 02:00 UTC is clear
+        // of the 03/04/05/06/07 crons.
+        ctx.waitUntil(
+          runStage(env.DB, 'hash-product-images', 'hash', () => runHashProductImages(env)).catch((err) =>
+            logger.error('Product image hash sweep failed', { error: String(err) })
+          )
+        );
         break;
 
       case '0 7 * * *':

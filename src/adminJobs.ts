@@ -33,7 +33,8 @@ export type AdminJobId =
   | 'scrydex-drain'
   | 'pricecharting-csv'        // PROCESS the cached R2 CSV (no download, unlimited, safe)
   | 'pricecharting-download'   // FETCH a fresh CSV → R2 (the only download; cooldown-gated) then PROCESS
-  | 'news-poll';               // poll the DotGG RSS feeds → upsert news_items (link-out only; no API key)
+  | 'news-poll'                // poll the DotGG RSS feeds → upsert news_items (link-out only; no API key)
+  | 'hash-product-images';     // perceptual-hash corpus sweep + packed index rebuild (bulk scan intake; no API key)
 
 export const ADMIN_JOB_IDS: AdminJobId[] = [
   'tcg-sync',
@@ -42,6 +43,7 @@ export const ADMIN_JOB_IDS: AdminJobId[] = [
   'pricecharting-csv',
   'pricecharting-download',
   'news-poll',
+  'hash-product-images',
 ];
 
 export function isAdminJobId(value: unknown): value is AdminJobId {
@@ -103,6 +105,7 @@ const JOB_LOCK_TTL_SECONDS: Record<AdminJobId, number> = {
   'pricecharting-csv': 600,      // fire-and-forget enqueue (the queue does the work); guard rapid re-fire
   'pricecharting-download': 600, // download + enqueue; the 10-min cooldown is the real rate guard
   'news-poll': 600,              // a handful of feeds; quick, but guard rapid re-fire
+  'hash-product-images': 600,    // one bounded sweep batch (~25s wall clock) + repack
 };
 
 export async function isJobRunning(env: Env, job: AdminJobId): Promise<boolean> {
