@@ -53,7 +53,9 @@ binding = "SLEEVEDPAGES_KV"
 id      = "d8b69df87a0143b699e8dc75d286cdcb"
 
 # ── Worker secrets (set via `wrangler secret put <NAME>`, never committed) ─────
-#   INGESTION_WORKER_SECRET — shared secret for the admin-proxied HTTP endpoints
+#   INGESTION_WORKER_SECRET — shared secret for the admin-proxied HTTP endpoints. ALSO sent
+#       OUTBOUND on the daily value-snapshot POST into the Content app (same secret, same
+#       x-worker-secret header, opposite direction). See src/valueSnapshots.ts.
 #   SCRYDEX_API_KEY / SCRYDEX_TEAM_ID — Scrydex price/image/Vision
 #   PRICECHARTING_TOKEN — PriceCharting on-demand graded + daily CSV bulk-ingest
 #   TCGGO_RAPIDAPI_KEY — STILL REQUIRED: powers the Artist→Binder-Template tool
@@ -70,6 +72,16 @@ id      = "d8b69df87a0143b699e8dc75d286cdcb"
 #   0 4 * * *    — DAILY Scrydex webhook drain (was */10; see below)
 #   0 5 * * *    — DAILY PriceCharting FETCH (download ONE rotated category → R2, then queue PROCESS)
 #   0 7 * * *    — DAILY News poll (DotGG WordPress RSS → news_items; headline+link+date only, link-out)
+#   0 10 * * *   — DAILY inventory VALUE SNAPSHOT trigger (POST Content /api/internal/snapshots/run)
+#
+# VALUE SNAPSHOTS (Content migration 0115): the worker prices NOTHING. It POSTs the Content app's
+# secret-gated internal endpoint and logs the counts; Content computes every figure with its own
+# valuation chain (`valueInventoryRows`), which is where that logic already lives and where it must
+# stay — a second implementation here would fork the valuator. Needs CONTENT_APP_URL (below) plus
+# the existing INGESTION_WORKER_SECRET. 10:00 UTC is chosen so the run lands AFTER the configured
+# local midnight (03:00 at the default -420 offset; still past midnight through Hawaii, UTC-10)
+# AND after the day's price ingest (04/05/06), and it is the first free hour past that block.
+# Idempotent per (profile, local day) — a re-fire writes nothing.
 #
 # PRICECHARTING (FETCH/PROCESS split, rebuilt 2026-06-19): the cron FETCHes ONE rotated category's
 # price-guide CSV (pokemon/magic/yugioh/one-piece-cards) → R2 (the only download; arms the 10-min
@@ -93,11 +105,15 @@ id      = "d8b69df87a0143b699e8dc75d286cdcb"
 [triggers]
 # 0 2 * * * — daily perceptual-hash corpus sweep + packed index rebuild (bulk scan intake;
 # bounded batch/run, self-advancing anti-join; the initial backfill is admin-loop-driven).
-crons = ["0 2 * * *", "0 6 * * *", "0 3 * * SUN", "0 4 * * *", "0 5 * * *", "0 7 * * *"]
+crons = ["0 2 * * *", "0 6 * * *", "0 3 * * SUN", "0 4 * * *", "0 5 * * *", "0 7 * * *", "0 10 * * *"]
 
 [vars]
 TCGCSV_BASE_URL = "https://tcgcsv.com"
 LOG_LEVEL = "debug"
+# Origin of the Content Pages app — the ONLY outbound call this worker makes into Content (the
+# daily value-snapshot trigger). There is deliberately NO in-code default: a fallback would make a
+# UAT worker write snapshots into the PRODUCTION database. Absent → the job self-skips.
+CONTENT_APP_URL = "https://sleevedpages.com"
 # DRY_RUN = "false"
 # BACKFILL_LIMIT = "50"  # Removed — full sync is ~2,000-2,500 requests, within the 10K limit
 # FORCE_SYNC = "true"      # Keep true until all sets are ingested, then remove
@@ -182,3 +198,11 @@ crons = ["0 6 * * *"]
 [env.preview.vars]
 TCGCSV_BASE_URL = "https://tcgcsv.com"
 LOG_LEVEL = "debug"
+# CONTENT_APP_URL — deliberately UNSET here. wrangler does NOT inherit top-level [vars] into a
+# named environment, so the UAT worker has no Content origin by default and the value-snapshot job
+# self-skips rather than guessing (a guess would be the PROD origin, i.e. UAT writing prod rows).
+# To exercise snapshots on UAT, uncomment and point it at the UAT Pages deployment, then fire the
+# job on demand — there is no snapshot cron in [env.preview.triggers], the news-poll precedent:
+#   CONTENT_APP_URL = "https://<uat-deployment>.pages.dev"
+#   curl -X POST "$INGESTION_WORKER_URL/admin/run-job" -H "x-worker-secret: $INGESTION_WORKER_SECRET" \
+#        -H 'content-type: application/json' -d '{"job":"value-snapshots"}'

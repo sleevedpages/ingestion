@@ -26,6 +26,7 @@ import { runScrydexImageRepairBatch } from './scrydexImageRepair.js';
 import { mintPcConsole } from './mintPcConsole.js';
 import { runNewsPoll } from './newsPoll.js';
 import { runHashProductImages, HASH_SWEEP_MAX_LIMIT } from './hashProductImages.js';
+import { runValueSnapshots } from './valueSnapshots.js';
 import {
   ADMIN_JOB_IDS,
   isAdminJobId,
@@ -55,8 +56,16 @@ export interface Env {
   SCRYDEX_API_KEY?: string;
   SCRYDEX_TEAM_ID?: string;
   SCRYDEX_MONTHLY_LIMIT?: string;
-  // Shared secret for admin-triggered HTTP endpoints
+  // Shared secret for admin-triggered HTTP endpoints. ALSO sent OUTBOUND on the one call this
+  // worker makes INTO the Content app (the daily value-snapshot trigger, src/valueSnapshots.ts) —
+  // same secret, same header, opposite direction.
   INGESTION_WORKER_SECRET?: string;
+  // Origin of the Content Pages app, e.g. 'https://sleevedpages.com'. REQUIRED by the
+  // value-snapshots job and by nothing else. Deliberately has NO in-code default: a fallback to
+  // the prod origin would make a UAT worker write snapshots into the PRODUCTION database. Absent →
+  // the job self-skips with `skipped:'not_configured'`. Set per environment in wrangler.toml
+  // (`[vars]` for prod, `[env.preview.vars]` for UAT — wrangler does not inherit top-level vars).
+  CONTENT_APP_URL?: string;
   // tcggo (pokemon-tcg-api.p.rapidapi.com) RapidAPI key — STILL REQUIRED: powers the
   // Artist→Binder-Template ingestion tool (/tcggo/artists, /tcggo/artists/:id/cards).
   // The graded eBay-sold role was REMOVED (unreliable id matching) — eBay sold comps
@@ -658,6 +667,13 @@ export default {
       if (job === 'pricecharting-download' && !env.PRICECHARTING_TOKEN) {
         return json({ ok: false, error: 'PRICECHARTING_TOKEN not configured' }, 503);
       }
+      // value-snapshots is the one job that calls OUT to Content, and there is deliberately no
+      // fallback origin (a default would make the UAT worker write into the prod DB). Surface the
+      // misconfiguration as a 503 here rather than letting the fire-and-forget run self-skip into
+      // a log line the operator has to go looking for.
+      if (job === 'value-snapshots' && !env.CONTENT_APP_URL) {
+        return json({ ok: false, error: 'CONTENT_APP_URL not configured' }, 503);
+      }
       // PriceCharting's per-game CSV download is HARD rate-limited (~1/10min, abuse → account
       // revocation). Gate ONLY the download job behind the cooldown (set by ANY download) so it
       // can't become a rapid-loop vector. pricecharting-csv re-processes the cached file → unlimited.
@@ -715,6 +731,14 @@ export default {
                 // (bulk scan intake; no API key). Converges over repeated runs —
                 // re-fire until the run-log counts show remaining: 0.
                 await runStage(env.DB, 'hash-product-images', 'hash', () => runHashProductImages(env));
+                break;
+              case 'value-snapshots':
+                // POST Content's /api/internal/snapshots/run (Content mig 0115). This worker
+                // prices nothing — Content computes with its own valuation chain. Idempotent
+                // (INSERT OR IGNORE per profile+day), so an on-demand fire after the cron has
+                // already run today simply reports skipped. Use this to seed/verify UAT, which
+                // has no snapshot cron (the news-poll precedent).
+                await runStage(env.DB, 'value-snapshots', 'run', () => runValueSnapshots(env));
                 break;
             }
           } catch (err) {
@@ -858,6 +882,33 @@ export default {
         ctx.waitUntil(
           runStage(env.DB, 'hash-product-images', 'hash', () => runHashProductImages(env)).catch((err) =>
             logger.error('Product image hash sweep failed', { error: String(err) })
+          )
+        );
+        break;
+
+      case '0 10 * * *':
+        // DAILY: ask the Content app to write today's inventory VALUE SNAPSHOT for every business
+        // profile (Content mig 0115). This worker prices nothing — it POSTs
+        // /api/internal/snapshots/run with the shared secret and logs the counts; the valuation
+        // chain stays in Content, where it already lives (see src/valueSnapshots.ts).
+        //
+        // WHY 10:00 UTC. Two constraints. (1) It must land AFTER the configured local midnight,
+        // because the snapshot is stamped with the local day it belongs to — at the default
+        // `snapshot_tz_offset_min` of -420 (US Pacific) 10:00 UTC is 03:00 local, comfortably
+        // inside the new day, and it is still past midnight for every US offset through Hawaii
+        // (UTC-10). (2) It must land after the day's PRICE ingest, so the snapshot values against
+        // fresh data rather than yesterday's: the Scrydex drain (04:00), the PriceCharting fetch
+        // (05:00) and the TCG sync (06:00) all get hours of clearance, and 10:00 is the first
+        // free hour past that block (02/03/04/05/06/07 are taken).
+        //
+        // LOG-AND-CONTINUE: the `.catch` below is the whole failure policy. A failed run throws
+        // out of runValueSnapshots so `runStage` records an honest `status='error'` row, the catch
+        // stops it there, and tomorrow's run is the retry (snapshots are per-day and idempotent).
+        // Nothing here can reach the Scrydex/PriceCharting jobs — separate crons, separate
+        // invocations.
+        ctx.waitUntil(
+          runStage(env.DB, 'value-snapshots', 'run', () => runValueSnapshots(env)).catch((err) =>
+            logger.error('Value snapshot run failed', { error: String(err) })
           )
         );
         break;

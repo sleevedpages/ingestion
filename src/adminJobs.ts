@@ -10,6 +10,7 @@
 //   0 3 * * SUN  image-mirror      → runWeeklyImagePipeline()        (this file)
 //   0 4 * * *    scrydex-drain     → processPendingWebhooks()        (scrydexProcessor.ts)
 //   0 5 * * *    (PriceCharting)   → runPriceChartingFetch()         (pricechartingIngest.ts)
+//   0 10 * * *   value-snapshots   → runValueSnapshots()             (valueSnapshots.ts)
 //
 // PriceCharting is FETCH/PROCESS-split (pricechartingIngest.ts): the daily cron FETCHes one
 // rotated category's CSV → R2 (the only download; arms the 10-min cooldown) then the dedicated
@@ -34,7 +35,8 @@ export type AdminJobId =
   | 'pricecharting-csv'        // PROCESS the cached R2 CSV (no download, unlimited, safe)
   | 'pricecharting-download'   // FETCH a fresh CSV → R2 (the only download; cooldown-gated) then PROCESS
   | 'news-poll'                // poll the DotGG RSS feeds → upsert news_items (link-out only; no API key)
-  | 'hash-product-images';     // perceptual-hash corpus sweep + packed index rebuild (bulk scan intake; no API key)
+  | 'hash-product-images'      // perceptual-hash corpus sweep + packed index rebuild (bulk scan intake; no API key)
+  | 'value-snapshots';         // POST Content's /api/internal/snapshots/run — daily inventory value history (Content mig 0115)
 
 export const ADMIN_JOB_IDS: AdminJobId[] = [
   'tcg-sync',
@@ -44,6 +46,7 @@ export const ADMIN_JOB_IDS: AdminJobId[] = [
   'pricecharting-download',
   'news-poll',
   'hash-product-images',
+  'value-snapshots',
 ];
 
 export function isAdminJobId(value: unknown): value is AdminJobId {
@@ -106,6 +109,7 @@ const JOB_LOCK_TTL_SECONDS: Record<AdminJobId, number> = {
   'pricecharting-download': 600, // download + enqueue; the 10-min cooldown is the real rate guard
   'news-poll': 600,              // a handful of feeds; quick, but guard rapid re-fire
   'hash-product-images': 600,    // one bounded sweep batch (~25s wall clock) + repack
+  'value-snapshots': 300,        // one HTTP POST to Content (capped at 60s); short backstop
 };
 
 export async function isJobRunning(env: Env, job: AdminJobId): Promise<boolean> {
