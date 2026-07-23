@@ -122,6 +122,58 @@ export function freshnessSafeForDrain(freshnessHours: number, drainHours = DRAIN
   return freshnessHours < drainHours
 }
 
+// ── Card-watch priority lane (Card Watch feature, Session 1) ──────────────────
+// A second, intraday drain scope that refreshes ONLY the Scrydex expansions containing at least
+// one WATCHED card (Content `card_watches`, mig 0116), leaving everything else to the daily 04:00
+// drain. It shares the ENTIRE processPendingWebhooks machinery (dedup, the WP-8 claim/retry state
+// machine, the credit guard/403 circuit break, incremental waitUntil completion) — the ONLY
+// differences are: (a) the candidate/work set is filtered to watched expansions, and (b) it uses
+// its OWN, shorter freshness window so an intraday run isn't no-op'd by the daily 20h bookkeeping.
+//
+// CRON CADENCE (Part-0 decision): the prod lane runs 3×/day at `0 10,16,22 * * *` — see
+// wrangler.toml. Min gap between runs = 6h (10→16, 16→22; the 22→10 gap is 12h).
+export const WATCH_LANE_INTERVAL_HOURS = 6
+// Watch freshness default (hours). SHORTER than the daily 20h so a watched expansion the daily
+// drain refreshed hours ago is re-fetched on the intraday lane. NO env var is required to function
+// (do NOT make this fail-closed). Overridable via SCRYDEX_WATCH_FRESHNESS_HOURS.
+export const DEFAULT_WATCH_FRESHNESS_HOURS = 4
+/**
+ * Watch-lane analogue of freshnessSafeForDrain: the watch freshness window MUST be strictly less
+ * than the lane's cron interval, or every intraday run no-ops against its own prior run and
+ * watched prices freeze (the same failure mode as the daily FRESHNESS↔DRAIN invariant). Default
+ * 4h < 6h lane interval ⇒ safe.
+ */
+export function watchFreshnessSafeForLane(freshnessHours: number, laneIntervalHours = WATCH_LANE_INTERVAL_HOURS): boolean {
+  return freshnessHours < laneIntervalHours
+}
+
+/**
+ * The distinct Scrydex expansion keys (`${gameSlug}|${expansionId}`, price-type-AGNOSTIC) that
+ * contain at least one watched card. Follows the canonical join map: card_watches →
+ * products (products.id = canonical_product_id) → sets (sets.scrydex_expansion_id) →
+ * canonical_games (name → slug via GAME_SLUG_BY_CANONICAL_NAME, the SAME slug the webhook
+ * event_name carries as its first segment). Nothing is cached — the query is cheap and correctness
+ * beats staleness here. Returns the key set + the raw distinct-expansion total for the audit line.
+ */
+export async function watchedExpansionKeys(db: D1Database): Promise<{ keys: Set<string>; total: number }> {
+  const { results } = await db.prepare(`
+    SELECT DISTINCT g.name AS game, s.scrydex_expansion_id AS expansion_id
+    FROM   card_watches   w
+    JOIN   products       p ON p.id = w.canonical_product_id
+    JOIN   sets           s ON s.id = p.set_id
+    JOIN   canonical_games g ON g.id = s.game_id
+    WHERE  s.scrydex_expansion_id IS NOT NULL
+    AND    s.scrydex_expansion_id <> ''
+  `).all()
+  const keys = new Set<string>()
+  for (const r of (results as any[]) ?? []) {
+    const slug = GAME_SLUG_BY_CANONICAL_NAME[r.game as string]
+    if (!slug || !r.expansion_id) continue
+    keys.add(`${slug}|${r.expansion_id}`)
+  }
+  return { keys, total: keys.size }
+}
+
 // ── WP-8 retry semantics (migration 0089: attempts + last_attempt_at) ─────────
 // A row-specific failure increments `attempts`; at MAX_DRAIN_ATTEMPTS the row goes
 // TERMINAL ('failed') and is never selected again — a poison row cannot loop forever.
@@ -326,23 +378,62 @@ const UNMATCHED_UPSERT_SQL = `
     card_name            = COALESCE(excluded.card_name,            scrydex_unmatched_cards.card_name),
     tcgplayer_product_id = COALESCE(excluded.tcgplayer_product_id, scrydex_unmatched_cards.tcgplayer_product_id)`
 
-export async function processPendingWebhooks(env: Env): Promise<void> {
+export async function processPendingWebhooks(
+  env: Env,
+  options: { scope?: 'daily' | 'watched' } = {},
+): Promise<void> {
+  const scope = options.scope === 'watched' ? 'watched' : 'daily'
+
   // ── Config ──────────────────────────────────────────────────────────────────
-  const freshnessHours = env.SCRYDEX_PRICE_FRESHNESS_HOURS
-    ? parseInt(env.SCRYDEX_PRICE_FRESHNESS_HOURS, 10)
-    : DEFAULT_FRESHNESS_HOURS
+  // The watched (priority-lane) scope uses its OWN, shorter freshness window so an intraday run
+  // isn't no-op'd by the daily drain's 20h bookkeeping. NEITHER window is fail-closed — both fall
+  // back to a working in-code default when their env var is unset.
+  const freshnessHours = scope === 'watched'
+    ? (env.SCRYDEX_WATCH_FRESHNESS_HOURS ? parseInt(env.SCRYDEX_WATCH_FRESHNESS_HOURS, 10) : DEFAULT_WATCH_FRESHNESS_HOURS)
+    : (env.SCRYDEX_PRICE_FRESHNESS_HOURS ? parseInt(env.SCRYDEX_PRICE_FRESHNESS_HOURS, 10) : DEFAULT_FRESHNESS_HOURS)
   const freshnessSeconds = freshnessHours * 3600
   const maxFetches = env.SCRYDEX_DRAIN_MAX_FETCHES
     ? parseInt(env.SCRYDEX_DRAIN_MAX_FETCHES, 10)
     : DEFAULT_MAX_FETCHES
 
-  // INVARIANT: freshness must stay < the daily drain interval or prices silently freeze.
-  if (!freshnessSafeForDrain(freshnessHours)) {
+  // INVARIANT: freshness must stay < the lane's re-run interval or prices silently freeze
+  // (each run no-ops against its own prior run). Daily lane: freshness < 24h. Watch lane:
+  // freshness < the intraday cron interval (WATCH_LANE_INTERVAL_HOURS).
+  if (scope === 'watched') {
+    if (!watchFreshnessSafeForLane(freshnessHours)) {
+      console.error(
+        `[ScrydexProcessor] ⚠️ SCRYDEX_WATCH_FRESHNESS_HOURS=${freshnessHours} ≥ ${WATCH_LANE_INTERVAL_HOURS}h watch-lane interval — ` +
+        `every intraday watch run will no-op against its own prior run and WATCHED prices will FREEZE. Lower it below ${WATCH_LANE_INTERVAL_HOURS}h.`
+      )
+    }
+  } else if (!freshnessSafeForDrain(freshnessHours)) {
     console.error(
       `[ScrydexProcessor] ⚠️ SCRYDEX_PRICE_FRESHNESS_HOURS=${freshnessHours} ≥ ${DRAIN_INTERVAL_HOURS}h drain interval — ` +
       `every daily run will no-op against its own prior run and prices will FREEZE. Lower it below 24h.`
     )
   }
+
+  // Watched scope: resolve the watched-expansion set FIRST. An empty set = nothing to do (no
+  // watches, or none map to a Scrydex expansion) → emit a zero audit and return before claiming
+  // any row (the daily drain owns everything).
+  let watchedKeys: Set<string> | null = null
+  let watchedExpansionsTotal = 0
+  if (scope === 'watched') {
+    const w = await watchedExpansionKeys(env.DB)
+    watchedKeys = w.keys
+    watchedExpansionsTotal = w.total
+    if (watchedKeys.size === 0) {
+      console.log(JSON.stringify({
+        log: 'scrydex_watch_drain_audit', watched_expansions_total: 0, rows_in: 0,
+        distinct_expansions: 0, fetches_made: 0, fetches_skipped_fresh: 0, rows_completed: 0,
+        rows_left_pending: 0, circuit_broken: false, credits_by_game: {},
+      }))
+      return
+    }
+  }
+  // True when this expansion's (game, id) contains a watched card. Daily scope watches everything.
+  const isExpansionInScope = (gameSlug: string, expansionId: string): boolean =>
+    scope === 'daily' || watchedKeys!.has(`${gameSlug}|${expansionId}`)
 
   // Game filter — deliberately UNSET in prod (scoping only throttles Pokémon, the wrong
   // lever). Kept available for an operator to exclude a game in an emergency.
@@ -391,7 +482,27 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
   const claimed: ClaimedRow[] = []
   let reclaimedProcessing = 0
   let retriedError = 0
-  const candidateRows = candidates.results as any[]
+  // Watched scope: only rows referencing at least one watched expansion are claimed — everything
+  // else stays pending for the daily drain (the watch lane must NEVER complete a non-watched row).
+  // A mixed row's non-watched expansions are still tracked in `remaining` below, so it never
+  // completes here either: it fetches its watched expansions and is released back to pending.
+  let candidateRows = candidates.results as any[]
+  if (scope === 'watched') {
+    candidateRows = candidateRows.filter((r) => {
+      let exps: string[]
+      try { exps = JSON.parse(r.expansion_ids_json as string) } catch { return false }
+      const gameSlug = String(r.event_name).split('.')[0]
+      return exps.some(e => isExpansionInScope(gameSlug, e))
+    })
+    if (!candidateRows.length) {
+      console.log(JSON.stringify({
+        log: 'scrydex_watch_drain_audit', watched_expansions_total: watchedExpansionsTotal, rows_in: 0,
+        distinct_expansions: 0, fetches_made: 0, fetches_skipped_fresh: 0, rows_completed: 0,
+        rows_left_pending: 0, circuit_broken: false, credits_by_game: {},
+      }))
+      return
+    }
+  }
   for (let i = 0; i < candidateRows.length; i += BATCH_SIZE) {
     const chunk = candidateRows.slice(i, i + BATCH_SIZE)
     const results = await env.DB.batch(chunk.map(r =>
@@ -467,7 +578,11 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
     rowState.set(id, st)
     for (let i = 0; i < keys.length; i++) {
       const key = keys[i]
-      if (!workItems.has(key)) {
+      // In the WATCHED scope, only in-scope (watched) expansions become work-items — a mixed row's
+      // non-watched keys stay in `remaining`/`rowsByKey` (so the row never completes here) but are
+      // never fetched, and the row is released back to 'pending' for the daily drain. Daily scope
+      // is in-scope for everything, so this is a no-op there.
+      if (isExpansionInScope(gameSlug, expansionIds[i]) && !workItems.has(key)) {
         workItems.set(key, { gameSlug, priceType, expansionId: expansionIds[i], ownerRowId: id })
       }
       const arr = rowsByKey.get(key) ?? []
@@ -480,9 +595,9 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
 
   const gameFilterLabel = gameFilter ? [...gameFilter].join(',') : 'none'
   console.log(
-    `[ScrydexProcessor] daily drain - ${claimed.length} claimed rows ` +
+    `[ScrydexProcessor] ${scope === 'watched' ? 'watch drain' : 'daily drain'} - ${claimed.length} claimed rows ` +
     `(${reclaimedProcessing} reclaimed-stale, ${retriedError} error-retries) -> ` +
-    `${workItems.size} distinct expansions (freshness=${freshnessHours}h, maxFetches=${maxFetches}, ` +
+    `${workItems.size} distinct expansions (scope=${scope}, freshness=${freshnessHours}h, maxFetches=${maxFetches}, ` +
     `gameFilter=${gameFilterLabel})`
   )
 
@@ -613,8 +728,9 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
   }
 
   const leftoverRows = unfinished.length
+  const laneLabel = scope === 'watched' ? 'watch drain' : 'daily drain'
   console.log(
-    `[ScrydexProcessor] daily drain complete — ${totalFetches} fetches, ${skippedFresh} fresh-skipped, ` +
+    `[ScrydexProcessor] ${laneLabel} complete — ${totalFetches} fetches, ${skippedFresh} fresh-skipped, ` +
     `${leftoverRows} rows released back to pending, ${failedTerminal} terminal` +
     (circuitBroken ? ' (circuit-broken)' : '')
   )
@@ -624,9 +740,11 @@ export async function processPendingWebhooks(env: Env): Promise<void> {
   // `rows_in` vs `distinct_expansions` quantifies the dedup collapse; `fetches_made`
   // (page-calls = credits) vs `fetches_skipped_fresh` shows the freshness savings;
   // `credits_by_game` confirms the measured Pokémon concentration. WP-8 adds the
-  // reclaim/retry/terminal/unmatched counters.
+  // reclaim/retry/terminal/unmatched counters. The watch lane emits its own `log` key +
+  // `watched_expansions_total` so the two lanes are separable in Logpush.
   console.log(JSON.stringify({
-    log:                        'scrydex_drain_audit',
+    log:                        scope === 'watched' ? 'scrydex_watch_drain_audit' : 'scrydex_drain_audit',
+    ...(scope === 'watched' ? { watched_expansions_total: watchedExpansionsTotal } : {}),
     rows_in:                    claimed.length,
     rows_reclaimed_processing:  reclaimedProcessing,
     rows_retried_error:         retriedError,

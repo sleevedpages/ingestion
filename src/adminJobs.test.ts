@@ -27,12 +27,13 @@ function fakeKV() {
 describe('ADMIN_JOB_IDS / isAdminJobId', () => {
   it('lists the cron jobs plus the explicit PriceCharting download job', () => {
     expect(ADMIN_JOB_IDS).toEqual([
-      'tcg-sync', 'image-mirror', 'scrydex-drain', 'pricecharting-csv', 'pricecharting-download', 'news-poll',
-      'hash-product-images', 'value-snapshots',
+      'tcg-sync', 'image-mirror', 'scrydex-drain', 'card-watch-drain', 'pricecharting-csv', 'pricecharting-download',
+      'news-poll', 'hash-product-images', 'value-snapshots',
     ])
   })
   it('accepts known ids and rejects everything else', () => {
     expect(isAdminJobId('tcg-sync')).toBe(true)
+    expect(isAdminJobId('card-watch-drain')).toBe(true)
     expect(isAdminJobId('hash-product-images')).toBe(true)
     expect(isAdminJobId('value-snapshots')).toBe(true)
     expect(isAdminJobId('pricecharting-csv')).toBe(true)

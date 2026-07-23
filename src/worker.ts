@@ -93,6 +93,11 @@ export interface Env {
   SCRYDEX_PRICE_FRESHNESS_HOURS?: string;  // default 20 — freshness window before re-fetching an expansion (MUST stay <24h, the daily drain interval)
   SCRYDEX_PRICE_GAMES?: string;            // comma-separated slug allowlist, e.g. 'pokemon,onepiece' — deliberately UNSET in prod
   SCRYDEX_DRAIN_MAX_FETCHES?: string;      // default 1500 — cap on Scrydex page-calls per daily drain invocation (waitUntil safety)
+  // Card-watch priority lane (Card Watch feature, Session 1). Freshness window for the intraday
+  // watched-scope drain — default 4h, OPTIONAL (a safe in-code default, never fail-closed). MUST
+  // stay < the lane's cron interval (WATCH_LANE_INTERVAL_HOURS) or watched prices freeze. See
+  // scrydexProcessor.ts watchFreshnessSafeForLane.
+  SCRYDEX_WATCH_FRESHNESS_HOURS?: string;  // default 4
 }
 
 function buildConfig(env: Env): IngestionConfig {
@@ -661,7 +666,7 @@ export default {
       // (the Scrydex sub-steps self-skip inside runWeeklyImagePipeline); scrydex-drain requires
       // them. pricecharting-download (the ONLY path that downloads) requires the PriceCharting
       // token; pricecharting-csv (PROCESS from the cached R2 file) needs NO token.
-      if (job === 'scrydex-drain' && !(env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID)) {
+      if ((job === 'scrydex-drain' || job === 'card-watch-drain') && !(env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID)) {
         return json({ ok: false, error: 'SCRYDEX_API_KEY / SCRYDEX_TEAM_ID not configured' }, 503);
       }
       if (job === 'pricecharting-download' && !env.PRICECHARTING_TOKEN) {
@@ -713,6 +718,12 @@ export default {
                 break;
               case 'scrydex-drain':
                 await runStage(env.DB, 'scrydex-drain', 'drain', () => processPendingWebhooks(env));
+                break;
+              case 'card-watch-drain':
+                // Card Watch priority lane — the intraday watched-scope drain (Card Watch Session 1).
+                // Same function as the daily drain, scope:'watched'. Use this to run the lane on
+                // demand from the admin Ingestion Jobs panel or to seed/verify UAT (no cron in UAT).
+                await runStage(env.DB, 'card-watch-drain', 'drain', () => processPendingWebhooks(env, { scope: 'watched' }));
                 break;
               case 'pricecharting-csv':
                 // PROCESS cached R2 file — NO download
@@ -851,6 +862,24 @@ export default {
           ctx.waitUntil(
             runStage(env.DB, 'scrydex-drain', 'drain', () => processPendingWebhooks(env)).catch((err) =>
               logger.error('Scrydex webhook processing failed', { error: String(err) })
+            )
+          );
+        }
+        break;
+
+      case '0 10,16,22 * * *':
+        // CARD WATCH PRIORITY LANE (Card Watch feature, Session 1) — 3×/day intraday drain that
+        // refreshes ONLY the Scrydex expansions containing at least one WATCHED card (Content
+        // `card_watches`, mig 0116), leaving everything else to the 04:00 daily drain. Shares the
+        // ENTIRE drain machinery via processPendingWebhooks(env, { scope:'watched' }) — same dedup,
+        // WP-8 claim/retry state machine, credit guard, 403 circuit break — differing only in the
+        // watched-expansion filter + its own shorter freshness window (SCRYDEX_WATCH_FRESHNESS_HOURS,
+        // default 4h < the 6h min cron gap). Prod only (UAT never has Scrydex crons). Cadence
+        // chosen in Part 0 (see wrangler.toml + the handoff). Needs Scrydex keys, like the daily drain.
+        if (env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID) {
+          ctx.waitUntil(
+            runStage(env.DB, 'card-watch-drain', 'drain', () => processPendingWebhooks(env, { scope: 'watched' })).catch((err) =>
+              logger.error('Card-watch drain failed', { error: String(err) })
             )
           );
         }

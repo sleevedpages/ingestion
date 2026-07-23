@@ -102,10 +102,28 @@ id      = "d8b69df87a0143b699e8dc75d286cdcb"
 # ⚠️ FRESHNESS COUPLING: SCRYDEX_PRICE_FRESHNESS_HOURS (default 20h) MUST stay < 24h or
 # each daily run no-ops against its own prior run and prices silently freeze. Do NOT raise
 # it to ≥24h while this is a daily cron. (scrydexProcessor.freshnessSafeForDrain guards/warns.)
+#
+# CARD WATCH PRIORITY LANE (Card Watch feature, mig 0116): `0 10,16,22 * * *` (3×/day, prod only)
+# refreshes ONLY the Scrydex expansions containing a watched card via processPendingWebhooks(scope:
+# 'watched'). It uses its OWN freshness window SCRYDEX_WATCH_FRESHNESS_HOURS (OPTIONAL, in-code
+# default 4h — NOT fail-closed) which MUST stay < the 6h min cron gap or watched prices freeze
+# (scrydexProcessor.watchFreshnessSafeForLane guards/warns). Do NOT add Scrydex crons to
+# [env.preview.triggers]. See Ingestion/CLAUDE.md → "Card-watch priority drain lane".
 [triggers]
 # 0 2 * * * — daily perceptual-hash corpus sweep + packed index rebuild (bulk scan intake;
 # bounded batch/run, self-advancing anti-join; the initial backfill is admin-loop-driven).
-crons = ["0 2 * * *", "0 6 * * *", "0 3 * * SUN", "0 4 * * *", "0 5 * * *", "0 7 * * *", "0 10 * * *"]
+#
+# CARD WATCH PRIORITY LANE — `0 10,16,22 * * *` (3×/day). Refreshes ONLY the Scrydex expansions
+# containing a WATCHED card (Content `card_watches`, mig 0116) via processPendingWebhooks(scope:
+# 'watched'), leaving everything else to the 04:00 daily drain. Part-0 cadence decision: the daily
+# drain moved off */10 precisely because volatile Pokémon expansions re-fire many times/day, so
+# watched expansions genuinely re-fire intraday → 3 runs/day (min gap 6h) beats 2. Offset from the
+# 04:00 daily drain and the 06:00 TCG sync. The watch freshness window (SCRYDEX_WATCH_FRESHNESS_HOURS,
+# default 4h) MUST stay < the 6h min gap or watched prices freeze (scrydexProcessor.watchFreshnessSafeForLane).
+# The 10:00 slot coincides with the value-snapshot cron (`0 10 * * *`) but they are SEPARATE
+# scheduled invocations (distinct event.cron) — no conflict, and a few watched-card refreshes never
+# materially move a whole-inventory snapshot. PROD ONLY — never add Scrydex crons to [env.preview.triggers].
+crons = ["0 2 * * *", "0 6 * * *", "0 3 * * SUN", "0 4 * * *", "0 10,16,22 * * *", "0 5 * * *", "0 7 * * *", "0 10 * * *"]
 
 [vars]
 TCGCSV_BASE_URL = "https://tcgcsv.com"

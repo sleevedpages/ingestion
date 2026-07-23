@@ -32,6 +32,7 @@ export type AdminJobId =
   | 'tcg-sync'
   | 'image-mirror'
   | 'scrydex-drain'
+  | 'card-watch-drain'         // intraday watched-scope Scrydex drain (Card Watch feature, mig 0116)
   | 'pricecharting-csv'        // PROCESS the cached R2 CSV (no download, unlimited, safe)
   | 'pricecharting-download'   // FETCH a fresh CSV → R2 (the only download; cooldown-gated) then PROCESS
   | 'news-poll'                // poll the DotGG RSS feeds → upsert news_items (link-out only; no API key)
@@ -42,6 +43,7 @@ export const ADMIN_JOB_IDS: AdminJobId[] = [
   'tcg-sync',
   'image-mirror',
   'scrydex-drain',
+  'card-watch-drain',
   'pricecharting-csv',
   'pricecharting-download',
   'news-poll',
@@ -105,6 +107,7 @@ const JOB_LOCK_TTL_SECONDS: Record<AdminJobId, number> = {
   'tcg-sync': 1800, // full sync is long-running; generous backstop
   'image-mirror': 3600, // Infinity-batch mirror can run long
   'scrydex-drain': 1200,
+  'card-watch-drain': 1200, // same drain machinery as scrydex-drain, watched scope (fewer expansions)
   'pricecharting-csv': 600,      // fire-and-forget enqueue (the queue does the work); guard rapid re-fire
   'pricecharting-download': 600, // download + enqueue; the 10-min cooldown is the real rate guard
   'news-poll': 600,              // a handful of feeds; quick, but guard rapid re-fire

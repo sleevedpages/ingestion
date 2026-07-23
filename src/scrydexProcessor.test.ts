@@ -6,6 +6,9 @@ import {
   processPendingWebhooks,
   ScrydexFetchError,
   freshnessSafeForDrain,
+  watchFreshnessSafeForLane,
+  WATCH_LANE_INTERVAL_HOURS,
+  DEFAULT_WATCH_FRESHNESS_HOURS,
   DRAIN_INTERVAL_HOURS,
   DEFAULT_FRESHNESS_HOURS,
   MAX_DRAIN_ATTEMPTS,
@@ -813,5 +816,226 @@ describe('game name ↔ slug resolution (WP-3) — round-trip, no collision', ()
       .filter(([, slug]) => slug === 'pokemon')
       .map(([name]) => name)
     expect(pokemonNames).toEqual(['Pokemon'])
+  })
+})
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CARD WATCH PRIORITY LANE (Card Watch feature, Session 1) — the watched scope of
+// processPendingWebhooks. Shares the entire drain machinery; the differences under test:
+//   (1) only watched expansions are fetched (others stay pending for the daily drain);
+//   (2) the dedup still collapses N rows for one watched expansion → 1 fetch;
+//   (3) it uses its OWN freshness window (4h default), independent of the daily 20h;
+//   (4) the credit guard / 403 circuit break still fires;
+//   (5) the freshness↔lane-interval invariant guard warns when violated.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// `card_watches` → products → sets → canonical_games resolution; the fake returns the watched
+// expansion rows for the resolver's `.all()`, and the candidate pending rows for the drain's.
+function watchedAll(watched: Array<{ game: string; expansion_id: string }>, pending: any[]) {
+  return (sql: string): any[] => {
+    if (sql.includes('card_watches')) return watched
+    if (sql.includes("status = 'pending'")) return pending
+    return []
+  }
+}
+const watchCard = (productId: string) => ({
+  number: '25',
+  variants: [{
+    name: 'normal',
+    marketplaces: [{ name: 'tcgplayer', product_id: productId }],
+    prices: [{ type: 'raw', condition: 'NM', market: 1.5, trends: {} }],
+  }],
+})
+function findWatchAuditLine(spy: ReturnType<typeof vi.spyOn>): any | null {
+  for (const call of spy.mock.calls) {
+    const arg = call[0]
+    if (typeof arg !== 'string') continue
+    try { const o = JSON.parse(arg); if (o?.log === 'scrydex_watch_drain_audit') return o } catch { /* not json */ }
+  }
+  return null
+}
+
+describe('processPendingWebhooks — watched scope (Card Watch priority lane)', () => {
+  it('fetches ONLY watched expansions; unwatched pending rows are never claimed', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ data: [watchCard('999')] }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    // exp1 is watched; exp2 is not. Two distinct pending rows.
+    const pending = [
+      { id: 1, event_name: 'pokemon.prices.raw', expansion_ids_json: '["exp1"]' },
+      { id: 2, event_name: 'pokemon.prices.raw', expansion_ids_json: '["exp2"]' },
+    ]
+    const db = makeFakeDB({
+      first: webhookFirstRouter,
+      all: watchedAll([{ game: 'Pokemon', expansion_id: 'exp1' }], pending),
+    })
+    await processPendingWebhooks({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any, { scope: 'watched' })
+
+    // Exactly ONE Scrydex fetch, and it is the WATCHED expansion (exp1), never exp2.
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const url = String(fetchMock.mock.calls[0][0])
+    expect(url).toContain('exp1')
+    expect(url).not.toContain('exp2')
+
+    // The unwatched row (id 2) is never touched — no claim/complete/error/release references it.
+    const idInvolvingTwo = db._runs.filter(r => r.sql.includes('scrydex_webhook_log') && r.args.includes(2))
+    const claimTwo = batchedStmts(db).filter(s => s.sql.includes('scrydex_webhook_log') && s.args.includes(2))
+    expect(idInvolvingTwo).toHaveLength(0)
+    expect(claimTwo).toHaveLength(0)
+
+    // The watched row (id 1) completes and the expansion is marked fresh.
+    expect(db._runs.some(r => /status\s*=\s*'complete'/.test(r.sql) && r.args.includes(1))).toBe(true)
+    expect(db._runs.some(r => r.sql.includes('INSERT INTO scrydex_expansion_freshness'))).toBe(true)
+  })
+
+  it('shared dedup still collapses N rows for one watched expansion into a single fetch', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ data: [watchCard('999')] }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    const pending = [1, 2, 3].map(id => ({ id, event_name: 'pokemon.prices.raw', expansion_ids_json: '["exp1"]' }))
+    const db = makeFakeDB({
+      first: webhookFirstRouter,
+      all: watchedAll([{ game: 'Pokemon', expansion_id: 'exp1' }], pending),
+    })
+    await processPendingWebhooks({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any, { scope: 'watched' })
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(db._runs.filter(r => /status\s*=\s*'complete'/.test(r.sql))).toHaveLength(3)
+
+    // The audit line is the WATCH variant and reports the watched-expansion total.
+    const audit = findWatchAuditLine(logSpy)
+    expect(audit).not.toBeNull()
+    expect(audit.watched_expansions_total).toBe(1)
+    expect(audit.rows_in).toBe(3)
+    expect(audit.distinct_expansions).toBe(1)
+    expect(audit.fetches_made).toBe(1)
+  })
+
+  it('a mixed row (watched + unwatched expansion) fetches only the watched one and is released back to pending', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ data: [watchCard('999')] }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    // One row references BOTH exp1 (watched) and exp2 (unwatched).
+    const pending = [{ id: 7, event_name: 'pokemon.prices.raw', expansion_ids_json: '["exp1","exp2"]' }]
+    const db = makeFakeDB({
+      first: webhookFirstRouter,
+      all: watchedAll([{ game: 'Pokemon', expansion_id: 'exp1' }], pending),
+    })
+    await processPendingWebhooks({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any, { scope: 'watched' })
+
+    // Only exp1 fetched; the row is NOT completed (exp2 still owed) and is released to 'pending' so
+    // the 04:00 daily drain fetches exp2. The watch lane must never complete a mixed row.
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(String(fetchMock.mock.calls[0][0])).toContain('exp1')
+    expect(db._runs.some(r => /status\s*=\s*'complete'/.test(r.sql) && r.args.includes(7))).toBe(false)
+    const released = batchedStmts(db).filter(s => /status\s*=\s*'pending'/.test(s.sql) && s.args.includes(7))
+    expect(released.length).toBeGreaterThan(0)
+  })
+
+  it('uses the 4h watch freshness window (not the daily 20h) and skips a fresh watched expansion', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    let freshnessMaxAge: number | null = null
+
+    const db = makeFakeDB({
+      first: (sql, args) => {
+        if (sql.includes('scrydex_expansion_freshness')) { freshnessMaxAge = args[2] as number; return { 1: 1 } } // fresh
+        return webhookFirstRouter(sql)
+      },
+      all: watchedAll([{ game: 'Pokemon', expansion_id: 'exp1' }],
+        [{ id: 1, event_name: 'pokemon.prices.raw', expansion_ids_json: '["exp1"]' }]),
+    })
+    await processPendingWebhooks({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any, { scope: 'watched' })
+
+    // Fresh within 4h → no fetch, row completes.
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(freshnessMaxAge).toBe(4 * 3600)   // 14400s — the watch window, NOT the daily 72000s (20h)
+    expect(db._runs.some(r => /status\s*=\s*'complete'/.test(r.sql) && r.args.includes(1))).toBe(true)
+  })
+
+  it('the DAILY scope still uses the 20h freshness window (unchanged by the watch lane)', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    let freshnessMaxAge: number | null = null
+    const db = makeFakeDB({
+      first: (sql, args) => {
+        if (sql.includes('scrydex_expansion_freshness')) { freshnessMaxAge = args[2] as number; return { 1: 1 } }
+        return webhookFirstRouter(sql)
+      },
+      all: pendingAll,
+    })
+    await processPendingWebhooks({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any)
+    expect(freshnessMaxAge).toBe(20 * 3600)   // 72000s — the daily window is untouched
+  })
+
+  it('credit-guard 403 in watched scope marks the row error and circuit-breaks', async () => {
+    const fetchMock = vi.fn(async () => new Response('{"code":"CREDIT_CAP_HIT"}', { status: 403 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const db = makeFakeDB({
+      first: webhookFirstRouter,
+      all: watchedAll([{ game: 'Pokemon', expansion_id: 'exp1' }],
+        [{ id: 1, event_name: 'pokemon.prices.raw', expansion_ids_json: '["exp1"]', status: 'pending', attempts: 0 }]),
+    })
+    await processPendingWebhooks({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any, { scope: 'watched' })
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)   // one call then break
+    const webhookUpdates = db._runs.filter(r => r.sql.includes('scrydex_webhook_log'))
+    expect(webhookUpdates.some(r => /status\s*=\s*'error'/.test(r.sql) && r.args.includes(1))).toBe(true)
+    expect(webhookUpdates.some(r => /status\s*=\s*'complete'/.test(r.sql))).toBe(false)
+    // A guard/403 burns NO attempt (the June-outage invariant) and writes no freshness row.
+    expect(db._runs.some(r => r.sql.includes('INSERT INTO scrydex_expansion_freshness'))).toBe(false)
+  })
+
+  it('an empty watched set is an immediate no-op (no watches → no claims, no fetch)', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const db = makeFakeDB({
+      first: webhookFirstRouter,
+      all: watchedAll([], [{ id: 1, event_name: 'pokemon.prices.raw', expansion_ids_json: '["exp1"]' }]),
+    })
+    await processPendingWebhooks({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any, { scope: 'watched' })
+
+    expect(fetchMock).not.toHaveBeenCalled()
+    // No candidate is ever claimed (the daily drain owns everything).
+    expect(db._batches.flat().some(s => s.sql.includes("status = 'processing'"))).toBe(false)
+    const audit = findWatchAuditLine(logSpy)
+    expect(audit).not.toBeNull()
+    expect(audit.watched_expansions_total).toBe(0)
+    expect(audit.fetches_made).toBe(0)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Watch freshness ↔ lane-interval invariant: the watch freshness window MUST be < the
+// lane's cron interval (default 6h) or every intraday run no-ops and watched prices freeze.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('watchFreshnessSafeForLane', () => {
+  it('the production default (4h) is safe against the 6h min lane gap', () => {
+    expect(WATCH_LANE_INTERVAL_HOURS).toBe(6)
+    expect(DEFAULT_WATCH_FRESHNESS_HOURS).toBe(4)
+    expect(watchFreshnessSafeForLane(DEFAULT_WATCH_FRESHNESS_HOURS)).toBe(true)
+  })
+  it('a freshness window ≥ the lane interval is UNSAFE (would freeze watched prices)', () => {
+    expect(watchFreshnessSafeForLane(6)).toBe(false)   // == interval → no-op against prior run
+    expect(watchFreshnessSafeForLane(8)).toBe(false)
+    expect(watchFreshnessSafeForLane(5.9)).toBe(true)
+  })
+  it('an over-long watch freshness window logs a loud warning at the drain', async () => {
+    vi.stubGlobal('fetch', vi.fn())
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const db = makeFakeDB({
+      first: webhookFirstRouter,
+      all: watchedAll([{ game: 'Pokemon', expansion_id: 'exp1' }], []),
+    })
+    await processPendingWebhooks(
+      { DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't', SCRYDEX_WATCH_FRESHNESS_HOURS: '6' } as any,
+      { scope: 'watched' },
+    )
+    expect(errSpy.mock.calls.some(c => String(c[0]).includes('SCRYDEX_WATCH_FRESHNESS_HOURS=6'))).toBe(true)
   })
 })
