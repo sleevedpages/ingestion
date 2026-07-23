@@ -27,6 +27,7 @@ import { mintPcConsole } from './mintPcConsole.js';
 import { runNewsPoll } from './newsPoll.js';
 import { runHashProductImages, HASH_SWEEP_MAX_LIMIT } from './hashProductImages.js';
 import { runValueSnapshots } from './valueSnapshots.js';
+import { runWatchAlerts } from './watchAlerts.js';
 import {
   ADMIN_JOB_IDS,
   isAdminJobId,
@@ -719,12 +720,21 @@ export default {
               case 'scrydex-drain':
                 await runStage(env.DB, 'scrydex-drain', 'drain', () => processPendingWebhooks(env));
                 break;
-              case 'card-watch-drain':
+              case 'card-watch-drain': {
                 // Card Watch priority lane — the intraday watched-scope drain (Card Watch Session 1).
                 // Same function as the daily drain, scope:'watched'. Use this to run the lane on
                 // demand from the admin Ingestion Jobs panel or to seed/verify UAT (no cron in UAT).
-                await runStage(env.DB, 'card-watch-drain', 'drain', () => processPendingWebhooks(env, { scope: 'watched' }));
+                // Session 3: fire the alert hook after the drain, exactly like the cron lane (the
+                // hook self-skips when CONTENT_APP_URL is unset — e.g. the UAT worker).
+                const res = await runStage(env.DB, 'card-watch-drain', 'drain', () => processPendingWebhooks(env, { scope: 'watched' }));
+                const refreshed = res?.refreshedExpansions ?? [];
+                if (refreshed.length) {
+                  await runWatchAlerts(env, refreshed).catch((err) =>
+                    logger.error('Watch-alert hook failed', { job, error: String(err) })
+                  );
+                }
                 break;
+              }
               case 'pricecharting-csv':
                 // PROCESS cached R2 file — NO download
                 await runStage(env.DB, 'pricecharting-csv', 'process', () => runPriceChartingProcess(env, category!));
@@ -876,11 +886,29 @@ export default {
         // watched-expansion filter + its own shorter freshness window (SCRYDEX_WATCH_FRESHNESS_HOURS,
         // default 4h < the 6h min cron gap). Prod only (UAT never has Scrydex crons). Cadence
         // chosen in Part 0 (see wrangler.toml + the handoff). Needs Scrydex keys, like the daily drain.
+        //
+        // Card Watch Session 3: AFTER the drain commits its price writes, POST the just-refreshed
+        // expansion list to Content's alert endpoint (runWatchAlerts) so it can diff against each
+        // watch's baseline and push. The hook fires inside the SAME waitUntil but only once the drain
+        // has resolved, and its failure is caught + logged — the drain's writes must never depend on
+        // alerting (Content owns the diff + FCM send; this worker just forwards the list).
         if (env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID) {
           ctx.waitUntil(
-            runStage(env.DB, 'card-watch-drain', 'drain', () => processPendingWebhooks(env, { scope: 'watched' })).catch((err) =>
-              logger.error('Card-watch drain failed', { error: String(err) })
-            )
+            (async () => {
+              let refreshed: { gameSlug: string; expansion: string }[] = [];
+              try {
+                const res = await runStage(env.DB, 'card-watch-drain', 'drain', () => processPendingWebhooks(env, { scope: 'watched' }));
+                refreshed = res?.refreshedExpansions ?? [];
+              } catch (err) {
+                logger.error('Card-watch drain failed', { error: String(err) });
+                return; // drain failed → nothing refreshed → no alerts
+              }
+              if (refreshed.length) {
+                await runWatchAlerts(env, refreshed).catch((err) =>
+                  logger.error('Watch-alert hook failed', { error: String(err) })
+                );
+              }
+            })()
           );
         }
         break;

@@ -1008,6 +1008,34 @@ describe('processPendingWebhooks — watched scope (Card Watch priority lane)', 
     expect(audit.watched_expansions_total).toBe(0)
     expect(audit.fetches_made).toBe(0)
   })
+
+  it('returns the (gameSlug, expansion) pairs it refreshed live — the Session-3 alert hook input', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ data: [watchCard('999')] }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const db = makeFakeDB({
+      first: webhookFirstRouter,
+      all: watchedAll([{ game: 'Pokemon', expansion_id: 'exp1' }],
+        [{ id: 1, event_name: 'pokemon.prices.raw', expansion_ids_json: '["exp1"]' }]),
+    })
+    const result = await processPendingWebhooks({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any, { scope: 'watched' })
+
+    // gameSlug is the webhook event_name's first segment ('pokemon'); expansion is the fetched id.
+    expect(result.scope).toBe('watched')
+    expect(result.expansionsFetched).toBe(1)
+    expect(result.refreshedExpansions).toEqual([{ gameSlug: 'pokemon', expansion: 'exp1' }])
+  })
+
+  it('the DAILY scope leaves refreshedExpansions empty (it never triggers alerts this session)', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ data: [watchCard('999')] }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const db = makeFakeDB({ first: webhookFirstRouter, all: pendingAll })
+    const result = await processPendingWebhooks({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any)
+
+    expect(result.scope).toBe('daily')
+    expect(result.refreshedExpansions).toEqual([])   // the daily drain never feeds the alert hook
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────

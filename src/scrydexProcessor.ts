@@ -378,11 +378,37 @@ const UNMATCHED_UPSERT_SQL = `
     card_name            = COALESCE(excluded.card_name,            scrydex_unmatched_cards.card_name),
     tcgplayer_product_id = COALESCE(excluded.tcgplayer_product_id, scrydex_unmatched_cards.tcgplayer_product_id)`
 
+/**
+ * The drain's machine-readable outcome. Returned (not void) so the WATCHED lane can hand the list of
+ * expansions it actually refreshed to the Card Watch alert hook (`runWatchAlerts`), and `runStage`
+ * records it as the stage's `counts_json`. `refreshedExpansions` is populated for the WATCHED scope
+ * only — the daily 04:00 drain leaves it empty because it never triggers alerts this session (Card
+ * Watch Session 3 keeps the blast radius small; the daily drain is a noted future option).
+ */
+export interface DrainResult {
+  scope: 'daily' | 'watched'
+  expansionsFetched: number
+  refreshedExpansions: { gameSlug: string; expansion: string }[]
+}
+
 export async function processPendingWebhooks(
   env: Env,
   options: { scope?: 'daily' | 'watched' } = {},
-): Promise<void> {
+): Promise<DrainResult> {
   const scope = options.scope === 'watched' ? 'watched' : 'daily'
+
+  // The distinct (gameSlug, expansion) pairs the WATCHED lane fetched live this run — the alert
+  // hook's input (Card Watch Session 3). Only populated for scope==='watched'; deduped because raw
+  // and graded are separate work-items for the same expansion.
+  const refreshedExpansions: { gameSlug: string; expansion: string }[] = []
+  const refreshedSeen = new Set<string>()
+  const noteRefreshed = (gameSlug: string, expansion: string): void => {
+    if (scope !== 'watched') return
+    const k = `${gameSlug}|${expansion}`
+    if (refreshedSeen.has(k)) return
+    refreshedSeen.add(k)
+    refreshedExpansions.push({ gameSlug, expansion })
+  }
 
   // ── Config ──────────────────────────────────────────────────────────────────
   // The watched (priority-lane) scope uses its OWN, shorter freshness window so an intraday run
@@ -428,7 +454,7 @@ export async function processPendingWebhooks(
         distinct_expansions: 0, fetches_made: 0, fetches_skipped_fresh: 0, rows_completed: 0,
         rows_left_pending: 0, circuit_broken: false, credits_by_game: {},
       }))
-      return
+      return { scope, expansionsFetched: 0, refreshedExpansions }
     }
   }
   // True when this expansion's (game, id) contains a watched card. Daily scope watches everything.
@@ -462,7 +488,7 @@ export async function processPendingWebhooks(
     LIMIT ${PENDING_ROW_LIMIT}
   `).all()
 
-  if (!candidates.results.length) return
+  if (!candidates.results.length) return { scope, expansionsFetched: 0, refreshedExpansions }
 
   // ── CLAIM each candidate atomically (the double-drain guard) ──────────────────
   // One conditional UPDATE per row: the WHERE re-checks the observed state, so when
@@ -500,7 +526,7 @@ export async function processPendingWebhooks(
         distinct_expansions: 0, fetches_made: 0, fetches_skipped_fresh: 0, rows_completed: 0,
         rows_left_pending: 0, circuit_broken: false, credits_by_game: {},
       }))
-      return
+      return { scope, expansionsFetched: 0, refreshedExpansions }
     }
   }
   for (let i = 0; i < candidateRows.length; i += BATCH_SIZE) {
@@ -523,7 +549,7 @@ export async function processPendingWebhooks(
     }
   }
 
-  if (!claimed.length) return
+  if (!claimed.length) return { scope, expansionsFetched: 0, refreshedExpansions }
 
   // ── Parse rows → build the DEDUPED work-item set (one per distinct expansion) ──
   const rowState = new Map<unknown, RowState>()
@@ -663,6 +689,9 @@ export async function processPendingWebhooks(
       totalFetches += requests
       expansionsFetched++
       creditsByGame[wi.gameSlug] = (creditsByGame[wi.gameSlug] ?? 0) + requests
+      // Card Watch Session 3: record this live-fetched expansion for the alert hook (watched scope
+      // only — noteRefreshed no-ops for the daily drain).
+      noteRefreshed(wi.gameSlug, wi.expansionId)
 
       const allUpserts: D1PreparedStatement[] = []
       const unmatched: UnmatchedCardEntry[] = []
@@ -761,6 +790,8 @@ export async function processPendingWebhooks(
     freshness_hours:            freshnessHours,
     credits_by_game:            creditsByGame,
   }))
+
+  return { scope, expansionsFetched, refreshedExpansions }
 }
 
 // ─── Scrydex API ──────────────────────────────────────────────────────────────

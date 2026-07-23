@@ -107,7 +107,7 @@ db/migrations/
 | `0 6 * * *` | Daily TCG data sync (categories → sets → products → prices) |
 | `0 3 * * SUN` | Weekly (MIRROR-FIRST since WP-2, 2026-07-07): `runMirrorJob` (Infinity batches) → `syncScrydexSetMappings` → `syncScrydexImages` → `scrydex_api_log` cleanup (90-day retention). Mirror first so the sync stages can never starve it (the 2026-07-05 run died before the mirror ran); the mirror consumes the PREVIOUS week's synced source_urls. |
 | `0 4 * * *` | **DAILY** Scrydex webhook drain → upsert canonical `prices` (dedup by expansion; 20h freshness). **Was `*/10`** — moved to daily for cost control (2026-06; see Price Processing). |
-| `0 10,16,22 * * *` | **CARD WATCH PRIORITY LANE** (3×/day) → `processPendingWebhooks(env, {scope:'watched'})`. Refreshes ONLY the Scrydex expansions containing a WATCHED card (Content `card_watches`, mig 0116) on a faster cadence than the 04:00 daily drain; everything else stays with the daily drain. SHARES the entire drain machinery (dedup, WP-8 claim/retry, credit guard, 403 break) — differs only by the watched-expansion filter + its OWN 4h freshness window (`SCRYDEX_WATCH_FRESHNESS_HOURS`, default 4h < the 6h min cron gap). Prod only. See **Card-watch priority drain lane**. |
+| `0 10,16,22 * * *` | **CARD WATCH PRIORITY LANE** (3×/day) → `processPendingWebhooks(env, {scope:'watched'})`. Refreshes ONLY the Scrydex expansions containing a WATCHED card (Content `card_watches`, mig 0116) on a faster cadence than the 04:00 daily drain; everything else stays with the daily drain. SHARES the entire drain machinery (dedup, WP-8 claim/retry, credit guard, 403 break) — differs only by the watched-expansion filter + its OWN 4h freshness window (`SCRYDEX_WATCH_FRESHNESS_HOURS`, default 4h < the 6h min cron gap). Prod only. **Session 3 (mig 0117):** after the drain, POSTs the refreshed expansions to Content's `/api/internal/watch-alerts/run` for the push alerts (`runWatchAlerts` via `waitUntil`, never fails the drain). See **Card-watch priority drain lane**. |
 | `0 5 * * *` | **DAILY** PriceCharting **FETCH** (rebuilt 2026-06-19) — download ONE rotated category's CSV → R2 (the only download; arms the 10-min cooldown), then the dedicated `PC_PROCESS_QUEUE` ingests the WHOLE category from that single cached file (canonical `prices`, source='pricecharting', for the 4 games). One download/day respects the 1-per-10-min limit; the queue finishes even a big ~88k-row category. See **PriceCharting CSV Bulk-Ingest (FETCH/PROCESS split)**. Prod only. |
 | `0 2 * * *` | **DAILY** Perceptual-hash corpus sweep → `runHashProductImages()` (`src/hashProductImages.ts`; job id `hash-product-images`). One bounded batch (~400 images) over `product_images` rows lacking a `product_image_hashes` row at the current `HASH_VERSION` (anti-join = self-advancing, no cursor persistence); fetch bytes (R2 mirror via the bucket binding, else NON-tcgplayer-cdn `source_url` — **tcgplayer-cdn is structurally excluded**: the standing Worker-egress 403 wall, counted `excludedTcgplayerCdn`); decode (jpeg-js + the hand-rolled PNG decoder `src/lib/imageDecode.ts` on native DecompressionStream); hash (`src/lib/cardHash.ts`, HASH_VERSION 1 — SHARED-VECTOR-PINNED against the two Content copies, never regenerate pins); write (permanent failures get a zero-length SENTINEL row so the sweep converges; transient failures retry; 10-consecutive circuit break); then REPACK each touched game's `hash-index/v{HASH_VERSION}/{gameId}.bin` blob (42-byte records `[product_id u32 LE][38B hash]`) — what the Content bulk-scan hash engine serves from. No API key. Content migration **0107 is BLOCKING for this worker deploy**. Initial backfill: loop the run-job / `POST /admin/hash-product-images` until `remaining: 0`. Prod only. Tests: `src/hashProductImages.test.ts`, `src/lib/{cardHash,imageDecode}.test.ts`. |
 | `0 10 * * *` | **DAILY** Inventory VALUE SNAPSHOT trigger → `runValueSnapshots()` (`src/valueSnapshots.ts`; job id `value-snapshots`). **⚠️ THE ONE JOB THAT CALLS OUT INTO CONTENT, and the one that computes nothing.** It POSTs `{CONTENT_APP_URL}/api/internal/snapshots/run` with `x-worker-secret: INGESTION_WORKER_SECRET` and logs the returned `{ok, dayStart, profiles, written, skipped, errors}`. Content records one inventory-value row per business profile per local day (Content migration **0115**) using its OWN valuation chain (`valueInventoryRows`) — re-implementing any part of that here would FORK the valuator, and the drift would surface only as an unexplainable step in a chart nobody can re-derive. **`CONTENT_APP_URL` is REQUIRED with no in-code default**: a fallback to the prod origin would make a UAT worker write into the PRODUCTION database, so absent → self-skip (`skipped:'not_configured'`). A genuine failure (non-2xx / unreachable / unexpected body) THROWS so `runStage` writes an honest `status='error'` row; the cron's `.catch(logger.error)` is the log-and-continue, and separate cron cases mean it can never touch the Scrydex/PriceCharting/TCG jobs. **Why 10:00 UTC:** after the configured local midnight (03:00 at Content's default `snapshot_tz_offset_min` of -420; still past midnight through Hawaii, UTC-10) AND after the day's price ingest (04/05/06), and it is the first free hour past the 02–07 block. Idempotent per (profile, local day) — a re-fire writes nothing. Prod only. Tests: `src/valueSnapshots.test.ts`, `src/valueSnapshotsCron.test.ts`. |
@@ -167,7 +167,7 @@ and the manual trigger call the SAME job functions (no duplicated logic):
 | `tcg-sync` | `runIngestion(buildConfig(env))` | `0 6 * * *` | ✅ idempotent upserts; long-running |
 | `image-mirror` | `runWeeklyImagePipeline(env)` (**`runMirrorJob(Infinity)` FIRST** → set-mappings → image sync → `cleanupScrydexApiLog`; WP-2 order) | `0 3 * * SUN` | ✅ merge-upserts + attempt-backoff (re-runs skip recently-attempted rows); long-running |
 | `scrydex-drain` | `processPendingWebhooks(env)` | `0 4 * * *` | ✅ freshness-guarded + deduped + atomic row claims (WP-8 — overlapping runs can never double-drain a row); consumes Scrydex credits |
-| `card-watch-drain` | `processPendingWebhooks(env, {scope:'watched'})` | `0 10,16,22 * * *` | ✅ same guards as `scrydex-drain`, watched scope only (fewer expansions); needs Scrydex keys → 503. Use on demand to seed/verify UAT (no cron in UAT). See **Card-watch priority drain lane**. |
+| `card-watch-drain` | `processPendingWebhooks(env, {scope:'watched'})` | `0 10,16,22 * * *` | ✅ same guards as `scrydex-drain`, watched scope only (fewer expansions); needs Scrydex keys → 503. Also fires the Session-3 alert hook after the drain (mig 0117). Use on demand to seed/verify UAT (no cron in UAT). See **Card-watch priority drain lane**. |
 | `pricecharting-csv` | `runPriceChartingProcess(env, priceChartingCategoryForDay())` — PROCESS the cached R2 CSV (no download) | — (on demand) | ✅ idempotent upserts, R2-only; **unlimited + safe** (never touches the rate limit) |
 | `pricecharting-download` | `runPriceChartingFetch(env, priceChartingCategoryForDay())` — DOWNLOAD fresh CSV → R2 → PROCESS | `0 5 * * *` | ⚠️ downloads from PriceCharting — **rate-limited ~1/10min** (cooldown-gated) |
 | `news-poll` | `runNewsPoll(env)` — poll active DotGG RSS feeds → upsert `news_items` (headline+link+date, link-out; prune >90d) | `0 7 * * *` (PROD only) | ✅ public RSS, deduped on link — unlimited + safe; no API key. **Use this to populate UAT** (no news cron in UAT). |
@@ -574,6 +574,31 @@ under `waitUntil`.
   'drain', …)` so it lands in the WP-4 observability panel. Manually triggerable as the
   `card-watch-drain` admin job (needs Scrydex keys → 503).
 - Tests: the watched-scope + `watchFreshnessSafeForLane` cases in `src/scrydexProcessor.test.ts`.
+
+#### Session 3 — the price-movement ALERT hook (Content mig 0117)
+
+After a watched-scope drain that refreshed ≥1 expansion, the worker POSTs the refreshed
+`(gameSlug, expansion)` list to Content's secret-gated `POST /api/internal/watch-alerts/run`, which
+does the pricing diff + the FCM send. **This worker grows NO FCM/diff logic** — the same division as
+the s40 value-snapshot seam, pointed at a different endpoint.
+
+- `processPendingWebhooks(env, {scope:'watched'})` now RETURNS `{ scope, expansionsFetched,
+  refreshedExpansions: [{gameSlug, expansion}] }` — populated for the WATCHED scope ONLY (the daily
+  drain leaves it empty and never triggers alerts this session). `runStage` passes it through to the
+  observability `counts_json`.
+- **`src/watchAlerts.ts` `runWatchAlerts(env, refreshedExpansions)`** is the seam — a thin POST that
+  mirrors `valueSnapshots.ts` exactly: same `x-worker-secret === INGESTION_WORKER_SECRET` (no new
+  secret), same **`CONTENT_APP_URL` REQUIRED-with-no-default** rule (absent → self-skip with a named
+  reason, so the UAT worker log-skips instead of POSTing prod), same 30s timeout, THROWS on a genuine
+  failure so the call site's `.catch` logs it.
+- **Wired at TWO call sites** (the cron `0 10,16,22` lane + the manual `card-watch-drain` job): after
+  the drain resolves, `ctx.waitUntil(runWatchAlerts(env, res.refreshedExpansions).catch(log))` — the
+  hook fires only on ≥1 fetch, and its failure is caught and NEVER fails the drain (the drain's price
+  writes must not depend on alerting). The **daily 04:00 drain does NOT fire the hook** (small blast
+  radius; a noted future option). Logs `{"log":"watch_alerts_run", …}` on success.
+- Tests: `src/watchAlerts.test.ts` (the POST, the empty/unset self-skip, throws-on-non-2xx) +
+  `src/watchAlertsCron.test.ts` (both call sites fire the hook; a drain failure fires none; a hook
+  failure never rejects the invocation).
 
 ### Per-game image source preference (mig 0104 — WP-1 RE-SCOPED, operator decision 2026-07-17)
 - The flag is `tcg_supported_games.image_source_preference` ('tcgplayer' default | 'scrydex'),
