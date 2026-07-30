@@ -200,7 +200,17 @@ async function streamCsv(
   }
 }
 
-interface Prod { id: number; tcgId: number | null; name: string | null; number: string | null }
+// `setName` (2026-07-30) carries BOTH console-scoping signals the numeric fuzzy rung now
+// requires — the language and the console↔set corroboration. Without it every candidate
+// is rejected, which is the intended fail-toward-rejection posture, so the SELECT below
+// must keep joining it.
+interface Prod {
+  id: number
+  tcgId: number | null
+  name: string | null
+  number: string | null
+  setName: string | null
+}
 export interface ProductIndex {
   byTcgId:  Map<number, Prod>
   byNumber: Map<string, Prod[]>   // keyed on cleanNumber(p.number)
@@ -230,7 +240,7 @@ async function loadProductIndex(env: Env, category: string): Promise<ProductInde
   const PAGE = 5000
   for (let offset = 0; ; offset += PAGE) {
     const { results } = await env.DB.prepare(
-      `SELECT p.id, p.tcgplayer_product_id AS tcgId, p.name, p.number
+      `SELECT p.id, p.tcgplayer_product_id AS tcgId, p.name, p.number, s.name AS setName
        FROM products p
        JOIN sets s ON s.id = p.set_id
        JOIN canonical_games g ON g.id = s.game_id
@@ -348,7 +358,7 @@ function matchRows(
         fuzzyAttempts++
         const candidates = index.byNumber.get(num) ?? []
         const productId = candidates.length
-          ? pickBestCanonicalMatch(r.row, candidates.map((c) => ({ id: c.id, name: c.name, number: c.number })))
+          ? pickBestCanonicalMatch(r.row, candidates.map((c) => ({ id: c.id, name: c.name, number: c.number, setName: c.setName })))
           : null
         if (productId != null) {
           resolutions.push({ pcId: r.pcId, productId, method: 'fuzzy', row: r.row, sealed: r.sealed })

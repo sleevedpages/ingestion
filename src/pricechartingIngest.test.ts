@@ -58,8 +58,10 @@ function makeFakeDb(products: Product[]) {
       const offsetMatch = sql.match(/OFFSET (\d+)/)
       const offset = offsetMatch ? Number(offsetMatch[1]) : 0
       if (offset > 0) return { results: [] }
+      // setName rides the primary index too (2026-07-30) — the numeric fuzzy rung needs it
+      // for the language + console↔set gates, and rejects any candidate without one.
       return { results: products.filter((p) => cats.includes(p.category))
-        .map((p) => ({ id: p.id, tcgId: p.tcgplayer_product_id, name: p.name, number: p.number })) }
+        .map((p) => ({ id: p.id, tcgId: p.tcgplayer_product_id, name: p.name, number: p.number, setName: p.setName ?? '' })) }
     }
     throw new Error('unhandled query SQL: ' + sql.slice(0, 60))
   }
@@ -152,9 +154,9 @@ function row(vals: Partial<Record<string, string>>): string {
 }
 
 const PRODUCTS: Product[] = [
-  { id: 7,  tcgplayer_product_id: 12345, name: 'Charizard ex', number: '125/197', category: 3 },
-  { id: 8,  tcgplayer_product_id: 99999, name: 'Pikachu',      number: '58/197',  category: 3 },
-  { id: 20, tcgplayer_product_id: 55555, name: 'Booster Box',  number: '',        category: 3, kind: 'sealed' },
+  { id: 7,  tcgplayer_product_id: 12345, name: 'Charizard ex', number: '125/197', category: 3, setName: 'Obsidian Flames' },
+  { id: 8,  tcgplayer_product_id: 99999, name: 'Pikachu',      number: '58/197',  category: 3, setName: 'Obsidian Flames' },
+  { id: 20, tcgplayer_product_id: 55555, name: 'Booster Box',  number: '',        category: 3, kind: 'sealed', setName: 'Obsidian Flames' },
 ]
 
 function buildCsv() {
@@ -420,6 +422,28 @@ describe('number-less set-corroborated matching (One Piece DON!!s)', () => {
     expect(c.unmatched).toBe(1)            // pre-mint: recorded unmatched, never mispriced
     expect(db._pcMap.get('pcGP')?.canonical_product_id).toBeNull()
     expect(db._prices.size).toBe(0)
+  })
+
+  it('a Chinese row whose number DOES match an English product is still rejected (language gate)', async () => {
+    // The case the test above could not catch: it relied on the English Gengar carrying a
+    // DIFFERENT number (226 vs 307), so the numeric rung found no candidate at all. Here the
+    // English product has the SAME name AND the SAME number — before the 2026-07-30 fix the
+    // fuzzy rung scored 5 and wrote CHINESE pricing onto the ENGLISH product.
+    const r2 = makeR2(); const key = rawKeyFor('pokemon-cards', today())
+    r2._store.set(key, [
+      HEADER,
+      row({ id: 'pcGP2', 'console-name': 'Pokemon Chinese Gem Pack', 'product-name': 'Gengar #307',
+            'loose-price': '$14.00', genre: 'Pokemon Card', 'tcg-id': '' }),
+    ].join('\n'))
+    const db = makeFakeDb([
+      { id: 44, tcgplayer_product_id: 88002, name: 'Gengar', number: '307/193', category: 3,
+        setName: 'Scarlet & Violet 151' },
+    ])
+    const c = await processPriceChartingWindow({ DB: db, IMAGES_BUCKET: r2 } as any, procMsg(key))
+    expect(c.matchedFuzzy).toBe(0)
+    expect(c.unmatched).toBe(1)
+    expect(db._pcMap.get('pcGP2')?.canonical_product_id).toBeNull()
+    expect(db._prices.size).toBe(0)        // NOTHING written to the English product
   })
 
   it('a pre-stamped (minted) row skips the matcher, keeps its method, and gets prices written', async () => {

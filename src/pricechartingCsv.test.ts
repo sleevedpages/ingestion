@@ -10,6 +10,10 @@ import {
   validateTcgIdMatch,
   pickBestCanonicalMatch,
   pickNumberlessCanonicalMatch,
+  textLanguage,
+  consoleCorroboratesSet,
+  norm,
+  DEFAULT_PC_LANGUAGE,
   PC_PRICE_COLUMNS,
   PC_GRADED_COLUMNS,
   PRICECHARTING_CATEGORIES,
@@ -265,31 +269,128 @@ describe('pickNumberlessCanonicalMatch', () => {
   it('returns null for empty candidate pools', () => {
     expect(pickNumberlessCanonicalMatch(dodgersRow, [])).toBeNull()
   })
+
+  // The 2026-07-30 refactor moved this rung's corroboration into the shared
+  // consoleCorroboratesSet() and added the language gate. Everything above is the
+  // PINNED pre-existing behaviour; these two are the delta.
+  it('still rejects when the console is empty (corroboration impossible)', () => {
+    expect(pickNumberlessCanonicalMatch(
+      { 'product-name': 'DON!! Card [Dodgers]', 'console-name': '' },
+      [dodgersCand],
+    )).toBeNull()
+  })
+  it('rejects a foreign-language console against an English set (new language gate)', () => {
+    expect(pickNumberlessCanonicalMatch(
+      { 'product-name': 'DON!! Card [Dodgers]', 'console-name': 'One Piece Japanese Promo' },
+      [dodgersCand],
+    )).toBeNull()
+  })
+})
+
+// ── console scoping primitives (2026-07-30) ─────────────────────────────────────
+describe('textLanguage', () => {
+  it('reads the PriceCharting language marker out of a normalised console name', () => {
+    expect(textLanguage(norm('Pokemon Chinese Gem Pack'))).toBe('chinese')
+    expect(textLanguage(norm('Pokemon Japanese Promo'))).toBe('japanese')
+    expect(textLanguage(norm('Yugioh Korean Starter Deck'))).toBe('korean')
+  })
+  it('an unmarked console is ENGLISH — which is what our canonical catalogue is', () => {
+    expect(textLanguage(norm('Pokemon Obsidian Flames'))).toBe(DEFAULT_PC_LANGUAGE)
+    expect(textLanguage(norm('One Piece Promotion Cards'))).toBe('english')
+    expect(textLanguage('')).toBe('english')
+  })
+  it('matches WHOLE tokens only — never a substring of a card/set word', () => {
+    // 'polish' must not fire on "Polished", nor 'french' on "Frenchman".
+    expect(textLanguage(norm('Polished Silver Promos'))).toBe('english')
+    expect(textLanguage(norm('Japanese'))).toBe('japanese')
+  })
+})
+
+describe('consoleCorroboratesSet', () => {
+  it('corroborates bidirectionally (Promo ⊂ Promotion Cards, either direction)', () => {
+    expect(consoleCorroboratesSet(norm('One Piece Promo'), norm('One Piece Promotion Cards'))).toBe(true)
+    expect(consoleCorroboratesSet(norm('Pokemon Obsidian Flames'), norm('Obsidian Flames'))).toBe(true)
+  })
+  it('rejects an unrelated set', () => {
+    expect(consoleCorroboratesSet(norm('One Piece Promo'), norm('Starter Deck 01'))).toBe(false)
+  })
+  it('an empty console or set corroborates NOTHING (fail toward rejection)', () => {
+    expect(consoleCorroboratesSet('', norm('Obsidian Flames'))).toBe(false)
+    expect(consoleCorroboratesSet(norm('Pokemon Obsidian Flames'), '')).toBe(false)
+  })
 })
 
 // ── fuzzy fallback matcher ──────────────────────────────────────────────────────
 describe('pickBestCanonicalMatch', () => {
   const csvRow = { 'product-name': 'Charizard ex #125', 'console-name': 'Pokemon Obsidian Flames' }
+  const SET = 'Obsidian Flames'
   it('accepts a name + number match', () => {
     const id = pickBestCanonicalMatch(csvRow, [
-      { id: 7, name: 'Charizard ex', number: '125/197' },
+      { id: 7, name: 'Charizard ex', number: '125/197', setName: SET },
     ])
     expect(id).toBe(7)
   })
   it('rejects a name-only (no number corroboration) match', () => {
     const id = pickBestCanonicalMatch(csvRow, [
-      { id: 9, name: 'Charizard ex', number: '004/197' },  // different number
+      { id: 9, name: 'Charizard ex', number: '004/197', setName: SET },  // different number
     ])
     expect(id).toBeNull()
   })
   it('rejects when the name does not match at all', () => {
     const id = pickBestCanonicalMatch(csvRow, [
-      { id: 3, name: 'Pikachu', number: '125/197' },
+      { id: 3, name: 'Pikachu', number: '125/197', setName: SET },
     ])
     expect(id).toBeNull()
   })
   it('returns null for empty candidate lists', () => {
     expect(pickBestCanonicalMatch(csvRow, [])).toBeNull()
+  })
+
+  // ── console scoping (2026-07-30) — `console-name` used to be accepted and ignored ──
+  describe('console scoping', () => {
+    it('THE BUG: a Chinese row must NOT match the English product of the same name+number', () => {
+      // Real archetype (DIAGNOSTIC_DON_AND_GEMPACK): pc console "Pokemon Chinese Gem Pack",
+      // product-name "Gengar #307". The candidate pool is the ENGLISH TCGplayer category,
+      // so before the fix this wrote Chinese pricing onto an English Gengar.
+      expect(pickBestCanonicalMatch(
+        { 'product-name': 'Gengar #307', 'console-name': 'Pokemon Chinese Gem Pack' },
+        [{ id: 40, name: 'Gengar', number: '307/193', setName: 'Gem Pack' }],
+      )).toBeNull()
+    })
+    it('a Japanese row is rejected even when the set corroborates on a shared token', () => {
+      // Set corroboration ALONE would pass here (`promo` ⊂ `promos`) — this is exactly why
+      // language is its own gate and not a by-product of the corroboration rung.
+      expect(pickBestCanonicalMatch(
+        { 'product-name': 'Pikachu #25', 'console-name': 'Pokemon Japanese Promo' },
+        [{ id: 41, name: 'Pikachu', number: '25', setName: 'SWSH Black Star Promos' }],
+      )).toBeNull()
+    })
+    it('the SAME row matches once the languages agree (symmetric rule, not "reject foreign")', () => {
+      expect(pickBestCanonicalMatch(
+        { 'product-name': 'Pikachu #25', 'console-name': 'Pokemon Japanese Promo' },
+        [{ id: 42, name: 'Pikachu', number: '25', setName: 'Japanese Promo Cards' }],
+      )).toBe(42)
+    })
+    it('rejects a right-name+number card from the WRONG set (console↔set corroboration)', () => {
+      expect(pickBestCanonicalMatch(csvRow, [
+        { id: 43, name: 'Charizard ex', number: '125/197', setName: 'Paldea Evolved' },
+      ])).toBeNull()
+    })
+    it('an unresolvable console name rejects rather than falling through to name+number', () => {
+      expect(pickBestCanonicalMatch(
+        { 'product-name': 'Charizard ex #125', 'console-name': '' },
+        [{ id: 7, name: 'Charizard ex', number: '125/197', setName: SET }],
+      )).toBeNull()
+      expect(pickBestCanonicalMatch(
+        { 'product-name': 'Charizard ex #125' },
+        [{ id: 7, name: 'Charizard ex', number: '125/197', setName: SET }],
+      )).toBeNull()
+    })
+    it('a candidate with no set name is rejected, never matched on name+number alone', () => {
+      expect(pickBestCanonicalMatch(csvRow, [
+        { id: 7, name: 'Charizard ex', number: '125/197', setName: null },
+      ])).toBeNull()
+    })
   })
 })
 

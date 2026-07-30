@@ -255,7 +255,86 @@ export function validateTcgIdMatch(
   return true
 }
 
-export interface FuzzyCandidate { id: number; name: string | null; number: string | null }
+// ── Console scoping: language + set corroboration ────────────────────────────
+//
+// WHY (2026-07-30). `pickBestCanonicalMatch` accepted a `console-name` argument and
+// never read it: a row was matched on card NAME + NUMBER alone. The canonical candidate
+// pool is scoped to the ENGLISH TCGplayer category (`CATEGORY_TCGPLAYER_IDS` → 1/2/3/68),
+// so a foreign-language PriceCharting row — console "Pokemon Chinese Gem Pack",
+// product-name "Gengar #307" — matched the English Gengar #307 and wrote CHINESE
+// pricing onto an ENGLISH product. Nothing downstream could tell the two apart.
+//
+// TRACED FIRST, per the fix brief. The number-less rung already corroborates
+// console↔set (`pickNumberlessCanonicalMatch`), and that corroboration is now the ONE
+// shared `consoleCorroboratesSet()` below — but note what it does and does NOT do: it
+// tests SET tokens, not LANGUAGE. "Pokemon Japanese Promo" vs canonical set "SWSH Black
+// Star Promos" corroborates on `promo` alone, so set corroboration by itself would NOT
+// have closed the language hole. Language is therefore its own gate, and both rungs get
+// both gates.
+//
+// The language rule is SYMMETRIC — the PC console and the canonical set must resolve to
+// the SAME language — rather than "reject anything foreign". That way a genuinely
+// foreign-language canonical set (should the catalogue ever carry one, e.g. an
+// English-catalogue Japanese-alt-art set whose own name says so) still matches its own
+// PC rows, while an English set can never be priced from a foreign console.
+
+/**
+ * Foreign-language markers as they appear in PriceCharting console names
+ * ("Pokemon Chinese Gem Pack", "Pokemon Japanese Promo"). Matched as WHOLE `norm()`
+ * tokens, never substrings — 'polish' must not fire on the card name "Polished".
+ * Absence of every marker means English, which is what our canonical catalogue is.
+ */
+export const PC_LANGUAGE_MARKERS = [
+  'japanese', 'japan', 'chinese', 'korean', 'german', 'french', 'italian',
+  'spanish', 'portuguese', 'dutch', 'russian', 'polish', 'thai', 'indonesian',
+] as const
+/** The language of the canonical catalogue, and of any console carrying no marker. */
+export const DEFAULT_PC_LANGUAGE = 'english'
+
+/**
+ * The language a `norm()`ed string declares — the first marker present as a whole token,
+ * else `DEFAULT_PC_LANGUAGE`. PURE. Pass NORMALISED text (`norm(...)`).
+ */
+export function textLanguage(normed: string): string {
+  const tokens = String(normed ?? '').split(' ')
+  for (const marker of PC_LANGUAGE_MARKERS) {
+    if (tokens.includes(marker)) return marker
+  }
+  return DEFAULT_PC_LANGUAGE
+}
+
+/**
+ * Does a PC console-name corroborate a canonical set name? Bidirectional token overlap
+ * (so "Promo" ⊂ "Promotion Cards" corroborates either way) — extracted VERBATIM from the
+ * number-less rung so both rungs share ONE implementation and can never drift.
+ *
+ * Both arguments must already be `norm()`ed. An empty console or an empty set name
+ * corroborates NOTHING (fail toward rejection — an unresolvable console must never fall
+ * through to a name+number match).
+ */
+export function consoleCorroboratesSet(pcConsoleNorm: string, setNorm: string): boolean {
+  const console_ = String(pcConsoleNorm ?? '')
+  const set = String(setNorm ?? '')
+  if (!console_ || !set) return false
+  const setTokens = set.split(' ').filter((t) => t.length >= 3)
+  const consoleTokens = console_.split(' ').filter((t) => t.length >= 3)
+  return (
+    (setTokens.length > 0 && setTokens.some((t) => console_.includes(t))) ||
+    (consoleTokens.length > 0 && consoleTokens.some((t) => set.includes(t)))
+  )
+}
+
+/**
+ * A canonical candidate for the numeric fuzzy rung. `setName` is REQUIRED for a match:
+ * it carries both the language and the set corroboration, and a candidate without one
+ * is rejected rather than matched on name+number alone.
+ */
+export interface FuzzyCandidate {
+  id: number
+  name: string | null
+  number: string | null
+  setName: string | null
+}
 
 /**
  * Pick + VALIDATE the best canonical product for a CSV row with no usable tcg-id, by
@@ -267,6 +346,17 @@ export interface FuzzyCandidate { id: number; name: string | null; number: strin
  * in the candidate (number or name) (+3). Accept at ≥ 5 (name + number) — name alone
  * never settles it (the candidates are already number/set-scoped by the SQL caller, so a
  * name-only tie among same-number cards would be ambiguous). Returns the candidate id or null.
+ *
+ * CONSOLE SCOPING (2026-07-30) — `console-name` is now READ, not ignored. Every candidate
+ * must clear two gates before it is even scored:
+ *   1. LANGUAGE AGREEMENT — `textLanguage(console) === textLanguage(setName)`. This is
+ *      the fix for foreign-language rows ("Pokemon Chinese Gem Pack" · "Gengar #307")
+ *      being priced onto the English product of the same name + number.
+ *   2. CONSOLE↔SET CORROBORATION — the same bidirectional test the number-less rung uses.
+ * Both FAIL TOWARD REJECTION: a row with no console-name, or a candidate with no set
+ * name, is rejected outright rather than falling back to name+number. An unmatched row is
+ * recorded as a catalogue gap and retried on later windows; a WRONG match silently
+ * mis-prices a product with no signal at all.
  */
 export function pickBestCanonicalMatch(
   csvRow: { 'product-name'?: string; 'console-name'?: string },
@@ -275,6 +365,10 @@ export function pickBestCanonicalMatch(
   if (!Array.isArray(candidates) || candidates.length === 0) return null
   const csvName = norm(csvRow?.['product-name'])
   if (!csvName) return null
+  // No console-name → the language/set of this row is unresolvable → reject.
+  const pcConsole = norm(csvRow?.['console-name'])
+  if (!pcConsole) return null
+  const pcLanguage = textLanguage(pcConsole)
   // Name tokens for the name check EXCLUDE pure-numeric tokens — the embedded card number
   // is corroborated separately (numHit), and the canonical NAME doesn't carry it (it lives
   // in the candidate's number field).
@@ -287,6 +381,11 @@ export function pickBestCanonicalMatch(
   for (const c of candidates) {
     const candName = norm(c?.name)
     if (!candName) continue
+    // ── console scoping (both gates fail toward rejection) ────────────────────
+    const setNorm = norm(c?.setName)
+    if (!setNorm) continue                                   // unresolvable set → reject
+    if (textLanguage(setNorm) !== pcLanguage) continue        // language must AGREE
+    if (!consoleCorroboratesSet(pcConsole, setNorm)) continue
     const nameHit = nameTokens.every((t) => candName.includes(t))
     if (!nameHit) continue
     const candCompact = compact(`${candName} ${compact(cleanNumber(c?.number))}`)
@@ -318,7 +417,12 @@ export interface NumberlessCandidate { id: number; name: string | null; setName:
  *     `dodgers` token), AND
  *   - console↔set corroboration: at least one canonical set-name token appears in the
  *     PC console-name, or vice versa (bidirectional so "Promo" ⊂ "Promotion Cards"
- *     corroborates either way), AND
+ *     corroborates either way) — now the shared `consoleCorroboratesSet()`, which
+ *     `pickBestCanonicalMatch` uses too, AND
+ *   - LANGUAGE AGREEMENT (2026-07-30): the console and the canonical set must resolve to
+ *     the same language. Set corroboration alone does NOT imply this (a Japanese "…
+ *     Promo" console corroborates an English "… Promos" set on `promo`), and this rung
+ *     is reachable by foreign-language rows just as the numeric one is, AND
  *   - the accepting candidate is UNIQUE — two candidates passing both gates is
  *     ambiguous and returns null. Name alone never settles anything; the worst case
  *     stays "unmatched", never "wrong price".
@@ -332,7 +436,7 @@ export function pickNumberlessCanonicalMatch(
   const pcConsole = norm(csvRow?.['console-name'])
   if (!pcName) return null
   const hay = `${pcName} ${pcConsole}`.trim()
-  const consoleTokens = pcConsole.split(' ').filter((t) => t.length >= 3)
+  const pcLanguage = textLanguage(pcConsole)
 
   let acceptedId: number | null = null
   for (const c of candidates) {
@@ -342,11 +446,8 @@ export function pickNumberlessCanonicalMatch(
     if (nameTokens.length === 0) continue
     if (!nameTokens.every((t) => hay.includes(t))) continue
     const setNorm = norm(c?.setName)
-    const setTokens = setNorm.split(' ').filter((t) => t.length >= 3)
-    const setHit =
-      (setTokens.length > 0 && setTokens.some((t) => pcConsole.includes(t))) ||
-      (consoleTokens.length > 0 && setNorm.length > 0 && consoleTokens.some((t) => setNorm.includes(t)))
-    if (!setHit) continue
+    if (textLanguage(setNorm) !== pcLanguage) continue        // language must AGREE
+    if (!consoleCorroboratesSet(pcConsole, setNorm)) continue
     if (acceptedId != null && acceptedId !== c.id) return null   // ambiguous → unmatched
     acceptedId = c.id
   }
