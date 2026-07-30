@@ -355,10 +355,29 @@ Every worker cron/pipeline stage now writes ONE row to a NEW generic run log,
   is best-effort `JSON.stringify`'d into `counts_json` — this table has NO fixed per-job
   schema on purpose, since every stage's stats look different.
 - **`runStage(db, job, stage, fn)`** — wraps an EXISTING call at its call site (never
-  changes `fn`'s signature/return type): times it, writes exactly one row on success OR
-  failure (try/finally — the WP-2 `runMirrorJob` pattern generalised), and **rethrows**
-  whatever `fn` threw so existing `.catch(err => logger.error(...))` chains keep working
-  unchanged.
+  changes `fn`'s signature/return type): times it, records exactly one row on success OR
+  failure, and **rethrows** whatever `fn` threw so existing
+  `.catch(err => logger.error(...))` chains keep working unchanged.
+- **⚠️ START-ROW CONTRACT (2026-07-30) — the floor was blind to the failure it was built
+  for.** The row used to be written ONLY in `finally`, so an invocation killed mid-stage
+  (the `waitUntil` death the image-pipeline audit named as THE silent failure mode) left
+  **no row at all** — a stage that died looked exactly like a stage that never ran. Now:
+  - `writeRunStart()` inserts a START row up front — `finished_at NULL`,
+    `status = RUN_STAGE_RUNNING ('running')` — using `RETURNING id`;
+  - `finishRunLog()` UPDATEs that row on the terminal path with the real status, counts and
+    error.
+  - **Neither write may become a failure point.** A start write that throws (or a driver
+    that can't return an id) logs and returns null → the stage still runs and the terminal
+    path falls back to the legacy single INSERT. A finish UPDATE that throws or matches no
+    row → the legacy INSERT. Either way exactly ONE row lands per invocation and the
+    stage's own result/error is never masked.
+  - **NO MIGRATION** — `ingestion_run_log.finished_at` has been nullable since Content mig
+    0090 (verified `migrations/0090_ingestion_run_log.sql:33`).
+  - **Reading the signal:** `finished_at NOT NULL` = completed (status is the outcome);
+    `finished_at NULL` + recent = in flight; `finished_at NULL` + stale = **died
+    mid-stage**. Content classifies the last two (`GET /api/admin/ingestion/jobs` →
+    `state`, stuck after 60 min) and the Observability panel leads with a stuck count — a
+    NULL-finish row is never treated as "no data".
 - **Wired at:** the weekly image-mirror pipeline's four sub-stages (`mirror`,
   `scrydex-set-mappings`, `scrydex-image-sync`, `api-log-cleanup` — see
   `adminJobs.ts` `runWeeklyImagePipeline`, job id `image-mirror`); `tcg-sync` (`sync`
@@ -851,6 +870,33 @@ cron and looping to finish tripped the limit. Now:
     mirrors the API path's `setHit`) AND a UNIQUE accepting candidate (two accepts = ambiguous =
     unmatched). `match_method='numberless'`; bounded by the same `PC_INGEST_FUZZY_MAX` value
     (separate counter). Worst case stays "unmatched", never "wrong price".
+  - **⚠️ CONSOLE SCOPING — language + set, on BOTH fuzzy rungs (2026-07-30).**
+    `pickBestCanonicalMatch` accepted a `console-name` argument and **never read it**, so a
+    row matched on card NAME + NUMBER alone. The candidate pool is scoped to the ENGLISH
+    TCGplayer category, so a foreign-language row — console "Pokemon Chinese Gem Pack",
+    product-name "Gengar #307" — matched the English Gengar #307 and wrote **Chinese pricing
+    onto an English product**, with nothing downstream able to tell. Every candidate on the
+    numeric fuzzy AND number-less rungs must now clear two gates before it is scored:
+    1. **LANGUAGE AGREEMENT** — `textLanguage(console) === textLanguage(setName)`, where
+       `textLanguage()` reads `PC_LANGUAGE_MARKERS` (japanese/japan/chinese/korean/german/…)
+       as WHOLE `norm()` tokens, never substrings ('polish' must not fire on "Polished"); no
+       marker = `english`, which is what our catalogue is. The rule is **SYMMETRIC**, not
+       "reject anything foreign" — a genuinely foreign-language canonical set still matches
+       its own PC rows.
+    2. **CONSOLE↔SET CORROBORATION** — the shared `consoleCorroboratesSet()`, extracted
+       verbatim from the number-less rung so both rungs share ONE implementation.
+    **These are two gates, not one.** Set corroboration does NOT imply language agreement —
+    "Pokemon Japanese Promo" corroborates the English set "SWSH Black Star Promos" on
+    `promo` alone — so the corroboration rung was NOT already immune; it gained the language
+    gate too. **Both FAIL TOWARD REJECTION:** an empty `console-name`, or a candidate with no
+    set name, is rejected rather than falling back to name+number. `loadProductIndex`'s
+    primary pull therefore selects `s.name AS setName` — without it every fuzzy candidate is
+    rejected, which is the intended posture but would zero out the rung.
+    **Bad rows do NOT self-heal:** rung 0 reuses stamped `pricecharting_products` matches
+    and skips the matcher entirely, so historical cross-language stamps keep re-writing the
+    foreign price daily. Corrective sweep (operator-gated, dry-run default, **never run,
+    never crontab'd**): `scripts/audit-pc-language-mismatch.mjs` — clears the stamps and
+    deletes the stale `source='pricecharting'` rows, both of which regenerate.
   - **Persisted mapping** → `pricecharting_products` (pc_id ↔ canonical product id). Re-runs re-match
     in memory (cheap + deterministic) and re-upsert prices on the same conflict keys (= the daily
     refresh, no dupes). **Unmatched rows are RECORDED** (`canonical_product_id IS NULL`), never silently
