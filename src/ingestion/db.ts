@@ -6,9 +6,19 @@ import type {
   SyncStatus,
 } from '../types/db.js';
 import { sourceUrlUpsertByProductId, type ImageSourcePreference } from '../lib/productImages.js';
+import {
+  attributeStatementsForProduct,
+  attributesHash,
+  extractProductAttributes,
+  type ProductAttribute,
+} from '../lib/productAttributes.js';
 
 // D1 batch() is limited to 100 statements per call
 const BATCH_SIZE = 100;
+
+// D1 caps BOUND PARAMETERS at 100 per statement, so any IN (...) built from a per-group array
+// chunks at 90 (the same ceiling the Content app's chunkedIn.js enforces).
+const IN_CHUNK = 90;
 
 function chunk<T>(arr: T[], size: number): T[][] {
   const chunks: T[][] = [];
@@ -193,6 +203,108 @@ export async function upsertProductSourceImages(
       )
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Product attributes — TCGCSV extendedData -> product_attributes (Content mig 0125)
+// ---------------------------------------------------------------------------
+//
+// Persists the deck-building metadata TCGCSV has always carried but the ingest dropped: card type /
+// colour, energy or ink cost, supertype / subtype, HP, stage. Extraction + sanitisation + the hash
+// are the pure, unit-tested `lib/productAttributes.ts`; this function only decides WHICH products
+// need rewriting and batches the statements.
+//
+// MUST run AFTER upsertProducts() — it resolves canonical `products.id` (and reads the stored
+// hash) in the same SELECT, and a product minted by this run has to exist first.
+//
+// CHANGE GUARD (the reason this doesn't triple the daily sync's write volume): the daily cron
+// re-upserts the whole catalogue, but a published card's attributes never change. Each product
+// carries `products.extended_data_hash`; only products whose computed hash differs are rewritten.
+// Steady state is ~zero attribute writes/day, and the first run after deploy IS the backfill.
+//
+// ORDERING IS LOAD-BEARING: per product the statements are delete -> insert(s) -> stamp hash, all
+// in ONE atomic db.batch(), and a product's group is NEVER split across two batches. An invocation
+// killed mid-group therefore leaves the previous (or NULL) hash and the next run redoes it — the
+// failure mode is "does it again", never "silently skips forever". Do not reorder or regroup.
+export interface ProductAttributeSyncResult {
+  /** Products whose attribute rows were rewritten this run. */
+  productsChanged: number;
+  /** Products the hash proved already current — no statements issued. */
+  productsUnchanged: number;
+  /** Attribute rows inserted. */
+  attributeRowsWritten: number;
+  /** Products whose canonical row did not resolve (should be 0 — upsertProducts runs first). */
+  productsUnresolved: number;
+}
+
+interface ProductHashRow {
+  id: number;
+  tcgplayer_product_id: number;
+  extended_data_hash: string | null;
+}
+
+export async function syncProductAttributes(
+  db: D1Database,
+  rows: TcgProductRow[]
+): Promise<ProductAttributeSyncResult> {
+  const result: ProductAttributeSyncResult = {
+    productsChanged: 0,
+    productsUnchanged: 0,
+    attributeRowsWritten: 0,
+    productsUnresolved: 0,
+  };
+  if (rows.length === 0) return result;
+
+  // Desired state, computed once. `attributes` is normally pre-extracted by transformProduct; the
+  // fallback keeps this callable with a hand-built row (tests, future callers).
+  const desired = new Map<number, { attrs: ProductAttribute[]; hash: string }>();
+  for (const r of rows) {
+    const attrs = r.attributes ?? extractProductAttributes(r.extended_data);
+    desired.set(r.tcgplayer_product_id, { attrs, hash: attributesHash(attrs) });
+  }
+
+  // Resolve canonical ids + stored hashes in one chunked read (~4 statements for a 300-card set).
+  const stored = new Map<number, ProductHashRow>();
+  for (const ids of chunk([...desired.keys()], IN_CHUNK)) {
+    const { results } = await db
+      .prepare(
+        `SELECT id, tcgplayer_product_id, extended_data_hash
+           FROM products
+          WHERE tcgplayer_product_id IN (${ids.map(() => '?').join(', ')})`
+      )
+      .bind(...ids)
+      .all<ProductHashRow>();
+    for (const row of results ?? []) stored.set(row.tcgplayer_product_id, row);
+  }
+
+  // One statement GROUP per changed product; groups are packed into batches without ever splitting.
+  const groups: D1PreparedStatement[][] = [];
+  for (const [tcgProductId, { attrs, hash }] of desired) {
+    const row = stored.get(tcgProductId);
+    if (!row) {
+      result.productsUnresolved++;
+      continue;
+    }
+    if (row.extended_data_hash === hash) {
+      result.productsUnchanged++;
+      continue;
+    }
+    groups.push(attributeStatementsForProduct(db, row.id, attrs, hash));
+    result.productsChanged++;
+    result.attributeRowsWritten += attrs.length;
+  }
+
+  let batch: D1PreparedStatement[] = [];
+  for (const group of groups) {
+    if (batch.length > 0 && batch.length + group.length > BATCH_SIZE) {
+      await db.batch(batch);
+      batch = [];
+    }
+    batch.push(...group);
+  }
+  if (batch.length > 0) await db.batch(batch);
+
+  return result;
 }
 
 // ---------------------------------------------------------------------------

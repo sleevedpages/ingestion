@@ -2,11 +2,17 @@ import type { TcgGroup, TcgProduct, TcgPrice } from '../types/tcgcsv.js';
 import type { TcgCategoryRow, TcgSetRow, TcgProductRow, TcgPriceRow } from '../types/db.js';
 import type { ResolvedCategory } from './categories.js';
 import { getScrydexSetId } from '../lib/scrydexSets.js';
+import { extractProductAttributes } from '../lib/productAttributes.js';
 
+// Tier-resilient: a product whose `extendedData` is missing or not an array yields null here
+// instead of throwing. Before the attribute work this walked the array unguarded, so ONE malformed
+// product would fail its whole queue message and strand the set.
 function getExtendedValue(product: TcgProduct, fieldName: string): string | null {
+  const fields = product.extendedData;
+  if (!Array.isArray(fields)) return null;
   return (
-    product.extendedData.find(
-      (f) => f.name.toLowerCase() === fieldName.toLowerCase()
+    fields.find(
+      (f) => typeof f?.name === 'string' && f.name.toLowerCase() === fieldName.toLowerCase()
     )?.value ?? null
   );
 }
@@ -41,9 +47,9 @@ export function bumpTcgplayerImageRes(url: string | null | undefined): string | 
  * products regardless.
  */
 export function isCard(product: TcgProduct): boolean {
-  return product.extendedData.some(
-    (f) => f.name === 'Rarity' || f.name === 'Number'
-  );
+  const fields = product.extendedData;
+  if (!Array.isArray(fields)) return false;
+  return fields.some((f) => f?.name === 'Rarity' || f?.name === 'Number');
 }
 
 export function transformCategory(
@@ -97,6 +103,10 @@ export function transformProduct(
     card_number:   getExtendedValue(product, 'Number'),
     rarity:        getExtendedValue(product, 'Rarity'),
     extended_data: product.extendedData,
+    // The storable subset of extendedData (Content mig 0125) — raw keys, prose fields skipped,
+    // values sanitised. Extracted here, once, so db.ts syncProductAttributes never re-parses and
+    // the malformed/missing cases are covered by the transformer's own tests.
+    attributes:    extractProductAttributes(product.extendedData),
     synced_at:     now,
   };
 }

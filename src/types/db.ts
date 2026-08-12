@@ -1,4 +1,5 @@
 import type { TcgExtendedData } from './tcgcsv.js';
+import type { ProductAttribute } from '../lib/productAttributes.js';
 
 export interface TcgCategoryRow {
   tcgplayer_category_id: number;
@@ -37,6 +38,8 @@ export interface TcgProductRow {
   card_number: string | null;  // from extendedData "Number" — null for non-card products
   rarity: string | null;       // from extendedData "Rarity"  — null for non-card products
   extended_data: TcgExtendedData[];
+  /** Storable subset of extended_data -> product_attributes (Content mig 0125). */
+  attributes: ProductAttribute[];
   synced_at: Date;
 }
 

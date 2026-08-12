@@ -11,6 +11,7 @@ import {
   upsertSetsBatch,
   upsertProducts,
   upsertProductSourceImages,
+  syncProductAttributes,
   upsertPrices,
   createSyncLog,
   updateSyncLog,
@@ -340,6 +341,18 @@ async function processGroupInline(
     productRows,
     preferenceForLabel(preferences, message.tcgLabel)
   );
+  // Card attribute metadata -> product_attributes (Content mig 0125). Also resolves products.id,
+  // so it must follow upsertProducts. Hash-guarded: after the first (backfilling) run this is a
+  // read of the group's hashes and no writes at all, so the daily sync is not meaningfully slowed.
+  const attributes = await syncProductAttributes(config.db, productRows);
+  if (attributes.productsChanged > 0 || attributes.productsUnresolved > 0) {
+    logger.info('Product attributes synced', {
+      tcg: message.tcgLabel,
+      groupId: message.groupId,
+      name: message.groupName,
+      ...attributes,
+    });
+  }
   const pricesUpserted = await upsertPrices(config.db, priceRows);
 
   return { productsUpserted, pricesUpserted };

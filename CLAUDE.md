@@ -82,6 +82,7 @@ src/
     scrydexUrl.ts     # URL builders for Scrydex/Scrydex image CDN
     scrydexSets.ts    # set name → scrydex_expansion_id lookup map
     productImages.ts  # Session D: canonical product_images merge-upsert helpers (r2/source_url, keyed on products.id)
+    productAttributes.ts # Content mig 0125: TCGCSV extendedData -> product_attributes (raw keys, prose skipped, the extended_data_hash change guard)
   types/
     db.ts             # D1 row types
     tcgcsv.ts         # TCGCSV API response types
@@ -89,6 +90,7 @@ src/
 scripts/
   mirror-local.mjs    # Fetches images from local IP → uploads to Worker → R2
   mint-gem-packs.mjs  # Runbook for POST /admin/mint-pc-console: mints the 5 Gem Pack consoles (or --console <any>), prints the rollback map; --process enqueues the pokemon+one-piece re-PROCESS. Needs INGESTION_WORKER_SECRET env (never hardcoded).
+  audit-extended-data.mjs # Read-only TCGCSV extendedData survey across every enabled game (the mig-0125 diagnostic; --summary/--out/--games/--sets). No credentials, never crons.
   update-prices.mjs   # On-demand price ingest: PROCESS the cached R2 CSVs (default all 4 categories; --category a,b to scope; --sync = one inline window with match counts incl. numberless/pre-stamped; --fetch = fresh download, cooldown-aware → falls back to cached on 429). Safe + idempotent.
 
 db/migrations/
@@ -202,14 +204,65 @@ and the manual trigger call the SAME job functions (no duplicated logic):
   drain instead). Tests: `src/adminJobs.test.ts`.
 
 ## Data Sync Pipeline
-`runIngestion()` flow:
-1. Fetch all categories from TCGCSV → upsert `tcg_categories`
-2. For each supported game: fetch sets → upsert `tcg_sets`
-3. For each set that needs re-sync (scheduler): fetch products → upsert `tcg_products`
-4. Fetch prices for configured games → upsert `tcg_prices`
-5. Uses Cloudflare Queue to fan out per-set work (up to 10 groups per consumer invocation)
+`runIngestion()` flow (CANONICAL writers since Session D — the `tcg_*` tables were DROPPED by
+Content mig 0066):
+1. Fetch all categories from TCGCSV → upsert `canonical_games`
+2. For each enabled `tcg_supported_games` row: fetch sets → batch-upsert `sets`
+3. Enqueue ONE message per group; each consumer runs `processGroupInline`, which per group writes,
+   **in this order** (each step resolves `products.id` by sub-select, so the order is load-bearing):
+   `products` → `product_images.source_url` → **`product_attributes`** → `prices`
+4. Uses Cloudflare Queue to fan out per-set work (up to 10 groups per consumer invocation)
 
-Supported games are controlled by `tcg_categories` and `price-config.ts`. Currently: Pokémon, One Piece.
+Supported games are controlled by `tcg_supported_games` (Content Admin → Supported Games) and
+`price-config.ts`. **`runIngestion` is a FULL-CATALOGUE upsert every run** — it enqueues every group
+of every enabled game, with no per-set change filter (`scheduler.ts` is a stub kept only to record
+that Cron Triggers replaced it). That is why a schema addition needs no separate backfill job: the
+next `tcg-sync` IS the backfill.
+
+⚠️ **Change-detection early exit.** `runIngestion` returns immediately when TCGCSV's
+`/last-updated.txt` is not newer than the last successful sync (logs `TCGCSV has not updated since
+last sync — exiting early`). A manual `tcg-sync` fired after that day's 06:00 cron therefore does
+NOTHING. To force one, set the `FORCE_SYNC=true` worker var; otherwise the next daily cron is the
+reliable trigger. Do not read the early exit as a failure.
+
+## Card attribute metadata → `product_attributes` (Content mig 0125, 2026-08-11)
+
+TCGCSV's per-product `extendedData` block carries the deck-building metadata the ingest used to
+drop: card type, colour/ink/domain, energy or ink cost, subtype/class/tribe, HP, and Pokémon
+`Stage`. `transformProduct` now extracts it and `db.ts syncProductAttributes()` persists it.
+
+- **Pure core: `src/lib/productAttributes.ts`** — extraction, sanitisation, the change hash, and the
+  statement builders. Read `Content/docs/audits/2026-08-11_tcgcsv-extended-data-diagnostic.md`
+  before changing any constant there; every rule below came from that live survey of all eleven
+  enabled games (3,207 products).
+- **Raw keys, VERBATIM.** Games disagree on spelling for the same concept — `CardType` vs
+  `Card Type`, `Cost` / `PlayCost` / `Cost Ink` / `Energy Cost`, and Pokemon's `RetreatCost` vs
+  Pokemon Japan's `Retreat Cost`. Storing TCGplayer's key means a NEW game ingests correctly with
+  zero code change; the `(game, key) → facet` mapping is deliberately a Content READ-side concern so
+  a mapping fix is a deploy, not a 268k-product re-sync. **Never normalise a key on the way in.**
+- **Prose is skipped** (`ATTRIBUTE_PROSE_KEYS`): `Description`, `OracleText`, `CardText`,
+  `Attack N`, `Flavor Text`/`FlavorText`, `Inherited Effect`, `Security Effect`, `Disclaimer`.
+  ~12–27% of the rows but nearly all of the bytes, and the ONLY fields carrying HTML/CR-LF.
+- **Never throws** (the tier-resilient idiom): a missing / non-array / broken `extendedData` yields
+  zero rows for that product and no error. `getExtendedValue`/`isCard` were hardened the same way —
+  before this, one malformed product would have failed its whole queue message.
+- **Never truncates**: an over-long value is skipped WHOLE (a half-stored `;`-delimited trait list
+  would read as a real, wrong value to a filter).
+- ⚠️ **THE WRITE GUARD — `products.extended_data_hash`.** The daily sync re-upserts the whole
+  catalogue, so an unguarded rewrite would write ~2.1M rows twice over EVERY DAY for data that never
+  changes once a set is published. Each group's stored hashes are read in one chunked SELECT and
+  only changed products are rewritten. Steady state ≈ zero attribute writes/day; the first
+  post-deploy run is the backfill.
+- ⚠️ **ORDER IS LOAD-BEARING**: per product the statements are `DELETE` → `INSERT` → stamp hash, all
+  inside ONE atomic `db.batch()`, and a product's group is never split across batches. An invocation
+  killed mid-group leaves the old/NULL hash so the next run redoes it — the failure mode is "does it
+  again", never "silently skips forever". Never hoist the stamp ahead of the rows it vouches for.
+- **Content mig `0125` is BLOCKING for this worker deploy** (`syncProductAttributes` reads the
+  column and writes the table unconditionally on every group message).
+- Diagnostic is re-runnable: `node scripts/audit-extended-data.mjs --summary` (read-only, no
+  credentials; TCGCSV 401s without a `User-Agent`).
+- Tests: `src/lib/productAttributes.test.ts` (per-game fixtures incl. malformed/missing),
+  `src/ingestion/db.test.ts` (the change guard, batching, unresolved products).
 
 ## Image Mirror Pipeline
 
