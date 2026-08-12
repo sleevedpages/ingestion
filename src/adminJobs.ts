@@ -23,6 +23,7 @@ import type { Env } from './worker.js';
 import { runMirrorJob } from './image-mirror.js';
 import { syncScrydexSetMappings } from './scrydexSetMapping.js';
 import { syncScrydexImages } from './scrydexImageSync.js';
+import { runMtgAttributeFill } from './mtgAttributeFill.js';
 import { cleanupScrydexApiLog } from './lib/scrydexClient.js';
 import { PRICECHARTING_CATEGORIES, type PriceChartingCategory } from './lib/pricechartingCsv.js';
 import { runStage } from './lib/runLog.js';
@@ -77,6 +78,17 @@ export async function runWeeklyImagePipeline(env: Env): Promise<void> {
   if (env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID) {
     await runStage(env.DB, 'image-mirror', 'scrydex-set-mappings', () => syncScrydexSetMappings(env))
       .catch((err) => logger.error('Scrydex set mapping failed', { error: String(err) }));
+    // FUTURE-SETS DECISION (2026-08-12, card attributes Session 3A): the Magic cost/colour fill
+    // rides the weekly pipeline rather than a cron of its own, and runs immediately AFTER the set
+    // mappings so an expansion mapped this morning is filled this morning. It is the lowest-credit
+    // option available: the `scrydex_expansion_freshness` marks (`price_type='mtg_attrs'`) are
+    // applied in the SQL that picks the work, so an already-filled expansion is filtered out before
+    // any fetch — a steady-state weekly pass costs ZERO credits and only new expansions spend.
+    // Bounded per run, and its failure never fails the pipeline. ⚠️ It sits after the mirror's
+    // Infinity batches, so a very long mirror can leave it unreached (the standing WP-2 hazard);
+    // `scripts/fill-mtg-attributes.mjs` is the manual catch-up and the initial-backfill driver.
+    await runStage(env.DB, 'image-mirror', 'mtg-attribute-fill', () => runMtgAttributeFill(env))
+      .catch((err) => logger.error('MTG attribute fill failed', { error: String(err) }));
     await runStage(env.DB, 'image-mirror', 'scrydex-image-sync', () => syncScrydexImages(env))
       .catch((err) => logger.error('Scrydex image sync failed', { error: String(err) }));
   }

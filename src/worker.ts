@@ -25,6 +25,7 @@ import { sweepDeadSourceUrls } from './deadSourceUrlSweep.js';
 import { runScrydexImageRepairBatch } from './scrydexImageRepair.js';
 import { mintPcConsole } from './mintPcConsole.js';
 import { probeScrydexFields } from './scrydexFieldProbe.js';
+import { runMtgAttributeFill } from './mtgAttributeFill.js';
 import { runNewsPoll } from './newsPoll.js';
 import { runHashProductImages, HASH_SWEEP_MAX_LIMIT } from './hashProductImages.js';
 import { runValueSnapshots } from './valueSnapshots.js';
@@ -614,6 +615,37 @@ export default {
         return json(result, result.ok ? 200 : (result.creditLimited ? 503 : 500));
       } catch (err) {
         logger.error('scrydex-image-repair failed', { error: String(err) });
+        return json({ ok: false, error: String(err) }, 500);
+      }
+    }
+
+    // POST /admin/mtg-attribute-fill — fill Magic mana cost + colour into product_attributes from
+    // Scrydex (card attribute metadata, Session 3A). Body { maxExpansions?, force?, expansionId? }.
+    // SYNCHRONOUS + bounded, the purge/dead-url-sweep loop shape — but the cursor is the
+    // `scrydex_expansion_freshness` mark (`price_type='mtg_attrs'`), so there is no cursor to pass:
+    // the driver just re-calls until hasMore is false, and a killed run loses at most the expansion
+    // in flight. Credit-guarded; a guard trip or a 402/403 stops the run with a recorded reason and
+    // does NOT mark the in-flight expansion done. Writes ONLY `@scrydex.*` rows — the TCGCSV rows
+    // and `products.extended_data_hash` are untouchable from here.
+    if (pathname === '/admin/mtg-attribute-fill' && request.method === 'POST') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      if (!(env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID)) {
+        return json({ ok: false, error: 'SCRYDEX_API_KEY / SCRYDEX_TEAM_ID not configured' }, 503);
+      }
+      const body = await request.json().catch(() => ({})) as {
+        maxExpansions?: number; force?: boolean; expansionId?: string;
+      };
+      try {
+        const result = await runStage(env.DB, 'mtg-attribute-fill', 'fill', () =>
+          runMtgAttributeFill(env, {
+            maxExpansions: body.maxExpansions, force: body.force, expansionId: body.expansionId,
+          }));
+        return json(result, result.ok ? 200 : (result.stoppedReason === 'error' ? 500 : 503));
+      } catch (err) {
+        logger.error('mtg-attribute-fill failed', { error: String(err) });
         return json({ ok: false, error: String(err) }, 500);
       }
     }

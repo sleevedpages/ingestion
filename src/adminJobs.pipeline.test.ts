@@ -15,6 +15,9 @@ vi.mock('./scrydexSetMapping.js', () => ({
 vi.mock('./scrydexImageSync.js', () => ({
   syncScrydexImages: vi.fn(async () => { calls.push('image-sync') }),
 }))
+vi.mock('./mtgAttributeFill.js', () => ({
+  runMtgAttributeFill: vi.fn(async () => { calls.push('mtg-attribute-fill'); return {} }),
+}))
 vi.mock('./lib/scrydexClient.js', () => ({
   cleanupScrydexApiLog: vi.fn(async () => { calls.push('cleanup') }),
 }))
@@ -24,10 +27,10 @@ import { runWeeklyImagePipeline } from './adminJobs.js'
 beforeEach(() => { calls.length = 0 })
 
 describe('runWeeklyImagePipeline — mirror-first stage order (WP-2)', () => {
-  it('runs mirror → set-mappings → image-sync → cleanup when Scrydex keys are present', async () => {
+  it('runs mirror → set-mappings → mtg-attribute-fill → image-sync → cleanup when Scrydex keys are present', async () => {
     const env = { DB: {} as any, IMAGES_BUCKET: {} as any, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any
     await runWeeklyImagePipeline(env)
-    expect(calls).toEqual(['mirror', 'set-mappings', 'image-sync', 'cleanup'])
+    expect(calls).toEqual(['mirror', 'set-mappings', 'mtg-attribute-fill', 'image-sync', 'cleanup'])
   })
 
   it('runs mirror → cleanup when Scrydex keys are absent (UAT shape)', async () => {
@@ -41,6 +44,6 @@ describe('runWeeklyImagePipeline — mirror-first stage order (WP-2)', () => {
     ;(runMirrorJob as any).mockImplementationOnce(async () => { calls.push('mirror'); throw new Error('boom') })
     const env = { DB: {} as any, IMAGES_BUCKET: {} as any, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any
     await runWeeklyImagePipeline(env)
-    expect(calls).toEqual(['mirror', 'set-mappings', 'image-sync', 'cleanup'])
+    expect(calls).toEqual(['mirror', 'set-mappings', 'mtg-attribute-fill', 'image-sync', 'cleanup'])
   })
 })

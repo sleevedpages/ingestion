@@ -365,7 +365,7 @@ export interface UnmatchedCardEntry {
 
 // Deduped record of unknown webhook cards (migration 0089). The conflict target must
 // match uq_scrydex_unmatched_identity's COALESCE'd expression list exactly.
-const UNMATCHED_UPSERT_SQL = `
+export const UNMATCHED_UPSERT_SQL = `
   INSERT INTO scrydex_unmatched_cards
     (scrydex_card_id, card_name, card_number, game_slug, scrydex_expansion_id,
      tcgplayer_product_id, variant_name)

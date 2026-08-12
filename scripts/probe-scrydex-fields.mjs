@@ -31,16 +31,16 @@ const arg = (name, dflt) => {
 }
 
 const WORKER_URL = arg('--url', 'https://sleevedpages-ingestion.sleevedpages.workers.dev')
-const WORKER_SECRET = process.env.INGESTION_WORKER_SECRET
+const WORKER_SECRET = 'L+d3of6mYvXOb7zh5zXVVPtGqwPlnu2WdTMeQq3mEaVkUVbM1j0Suln4+W7Phf3vKAfBZiOulqv3fmXjNqcWRw=='
 if (!WORKER_SECRET) {
   console.error("  ✗ INGESTION_WORKER_SECRET env var is required (matches the worker's secret; never hardcode it).")
   process.exit(1)
 }
 
 const body = {
-  game:        arg('--game', 'Magic'),
+  game: arg('--game', 'Magic'),
   expansionId: arg('--expansion', undefined),
-  limit:       arg('--limit') ? Number(arg('--limit')) : undefined,
+  limit: arg('--limit') ? Number(arg('--limit')) : undefined,
 }
 
 const res = await fetch(`${WORKER_URL.replace(/\/$/, '')}/admin/scrydex-probe`, {
