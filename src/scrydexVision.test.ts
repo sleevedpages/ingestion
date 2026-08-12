@@ -63,7 +63,7 @@ describe('scrydexVisionIdentify', () => {
     expect(log!.args[3]).toBe(5)
   })
 
-  it('logs a 5-credit error row on a non-OK response (still returns it for caller circuit-breaking)', async () => {
+  it('logs a ZERO-credit error row on a non-OK response (still returns it for caller circuit-breaking)', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('{"code":"CREDIT_CAP_HIT"}', { status: 403 })))
     const db = makeFakeDB(sql => sql.includes('SUM(credits_used)') ? { total: 0 } : null)
 
@@ -71,6 +71,8 @@ describe('scrydexVisionIdentify', () => {
     expect(res.status).toBe(403)
     const log = db._runs.find(r => r.sql.includes('INSERT INTO scrydex_api_log') && r.args[4] === 'error')
     expect(log).toBeTruthy()
-    expect(log!.args[3]).toBe(5)
+    // A refused call served nothing and is not billable — charging it against the guard is what let
+    // the 2026-08-04 outage book 5,295 phantom credits. The row still records the attempt.
+    expect(log!.args[3]).toBe(0)
   })
 })

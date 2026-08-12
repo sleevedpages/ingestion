@@ -9,7 +9,17 @@
  * - Price matching in scrydexProcessor (matches on scrydex_set_id OR abbreviation)
  * - Image mirroring for non-Pokémon games once Scrydex CDN support is added
  *
- * Cost: 1 credit per game (6 games = 6 credits per weekly run).
+ * Cost: 1 credit per PAGE per game (see the pagination note below) — a handful per weekly run.
+ *
+ * ⚠️ PAGINATION (fixed 2026-08-12). This used to send `limit: '500'`, and Scrydex **silently
+ * ignores unknown params** — the exact defect that capped `/cards` at ~100 rows until 2026-06-12
+ * and was carried in Ingestion/CLAUDE.md as an open risk ever since. So only the FIRST page of each
+ * game's expansions was ever seen, and any game with more expansions than one page could never be
+ * fully mapped. Measured consequence on prod (2026-08-12): **70 of 454 Magic sets carried a
+ * `scrydex_expansion_id`** — 15% — which in turn capped every expansion-scoped Scrydex job for
+ * Magic (prices, images, and the Session-3A attribute fill) at ~21.7% of its products. It now
+ * paginates with `page`/`pageSize` and stops on `totalCount`, the same contract
+ * `fetchAllExpansionCards` uses.
  *
  * Match strategy (in priority order):
  * 1. Scrydex `code` or `ptcgo_code` matches our `tcg_sets.abbreviation`
@@ -17,8 +27,64 @@
  */
 
 import type { Env } from './worker.js'
-import { scrydexFetch, ScrydexCreditLimitError } from './lib/scrydexClient.js'
+import { scrydexFetch, ScrydexCreditLimitError, isScrydexRefusal } from './lib/scrydexClient.js'
 import { GAME_SLUG_BY_CANONICAL_NAME } from './lib/gameNames.js'
+
+/** Requested page size; Scrydex may cap lower, which `totalCount` paging handles. */
+const EXPANSION_PAGE_SIZE = 250
+/** Safety valve against a missing/zero `totalCount` — never an unbounded loop. */
+const EXPANSION_MAX_PAGES = 20
+
+/**
+ * Every expansion for one game, across all pages. Returns what it managed to read: a page that
+ * fails mid-way yields the pages already collected (`complete: false`) rather than throwing away
+ * the run's work — but a REFUSAL (402/403) rethrows so the caller's circuit breaker stops the whole
+ * sync instead of writing mappings from a partial catalogue.
+ */
+export async function fetchAllExpansions(
+  env:      Env,
+  gameSlug: string,
+): Promise<{ expansions: any[]; requests: number; complete: boolean }> {
+  const expansions: any[] = []
+  let requests = 0
+  let page = 1
+  let total = Infinity
+
+  while (expansions.length < total && page <= EXPANSION_MAX_PAGES) {
+    const res = await scrydexFetch(env, `/${gameSlug}/v1/expansions`, 'syncScrydexSetMappings', {
+      params: { pageSize: String(EXPANSION_PAGE_SIZE), page: String(page) },
+    })
+    requests++
+
+    if (!res.ok) {
+      if (isScrydexRefusal(res.status)) {
+        throw new ScrydexExpansionsError(res.status, `Scrydex ${res.status} for ${gameSlug}/expansions`)
+      }
+      console.warn(`[SetMapping] ${gameSlug} expansions page ${page} failed: ${res.status}`)
+      return { expansions, requests, complete: false }
+    }
+
+    const data  = await res.json() as { data?: unknown[]; totalCount?: number; total_count?: number }
+    const batch = (data.data ?? []) as any[]
+    expansions.push(...batch)
+
+    total = data.totalCount ?? data.total_count ?? expansions.length   // absent → stop after this page
+    if (batch.length === 0) break
+    page++
+  }
+
+  return { expansions, requests, complete: expansions.length >= total }
+}
+
+/** Carries the HTTP status so the caller can circuit-break on an account-level refusal. */
+export class ScrydexExpansionsError extends Error {
+  status: number
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'ScrydexExpansionsError'
+    this.status = status
+  }
+}
 
 // WP-3 (audit IMG-5/IMG-6b): configs derive from the ONE shared canonical-name map,
 // so the category names here are always the exact canonical_games.name strings
@@ -42,23 +108,18 @@ export async function syncScrydexSetMappings(env: Env): Promise<SyncResult> {
 
   for (const game of GAME_CONFIGS) {
     try {
-      const res = await scrydexFetch(
-        env,
-        `/${game.slug}/v1/expansions`,
-        'syncScrydexSetMappings',
-        { params: { limit: '500' } },
-      )
-      result.creditsUsed++
+      const { expansions, requests, complete } = await fetchAllExpansions(env, game.slug)
+      result.creditsUsed += requests
 
-      if (!res.ok) {
-        console.warn(`[SetMapping] ${game.slug} expansions failed: ${res.status}`)
+      if (!expansions.length) {
+        console.warn(`[SetMapping] ${game.slug}: no expansions returned — nothing to map`)
         continue
       }
 
-      const data = await res.json() as { data?: unknown[] }
-      const expansions = (data.data ?? []) as any[]
-
-      console.log(`[SetMapping] ${game.slug}: ${expansions.length} expansions from Scrydex`)
+      console.log(
+        `[SetMapping] ${game.slug}: ${expansions.length} expansions from Scrydex`,
+        `(${requests} page-call${requests === 1 ? '' : 's'}${complete ? '' : ', PARTIAL — some sets may stay unmapped'})`
+      )
 
       // Build lookup maps: code → scrydex_id, normalisedName → scrydex_id
       const byCode = new Map<string, string>()
@@ -159,6 +220,11 @@ export async function syncScrydexSetMappings(env: Env): Promise<SyncResult> {
     } catch (err) {
       if (err instanceof ScrydexCreditLimitError) {
         console.warn('[SetMapping] Credit limit guard triggered — stopping game processing')
+        break
+      }
+      if (err instanceof ScrydexExpansionsError && isScrydexRefusal(err.status)) {
+        // Account-level refusal (403 cap / 402 plan): every remaining game would fail the same way.
+        console.error(`[SetMapping] ${err.status} (Scrydex refusal) — circuit breaker, stopping run`)
         break
       }
       console.error(`[SetMapping] Error on ${game.slug}:`, err)

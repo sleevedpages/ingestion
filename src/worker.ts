@@ -24,6 +24,7 @@ import { purgePlaceholderMirrors } from './purgePlaceholderMirrors.js';
 import { sweepDeadSourceUrls } from './deadSourceUrlSweep.js';
 import { runScrydexImageRepairBatch } from './scrydexImageRepair.js';
 import { mintPcConsole } from './mintPcConsole.js';
+import { probeScrydexFields } from './scrydexFieldProbe.js';
 import { runNewsPoll } from './newsPoll.js';
 import { runHashProductImages, HASH_SWEEP_MAX_LIMIT } from './hashProductImages.js';
 import { runValueSnapshots } from './valueSnapshots.js';
@@ -613,6 +614,35 @@ export default {
         return json(result, result.ok ? 200 : (result.creditLimited ? 503 : 500));
       } catch (err) {
         logger.error('scrydex-image-repair failed', { error: String(err) });
+        return json({ ok: false, error: String(err) }, 500);
+      }
+    }
+
+    // POST /admin/scrydex-probe — READ-ONLY shape + match probe for the Scrydex /cards payload
+    // (card attribute metadata, Session 3A). Body { game?, expansionId?, limit? }. Fetches ONE page
+    // of ONE expansion (≈1 credit, NO writes, no freshness marks) and reports: the field census of
+    // the card + variant objects (so the fill's stored key names are pinned to observed data, never
+    // to documentation), and how many sampled cards each match rung resolves against our catalogue.
+    // Its purpose is to decide the fill's design BEFORE that code is written; it is not a job and
+    // never becomes a cron. A Scrydex error is returned as { ok:false, status } — no retries.
+    if (pathname === '/admin/scrydex-probe' && request.method === 'POST') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      if (!(env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID)) {
+        return json({ ok: false, error: 'SCRYDEX_API_KEY / SCRYDEX_TEAM_ID not configured' }, 503);
+      }
+      const body = await request.json().catch(() => ({})) as {
+        game?: string; expansionId?: string; limit?: number;
+      };
+      try {
+        const result = await probeScrydexFields(env, {
+          game: body.game, expansionId: body.expansionId, limit: body.limit,
+        });
+        return json(result, result.ok ? 200 : 502);
+      } catch (err) {
+        logger.error('scrydex-probe failed', { error: String(err) });
         return json({ ok: false, error: String(err) }, 500);
       }
     }

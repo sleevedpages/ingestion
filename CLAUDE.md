@@ -82,7 +82,8 @@ src/
     scrydexUrl.ts     # URL builders for Scrydex/Scrydex image CDN
     scrydexSets.ts    # set name → scrydex_expansion_id lookup map
     productImages.ts  # Session D: canonical product_images merge-upsert helpers (r2/source_url, keyed on products.id)
-    productAttributes.ts # Content mig 0125: TCGCSV extendedData -> product_attributes (raw keys, prose skipped, the extended_data_hash change guard)
+    productAttributes.ts # Content mig 0125: TCGCSV extendedData -> product_attributes (raw keys, prose skipped, the extended_data_hash change guard, the `@source.field` namespace for non-TCGCSV writers)
+  scrydexFieldProbe.ts   # Read-only Scrydex /cards shape + match probe (POST /admin/scrydex-probe); ~1 credit, no writes
   types/
     db.ts             # D1 row types
     tcgcsv.ts         # TCGCSV API response types
@@ -91,6 +92,7 @@ scripts/
   mirror-local.mjs    # Fetches images from local IP → uploads to Worker → R2
   mint-gem-packs.mjs  # Runbook for POST /admin/mint-pc-console: mints the 5 Gem Pack consoles (or --console <any>), prints the rollback map; --process enqueues the pokemon+one-piece re-PROCESS. Needs INGESTION_WORKER_SECRET env (never hardcoded).
   audit-extended-data.mjs # Read-only TCGCSV extendedData survey across every enabled game (the mig-0125 diagnostic; --summary/--out/--games/--sets). No credentials, never crons.
+  probe-scrydex-fields.mjs # Runbook for POST /admin/scrydex-probe: prints the Scrydex card-payload field census + per-rung match rates for ONE expansion (~1 credit, read-only). Needs INGESTION_WORKER_SECRET.
   update-prices.mjs   # On-demand price ingest: PROCESS the cached R2 CSVs (default all 4 categories; --category a,b to scope; --sync = one inline window with match counts incl. numberless/pre-stamped; --fetch = fresh download, cooldown-aware → falls back to cached on 429). Safe + idempotent.
 
 db/migrations/
@@ -152,6 +154,7 @@ The `0 3 * * SUN` and `0 4 * * *` (Scrydex) crons are not registered in the UAT 
 | `POST` | `/admin/purge-placeholder-mirrors` | `x-worker-secret` | **CARD-BACK CLEANUP SWEEP** (2026-07-08). Body `{ cursor?, limit? }`. **Synchronous + cursor-based** (NOT fire-and-forget): runs ONE bounded batch and returns `{ ok, scanned, purged, repaired, remaining, hasMore, cursorNext }`; the caller loops (pass `cursorNext` back as `cursor`) until `hasMore:false` — same loop shape as bulk-enrich / FETCH-PROCESS. Reads each `product_images.r2_url` object straight from R2, SHA-256s it, and on a `PLACEHOLDER_IMAGE_HASHES` match deletes the R2 object + repairs the row (source_url → reconstructed TCGplayer `_in_1000x1000`, r2_url/mirrored_at → NULL, source → NULL). Data changes are regenerable (rows self-repair on the next mirror), never destructive. Loop it with `scripts/purge-placeholder-mirrors.mjs`, or the Content admin panel's "Purge card-back placeholders" card. See **Card-back placeholder guard** below. |
 | `POST` | `/admin/dead-url-sweep` | `x-worker-secret` | **WP-6 DEAD SOURCE_URL SWEEP** (2026-07-08, audit IMG-7). Body `{ cursor?, limit? }`. **Synchronous + cursor-based**, same shape as purge-placeholder-mirrors: `{ ok, scanned, alive, dead, repaired, remaining, hasMore, cursorNext }`. Manual-trigger only — **no cron**. Probes `product_images` rows with NO `r2_url` (source_url is their only serving path) and hashes every response (a bare 200 isn't proof of life — Scrydex serves its card-back placeholder at 200); a placeholder match repairs via the SAME `tcgplayerPlaceholderFallback` path the mirror uses; a plain-dead probe (non-2xx/network error/empty body) marks the row via the EXISTING `mirror_attempts`/`mirror_last_attempt_at` bookkeeping (mig 0086) — no new column. `src/deadSourceUrlSweep.ts`. See **Dead source_url sweep (WP-6)** below. |
 | `POST` | `/admin/scrydex-image-repair` | `x-worker-secret` | **BANDAI IMAGE REPAIR** (2026-07-17, WP-1 re-scoped). Body `{ cursor? }`. **Synchronous + cursor-based**: re-syncs Scrydex art (+prices, force) for ONE mapped set of a `'scrydex'`-preferred game (mig 0104 — One Piece, Gundam) per call via `syncSingleSet`, → `{ ok, set?, setsRepaired, imagesUpdated, requests, remaining, hasMore, cursorNext, creditLimited? }`; the Content admin panel loops (CursorLoopCard "Bandai Scrydex image repair"). Repairs the pre-2026-07-07 TCGCSV clobber damage (watermarked TCGPlayer SAMPLE art). Idempotent; credit-guarded (a guard trip → 503 `creditLimited:true` WITHOUT advancing the cursor). Unmapped sets untouched (manual-image residual). `src/scrydexImageRepair.ts`; tests `src/scrydexImageRepair.test.ts`. |
+| `POST` | `/admin/scrydex-probe` | `x-worker-secret` | **READ-ONLY SHAPE + MATCH PROBE** (2026-08-12, card attributes Session 3A). Body `{ game?, expansionId?, limit? }` (default game `Magic`, default expansion = the newest mapped set). Fetches ONE page of ONE expansion — **≈1 credit, ZERO writes** (no attribute rows, no freshness marks, no hash stamp, no run-log row) — and returns `{ ok, cardsSampled, requests, cardFields[], variantFields[], withTcgplayerProductId, matchRungs, unmatchedSample }`. Exists so the fill's VERBATIM stored key names and its product resolver are pinned to observed payload rather than to Scrydex's docs. A refusal returns `{ ok:false, status }` (502) with no retry — which also makes it the cheapest live check that the account is healthy. Not a job, never a cron. `src/scrydexFieldProbe.ts`; runbook `node scripts/probe-scrydex-fields.mjs`. |
 | `POST` | `/admin/mint-pc-console` | `x-worker-secret` | **PC-CONSOLE MINT JOB** (2026-07-15, DIAGNOSTIC_DON_AND_GEMPACK B). Body `{ console_name, game (PC category e.g. 'pokemon-cards'), set_code?, set_name? }`. Mints ONE canonical `sets` row (game_id = the canonical game spine row; NO tcgplayer_group_id) + `products` rows from the console's still-unmatched `pricecharting_products` rows (name+`#NNN` parsed from product_name; genre/`Booster Box|Pack`-shaped → `product_kind='sealed'`; NO external ids), then stamps `canonical_product_id` + `match_method='minted'` so the next daily PROCESS writes prices with ZERO write-path changes (the matcher skips stamped rows). **Writes NO `product_images` row — the documented PC-mint image carve-out**; art arrives via the Content admin per-product upload. BLOCKING + IDEMPOTENT (upserts by set `(game_id,name)` / product `(set_id,name,number)`; re-run = no dupes; returns counts + the minted `productIds` range for rollback). Archetype: the 5 Chinese Gem Pack consoles (CBB1C–CBB5C); the one-piece/yugioh unmatched pools are future candidates. `src/mintPcConsole.ts`; tests `src/mintPcConsole.test.ts`. **Runbook: `node scripts/mint-gem-packs.mjs`** (all five + rollback map; `--process` chains the re-PROCESS; `--url` for UAT). |
 | `POST` | `/admin/hash-product-images` | `x-worker-secret` | **HASH SWEEP LOOP ENDPOINT** (2026-07-17, bulk scan intake). Body `{ cursor?, limit? }` (limit capped 1000). **Synchronous + cursor-based**, the purge/dead-url-sweep loop shape: runs ONE bounded sweep batch via `runStage('hash-product-images','hash', …)` → `{ ok, scanned, hashed, undecodable, transientFailures, circuitBroken, remaining, excludedTcgplayerCdn, gamesRepacked, hasMore, cursorNext }`. The anti-join is self-advancing so `cursor: 0` is always safe; pass `cursorNext` back to skip past transient failures within a looping session. The initial-backfill driver (the daily `0 2` cron only keeps up with new catalogue rows). No API key. `src/hashProductImages.ts`. |
 | `POST` | `/admin/run-job` | `x-worker-secret` | **MANUAL CRON-JOB TRIGGER** (2026-06-19). Body `{ job: 'tcg-sync'\|'image-mirror'\|'scrydex-drain'\|'card-watch-drain'\|'pricecharting-csv'\|'pricecharting-download', force? }`. Runs the SAME function the matching cron calls (`src/adminJobs.ts`), **fire-and-forget via `waitUntil`** → `{ ok, job, started:true, category? }`. Per-job prereqs: scrydex-drain needs Scrydex keys → 503; **pricecharting-download** (the ONLY download) needs `PRICECHARTING_TOKEN` → 503; **pricecharting-csv** PROCESSes the cached R2 file (no token, no download); image-mirror runs without Scrydex keys. **Double-fire guard:** best-effort KV lock `ingestion_job_lock:{job}` (shared `SLEEVEDPAGES_KV`) → **409** `{alreadyRunning:true}`. **pricecharting-download extra guard:** a download cooldown `ingestion_pc_csv_cooldown` (~10 min, set by ANY download — manual or cron) → **429** `{cooldown:true, retryAfterSec}` (PriceCharting CSV download is hard rate-limited ~1/10min, abuse → account revocation). `pricecharting-csv` (re-process) is NOT cooldown-gated — unlimited + safe. Content proxies this **admin-only** via `POST /api/admin/ingestion/trigger`; status via `GET /api/admin/ingestion/jobs`. See **Manual Cron-Job Triggers** below. |
@@ -219,6 +222,14 @@ of every enabled game, with no per-set change filter (`scheduler.ts` is a stub k
 that Cron Triggers replaced it). That is why a schema addition needs no separate backfill job: the
 next `tcg-sync` IS the backfill.
 
+⚠️ **The `tcg-sync` run-log row measures the ORCHESTRATOR, not the catalogue write.**
+`runStage('tcg-sync','sync', runIngestion)` wraps only steps 1–2 plus the enqueue, so every prod
+run finishes in **~10 seconds** with `status='success'` while the consumers are still draining —
+and the consumers write **no `ingestion_run_log` row at all**. A green `sync` row therefore means
+"fan-out dispatched", never "catalogue written". Track a real sync through
+`tcg_sync_log.groups_completed` vs `groups_enqueued`, or through the row counts of whatever the
+consumers write. Logged as an observability follow-up in Content's `open-backlog.md`.
+
 ⚠️ **Change-detection early exit.** `runIngestion` returns immediately when TCGCSV's
 `/last-updated.txt` is not newer than the last successful sync (logs `TCGCSV has not updated since
 last sync — exiting early`). A manual `tcg-sync` fired after that day's 06:00 cron therefore does
@@ -253,6 +264,21 @@ drop: card type, colour/ink/domain, energy or ink cost, subtype/class/tribe, HP,
   changes once a set is published. Each group's stored hashes are read in one chunked SELECT and
   only changed products are rewritten. Steady state ≈ zero attribute writes/day; the first
   post-deploy run is the backfill.
+- ⚠️ **THE `@` NAMESPACE — the table is MULTI-SOURCE as of 2026-08-12 (Session 3A).** TCGCSV is no
+  longer the only writer: sources that fill gaps TCGCSV provably cannot (first: Magic mana cost +
+  colour) write keys as **`@<source>.<field>`** (`externalAttributeKey`, source id `[a-z0-9]+`).
+  The rules, all in `productAttributes.ts`:
+  - the TCGCSV delete is scoped **`AND name NOT LIKE '@%'`** — it still owns every un-namespaced
+    key, including a NEW TCGplayer key, so nothing of its own can strand;
+  - an external writer deletes only `@<its source>.%` (`externalAttributeStatements`) and **NEVER
+    stamps `products.extended_data_hash`** — that column vouches for the TCGCSV rows alone;
+  - `extractProductAttributes` DROPS a raw `extendedData` key starting with `@`, so upstream can
+    never forge another source's provenance;
+  - field names stay VERBATIM for every source; a list value is `;`-joined like every other
+    multi-value in the table. Never widen the TCGCSV delete back to a bare `WHERE product_id = ?`.
+  Decision + rejected alternatives (a `source` column — the PK `(product_id, name)` collision it
+  does NOT solve; a sibling table — a heavier Content read):
+  `Content/docs/audits/2026-08-12_scrydex-mtg-attribute-fill-diagnostic.md` §2.
 - ⚠️ **ORDER IS LOAD-BEARING**: per product the statements are `DELETE` → `INSERT` → stamp hash, all
   inside ONE atomic `db.batch()`, and a product's group is never split across batches. An invocation
   killed mid-group leaves the old/NULL hash so the next run redoes it — the failure mode is "does it
@@ -261,8 +287,31 @@ drop: card type, colour/ink/domain, energy or ink cost, subtype/class/tribe, HP,
   column and writes the table unconditionally on every group message).
 - Diagnostic is re-runnable: `node scripts/audit-extended-data.mjs --summary` (read-only, no
   credentials; TCGCSV 401s without a `User-Agent`).
-- Tests: `src/lib/productAttributes.test.ts` (per-game fixtures incl. malformed/missing),
-  `src/ingestion/db.test.ts` (the change guard, batching, unresolved products).
+- Tests: `src/lib/productAttributes.test.ts` (per-game fixtures incl. malformed/missing, the `@`
+  namespace + the external builders), `src/ingestion/db.test.ts` (the change guard, batching,
+  unresolved products, and the COEXISTENCE pair — a TCGCSV rewrite preserves `@` rows; the external
+  writer never touches TCGCSV rows; both re-run idempotently).
+
+### Magic cost/colour fill (Session 3A) — DIAGNOSED, NOT BUILT (2026-08-12)
+
+Session 1 proved Magic carries no mana cost/colour in `extendedData`. The Scrydex fill that would
+close it is **specified but deliberately unwritten** — two blockers, both measured on prod:
+
+- ⛔ **Scrydex answers HTTP 402 to everything since 2026-08-04 04:14 UTC** (last success). Account
+  /billing state, not code. No probe, price drain, enrichment or fill can succeed until it clears.
+- ⛔ **Only 70 of 454 Magic sets carry a `scrydex_expansion_id`** (the fetch unit) → a 21.7% product
+  ceiling. Root cause was the `/expansions` ignored-`limit` bug, **fixed this session** (see Set
+  Mapping below); re-run the mapping once the account is live and re-measure before building.
+
+Shipped instead, both un-blocked: the coexistence contract above, and the probe —
+**`POST /admin/scrydex-probe`** (`src/scrydexFieldProbe.ts`, read-only, ≈1 credit): field census of
+the card/variant payload + per-rung match rates (R1 tcgplayer product_id · R2 `card.id` vs
+`products.number` · R3 number-in-expansion). ⚠️ `products.scrydex_card_id` is NULL for **all
+117,278** Magic products, so the resolver cannot assume it. Runbook:
+`node scripts/probe-scrydex-fields.mjs`. Full spec of the remaining work + the credit estimates:
+the §5 of the diagnostic above. **Hand-off note for the Content read side: `parseCostNumber`
+returns 2 for `{2}{W}{U}` (the generic pip, not the mana value 4) — chart `@scrydex.mana_value`, or
+write a real mana-cost parser.**
 
 ## Image Mirror Pipeline
 
@@ -521,6 +570,23 @@ Key exports:
 
 Credit guard: blocks calls when `scrydex_api_log` shows ≥ `SCRYDEX_MONTHLY_LIMIT - 500` credits used this month. Guard inserts a `status='blocked'` row and throws — never crashes the worker.
 
+⚠️ **ACCOUNT REFUSALS — 402 AND 403, not just 403 (fixed 2026-08-12).** `isScrydexRefusal(status)` /
+`SCRYDEX_REFUSAL_STATUSES` is the ONE predicate: **403** = CREDIT_CAP_HIT, **402** = the plan is not
+serving this key. Every per-expansion/per-card loop circuit-breaks on it (`scrydexProcessor`,
+`scrydexImageSync`, `seedVariantProducts`/`backfillVariantImages`, `syncScrydexSetMappings`);
+`scrydexEnrich` returns `skipped:'credit_cap'` for BOTH — deliberately the same string, because
+Content's bulk-enrich loop stops only on `credit_guard`/`credit_cap` and a new label would leave it
+looping. *Why:* from 2026-08-04 Scrydex answered 402 to everything and only 403 broke the circuit,
+so the daily drain re-attempted 600–1,000 rows a day into the wall for eight days.
+
+⚠️ **A FAILED CALL COSTS 0 CREDITS (changed 2026-08-12).** `scrydex_api_log.credits_used` is now 1
+(5 for Vision) ONLY on a served response; a non-OK response or a network failure logs its real
+status with `credits_used = 0`. The guard sums that column, so charging failures against it let the
+402 outage book **5,295 phantom credits** in one month — on a correctly-set limit that would have
+locked the worker out long after the provider recovered. Attempt volume is still visible in the log
+(the row is written either way); only the billable total changed. Anything reading burn history
+should compare `COUNT(*)` for attempts and `SUM(credits_used)` for spend.
+
 ### Cards endpoint query — `lib/scrydexCards.ts` (CRITICAL, fixed 2026-06-12)
 The Scrydex `/{game}/v1/cards` endpoint filters by a **Lucene `q` query** and paginates with
 **`page`/`pageSize`** — NOT the `expansion`/`limit` params the worker historically sent. Scrydex
@@ -536,9 +602,14 @@ still completes). Returns `{ cards, requests }` (requests = credits). Throws `Sc
 `scrydexImageSync`, `seedVariantProducts`, `backfillVariantImages`. The `expansionId` must be a real
 Scrydex expansion id (e.g. `OP09`, `GD04`), which is what `q=expansion.id:` matches.
 
-> The `/expansions` endpoint (`scrydexSetMapping`) still sends `limit:'500'` — same ignored-param
-> risk; if a game has >100 expansions only the first page is mapped. Manual mappings cover the gap
-> today; convert to `pageSize`/`page` if full auto-mapping is needed.
+> ✅ **`/expansions` now paginates too (fixed 2026-08-12).** It sent the ignored `limit:'500'` for as
+> long as this note warned about it, so only the FIRST page of each game's expansions was ever
+> mapped. Measured damage on prod: **70 of 454 Magic sets** carried a `scrydex_expansion_id`,
+> capping every expansion-scoped Magic job (prices, images, the attribute fill) at ~21.7% of the
+> game's products. `fetchAllExpansions()` now uses `pageSize`/`page` and stops on `totalCount`; a
+> partial read is REPORTED (`complete:false`), never mistaken for the whole catalogue. Cost rose
+> from 1 credit/game to 1 per page. **Re-run `/scrydex/sync-sets` once the account is live and
+> re-measure the mapped-set counts before trusting any Magic coverage figure.**
 
 ### Set Mapping
 - `tcg_sets.scrydex_set_id` maps a TCGPlayer set to its Scrydex expansion identifier

@@ -30,6 +30,22 @@
  *    half-stored `;`-delimited trait list would read as a real, wrong value to a filter. The cap is
  *    far above every observed kept value (the longest is Magic's 53-char `SubType` type line), so
  *    tripping it means the source changed shape and the omission is the honest outcome.
+ *
+ * 5. THE `@` NAMESPACE IS RESERVED FOR NON-TCGCSV SOURCES (2026-08-12, Session 3A).
+ *    `product_attributes` is no longer single-writer: sources other than TCGCSV fill gaps TCGCSV
+ *    provably cannot (the first is Magic mana cost + colour, which the 2026-08-11 diagnostic proved
+ *    absent from `extendedData` in every era). Because THIS writer rewrites a product's rows as one
+ *    atomic delete-then-insert group, an unscoped delete would silently wipe another source's rows
+ *    on the next day the product's TCGCSV hash changed. So:
+ *      • every non-TCGCSV key is stored as `@<source>.<field>` (`externalAttributeKey`);
+ *      • the TCGCSV delete is scoped `name NOT LIKE '@%'` — it owns every un-namespaced key,
+ *        including a NEW TCGplayer key it has never seen, so nothing of ITS OWN can ever strand;
+ *      • an external writer deletes only `@<its source>.%` and NEVER stamps
+ *        `products.extended_data_hash` (that column is TCGCSV's change guard, not a shared one);
+ *      • TCGCSV may never write INTO the namespace — a raw `extendedData` key starting with `@` is
+ *        dropped by `extractProductAttributes`, so provenance can't be forged from upstream.
+ *    Full rationale + the rejected alternatives (a `source` column; a sibling table):
+ *    `Content/docs/audits/2026-08-12_scrydex-mtg-attribute-fill-diagnostic.md` §2.
  */
 
 export interface ProductAttribute {
@@ -45,6 +61,33 @@ export const ATTRIBUTE_VALUE_MAX = 512
 export const ATTRIBUTE_NAME_MAX = 64
 /** Max attribute rows per product. Observed max key count on one product is 18. */
 export const ATTRIBUTE_COUNT_MAX = 64
+
+/**
+ * First character of every key written by a source OTHER than TCGCSV (rule 5). TCGplayer has never
+ * used it — verified against every key in the 11-game diagnostic — and `extractProductAttributes`
+ * refuses to store one, so the two key spaces can never overlap.
+ */
+export const EXTERNAL_KEY_PREFIX = '@'
+
+/** A source id may only be `[a-z0-9]+`: `_` and `%` are LIKE wildcards and would over-match. */
+const SOURCE_ID_RE = /^[a-z0-9]+$/
+
+/**
+ * The stored key for one field of one external source: `@scrydex.mana_cost`.
+ * Field names stay VERBATIM (rule 1 applies to every source) — the prefix is a namespace, not a
+ * rename, and the read side matches on the whole key through `attributeFacets.js`.
+ */
+export function externalAttributeKey(source: string, field: string): string {
+  if (!SOURCE_ID_RE.test(source)) {
+    throw new Error(`attribute source id must match ${SOURCE_ID_RE} (got ${JSON.stringify(source)})`)
+  }
+  return `${EXTERNAL_KEY_PREFIX}${source}.${field}`
+}
+
+/** True for a key in the reserved non-TCGCSV namespace. */
+export function isReservedAttributeKey(name: string): boolean {
+  return String(name ?? '').startsWith(EXTERNAL_KEY_PREFIX)
+}
 
 /**
  * Normalised form of a key: lowercase, non-alphanumerics removed. Used ONLY for matching against
@@ -119,7 +162,9 @@ export function sanitizeAttributeValue(raw: unknown): string {
  * Turn a raw `extendedData` block into the rows we will persist. Never throws (rule 3).
  *
  * Dropped, silently and by design: a non-array block; a non-object entry; a blank or over-long
- * key; a prose key (rule 2); an empty value (nothing to store, and `value` is NOT NULL); an
+ * key; a key in the reserved `@` namespace (rule 5 — TCGCSV must never be able to forge another
+ * source's provenance); a prose key (rule 2); an empty value (nothing to store, and `value` is NOT
+ * NULL); an
  * over-long value (rule 4); and any repeat of a key already seen — first occurrence wins, because
  * the table's PK is (product_id, name) and a duplicate inside one multi-row INSERT would abort the
  * whole atomic batch and fail the group.
@@ -136,6 +181,7 @@ export function extractProductAttributes(extendedData: unknown): ProductAttribut
 
     const rawName = typeof entry.name === 'string' ? entry.name.trim() : ''
     if (!rawName || rawName.length > ATTRIBUTE_NAME_MAX) continue
+    if (isReservedAttributeKey(rawName)) continue
     if (isProseAttributeKey(rawName)) continue
     if (seen.has(rawName)) continue
 
@@ -183,12 +229,32 @@ export const EMPTY_ATTRIBUTES_HASH = attributesHash([])
 // the cap even if a future game exceeds today's 18-key maximum.
 export const ATTRIBUTE_INSERT_ROWS_PER_STATEMENT = 20
 
-const DELETE_SQL = 'DELETE FROM product_attributes WHERE product_id = ?'
-const HASH_SQL   = 'UPDATE products SET extended_data_hash = ? WHERE id = ?'
+// ⚠️ COEXISTENCE (rule 5): the TCGCSV delete is SCOPED to un-namespaced keys. It still clears every
+// key TCGCSV owns — including one it has never seen before, so a new TCGplayer key can never strand
+// — while leaving `@source.*` rows written by another filler untouched. Never widen it back to a
+// bare `WHERE product_id = ?`: that is the delete-all that would wipe the other source's rows every
+// time this product's `extended_data_hash` changed.
+const DELETE_SQL          = `DELETE FROM product_attributes WHERE product_id = ? AND name NOT LIKE '${EXTERNAL_KEY_PREFIX}%'`
+const DELETE_EXTERNAL_SQL = 'DELETE FROM product_attributes WHERE product_id = ? AND name LIKE ?'
+const HASH_SQL            = 'UPDATE products SET extended_data_hash = ? WHERE id = ?'
 
-/** Clear a product's attribute rows. Always paired with the inserts in the SAME atomic batch. */
+/**
+ * Clear a product's TCGCSV attribute rows (never another source's — see DELETE_SQL).
+ * Always paired with the inserts in the SAME atomic batch.
+ */
 export function deleteAttributesStmt(db: D1Database, productId: number): D1PreparedStatement {
   return db.prepare(DELETE_SQL).bind(productId)
+}
+
+/** Clear ONE external source's rows for a product, and nothing else. */
+export function deleteExternalAttributesStmt(
+  db:        D1Database,
+  productId: number,
+  source:    string,
+): D1PreparedStatement {
+  // externalAttributeKey validates the source id; the `.` and `@` are LIKE-literal, and the
+  // `[a-z0-9]+` shape guarantees no `_`/`%` wildcard can sneak into the pattern.
+  return db.prepare(DELETE_EXTERNAL_SQL).bind(productId, `${externalAttributeKey(source, '')}%`)
 }
 
 /** Multi-row INSERTs for one product's attributes, chunked to stay inside D1's bound-param cap. */
@@ -238,5 +304,64 @@ export function attributeStatementsForProduct(
     deleteAttributesStmt(db, productId),
     ...insertAttributesStmts(db, productId, attrs),
     stampAttributesHashStmt(db, productId, hash),
+  ]
+}
+
+// ── External (non-TCGCSV) sources ────────────────────────────────────────────
+// The store-side half of the coexistence contract (rule 5). A filler supplies a flat
+// `{ field: value }` map of ITS OWN field names; this namespaces, sanitises and orders them, and
+// builds a group that touches only that source's rows.
+
+/**
+ * Turn one external source's raw fields into storable rows. Never throws (rule 3): a field that is
+ * absent, empty, non-scalar or over-long is simply not stored, so a card missing mana cost still
+ * persists its colours. Values are kept VERBATIM apart from the shared HTML/whitespace sanitiser —
+ * a mana-cost string stays `{2}{W}{U}`, and a list is joined with the `;` delimiter every other
+ * multi-value in this table already uses, so `splitAttributeValues` reads it unchanged.
+ *
+ * `position` is the field's index in the caller's own list — the same "source order" contract the
+ * TCGCSV rows carry, scoped to that source.
+ */
+export function buildExternalAttributes(
+  source: string,
+  fields: Readonly<Record<string, unknown>>,
+): ProductAttribute[] {
+  const out: ProductAttribute[] = []
+  for (const [field, raw] of Object.entries(fields ?? {})) {
+    if (out.length >= ATTRIBUTE_COUNT_MAX) break
+    if (!field.trim()) continue
+    const name = externalAttributeKey(source, field.trim())
+    if (name.length > ATTRIBUTE_NAME_MAX) continue
+
+    const value = Array.isArray(raw)
+      ? raw.map(v => sanitizeAttributeValue(v)).filter(v => v !== '').join(';')
+      : sanitizeAttributeValue(raw)
+    if (!value || value.length > ATTRIBUTE_VALUE_MAX) continue
+
+    out.push({ name, value, position: out.length })
+  }
+  return out
+}
+
+/**
+ * The full statement group for ONE product from ONE external source: delete-own-namespace →
+ * insert(s). Like the TCGCSV group it is atomic and must never be split across two `db.batch()`
+ * calls; unlike it, there is **no hash stamp** — `products.extended_data_hash` vouches for the
+ * TCGCSV rows alone, and stamping it here would make the daily sync skip a product whose TCGCSV
+ * attributes it had never actually written. An external filler's own resumability is per-expansion
+ * (`scrydex_expansion_freshness`), not per-product.
+ *
+ * A product with zero resolvable fields yields ONLY the delete — that is deliberate: it clears a
+ * stale row set when the source stops carrying the data, and re-running is idempotent either way.
+ */
+export function externalAttributeStatements(
+  db:        D1Database,
+  productId: number,
+  source:    string,
+  attrs:     readonly ProductAttribute[],
+): D1PreparedStatement[] {
+  return [
+    deleteExternalAttributesStmt(db, productId, source),
+    ...insertAttributesStmts(db, productId, attrs),
   ]
 }

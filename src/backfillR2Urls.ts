@@ -15,7 +15,7 @@
 import type { Env } from './worker.js'
 import { uploadCardImage } from './image-mirror.js'
 import { r2ImageUpsert, sourceUrlUpsertByProductId } from './lib/productImages.js'
-import { ScrydexCreditLimitError } from './lib/scrydexClient.js'
+import { ScrydexCreditLimitError, isScrydexRefusal } from './lib/scrydexClient.js'
 import { fetchAllExpansionCards, ScrydexCardsError } from './lib/scrydexCards.js'
 import {
   collectVariantEntries,
@@ -324,8 +324,8 @@ export async function seedVariantProducts(env: Env, game?: string): Promise<Seed
         console.warn('[SeedVariants] Credit limit guard triggered — stopping')
         break outer
       }
-      if (err instanceof ScrydexCardsError && err.status === 403) {
-        console.error('[SeedVariants] 403 (CREDIT_CAP_HIT) — circuit breaker, stopping run')
+      if (err instanceof ScrydexCardsError && isScrydexRefusal(err.status)) {
+        console.error(`[SeedVariants] ${err.status} (Scrydex refusal) — circuit breaker, stopping run`)
         break outer
       }
       console.error(`[SeedVariants] Error on expansion ${exp.scrydex_set_id}:`, err)
@@ -492,8 +492,8 @@ export async function backfillVariantImages(env: Env, game?: string): Promise<Va
         console.warn('[VariantBackfill] Credit limit guard triggered — stopping')
         break outer
       }
-      if (err instanceof ScrydexCardsError && err.status === 403) {
-        console.error('[VariantBackfill] 403 (CREDIT_CAP_HIT) — circuit breaker, stopping run')
+      if (err instanceof ScrydexCardsError && isScrydexRefusal(err.status)) {
+        console.error(`[VariantBackfill] ${err.status} (Scrydex refusal) — circuit breaker, stopping run`)
         break outer
       }
       console.error(`[VariantBackfill] Error on ${set.name}:`, err)

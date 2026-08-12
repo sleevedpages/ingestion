@@ -279,6 +279,29 @@ describe('processPendingWebhooks — 403 masking fix', () => {
     expect(db._runs.some(r => r.sql.includes('INSERT INTO scrydex_expansion_freshness'))).toBe(false)
   })
 
+  it('breaks on a 402 too, and books ZERO credits for the refused call (2026-08-12)', async () => {
+    // The 2026-08-04 outage: Scrydex answered 402 to everything for eight days. Only 403 broke the
+    // circuit, so the drain re-attempted 600–1,000 rows a DAY against a wall — and each failure was
+    // logged as a credit, booking 5,295 phantom credits against our own monthly guard.
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 402 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const db = makeFakeDB({ first: webhookFirstRouter, all: pendingAll })
+    await processPendingWebhooks({ DB: db, SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' } as any)
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    const apiLog = db._runs.find(r => r.sql.includes('INSERT INTO scrydex_api_log'))
+    expect(apiLog).toBeTruthy()
+    expect(apiLog!.args[2]).toBe(402)   // response_status recorded — the attempt stays visible
+    expect(apiLog!.args[3]).toBe(0)     // credits_used — a refused call served nothing
+
+    const webhookUpdates = db._runs.filter(r => r.sql.includes('scrydex_webhook_log'))
+    expect(webhookUpdates.some(r => /status\s*=\s*'error'/.test(r.sql))).toBe(true)
+    expect(webhookUpdates.some(r => /status\s*=\s*'complete'/.test(r.sql))).toBe(false)
+    expect(db._runs.some(r => r.sql.includes('INSERT INTO scrydex_expansion_freshness'))).toBe(false)
+  })
+
   it('marks the webhook COMPLETE and records freshness on a successful fetch', async () => {
     const card = {
       number: '25',

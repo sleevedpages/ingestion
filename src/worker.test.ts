@@ -105,6 +105,29 @@ describe('worker.ts — WP-0 auth on /sync, /mirror, /mirror/pending, /mirror/up
     })
   }
 
+  // The probe is secret-gated like everything else (WP-0) but self-skips without Scrydex keys,
+  // so it gets its own cases rather than the shared 200 expectation above.
+  describe('POST /admin/scrydex-probe', () => {
+    const req = () => new Request('https://worker.test/admin/scrydex-probe', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-worker-secret': SECRET },
+      body: JSON.stringify({ game: 'Magic' }),
+    })
+
+    it('401s with no secret header', async () => {
+      const bare = new Request('https://worker.test/admin/scrydex-probe', { method: 'POST' })
+      const res = await worker.fetch(bare, makeEnv(), fakeCtx())
+      expect(res.status).toBe(401)
+      expect(await res.json()).toEqual({ ok: false, error: 'Unauthorized' })
+    })
+
+    it('503s when the Scrydex keys are absent (e.g. UAT) instead of failing mid-probe', async () => {
+      const res = await worker.fetch(req(), makeEnv(), fakeCtx())
+      expect(res.status).toBe(503)
+      expect((await res.json() as any).error).toContain('SCRYDEX_API_KEY')
+    })
+  })
+
   it('POST /sync starts runIngestion in the background', async () => {
     const req = new Request('https://worker.test/sync', {
       method: 'POST',

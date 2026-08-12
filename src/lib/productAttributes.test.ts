@@ -7,8 +7,12 @@ import {
   EMPTY_ATTRIBUTES_HASH,
   attributeStatementsForProduct,
   attributesHash,
+  buildExternalAttributes,
+  externalAttributeKey,
+  externalAttributeStatements,
   extractProductAttributes,
   isProseAttributeKey,
+  isReservedAttributeKey,
   normalizeAttributeKey,
   sanitizeAttributeValue,
 } from './productAttributes.js'
@@ -318,7 +322,10 @@ describe('attributeStatementsForProduct', () => {
     const stmts = attributeStatementsForProduct(fakeDb(), 4242, attrs, 'deadbeef:1') as any[]
 
     expect(stmts).toHaveLength(3)
-    expect(stmts[0].sql).toBe('DELETE FROM product_attributes WHERE product_id = ?')
+    // SCOPED delete (rule 5): TCGCSV clears its own keys, never another source's `@…` rows.
+    expect(stmts[0].sql).toBe(
+      "DELETE FROM product_attributes WHERE product_id = ? AND name NOT LIKE '@%'"
+    )
     expect(stmts[0].args).toEqual([4242])
     expect(stmts[1].sql).toContain('INSERT INTO product_attributes')
     // 4 binds per row, all under the same product id.
@@ -340,5 +347,103 @@ describe('attributeStatementsForProduct', () => {
   it('a product with no attributes still deletes and stamps (so it stops being reprocessed)', () => {
     const stmts = attributeStatementsForProduct(fakeDb(), 9, [], EMPTY_ATTRIBUTES_HASH) as any[]
     expect(stmts.map(s => s.sql.split(' ')[0])).toEqual(['DELETE', 'UPDATE'])
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rule 5 — the `@` namespace + external-source coexistence (Session 3A, 2026-08-12)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('externalAttributeKey / isReservedAttributeKey', () => {
+  it('namespaces a field without renaming it', () => {
+    expect(externalAttributeKey('scrydex', 'mana_cost')).toBe('@scrydex.mana_cost')
+    expect(externalAttributeKey('scrydex', 'colors')).toBe('@scrydex.colors')
+  })
+
+  it('rejects a source id that could smuggle a LIKE wildcard into the delete pattern', () => {
+    for (const bad of ['my_source', 'scry%', 'Scrydex', 'scrydex.x', '']) {
+      expect(() => externalAttributeKey(bad, 'f')).toThrow()
+    }
+  })
+
+  it('recognises reserved keys and leaves every real TCGplayer key unreserved', () => {
+    expect(isReservedAttributeKey('@scrydex.mana_cost')).toBe(true)
+    // Every kept key observed across the eleven games in the 2026-08-11 diagnostic.
+    for (const raw of [
+      'Rarity', 'Number', 'Card Type', 'CardType', 'SubType', 'P', 'T', 'UPC', 'HP', 'Stage',
+      'Color', 'InkType', 'Domain', 'Attribute', 'MonsterType', 'Cost', 'PlayCost', 'Cost Ink',
+      'Energy Cost', 'Power Cost', 'RetreatCost', 'Retreat Cost', 'Character Traits', 'Trait',
+    ]) {
+      expect(isReservedAttributeKey(raw)).toBe(false)
+    }
+  })
+})
+
+describe('extractProductAttributes — the reserved namespace is not writable from TCGCSV', () => {
+  it('drops an extendedData key that tries to occupy another source\'s namespace', () => {
+    const attrs = extractProductAttributes(
+      ed(['Rarity', 'R'], ['@scrydex.mana_cost', '{9}{B}'], ['SubType', 'Creature']),
+    )
+    expect(attrs.map(a => a.name)).toEqual(['Rarity', 'SubType'])
+  })
+})
+
+describe('buildExternalAttributes', () => {
+  it('stores values verbatim and joins a list with the shared `;` delimiter', () => {
+    const attrs = buildExternalAttributes('scrydex', {
+      mana_cost: '{2}{W}{U}',
+      colors:    ['W', 'U'],
+      mana_value: 4,
+    })
+    expect(attrs).toEqual([
+      { name: '@scrydex.mana_cost',  value: '{2}{W}{U}', position: 0 },
+      { name: '@scrydex.colors',     value: 'W;U',       position: 1 },
+      { name: '@scrydex.mana_value', value: '4',         position: 2 },
+    ])
+  })
+
+  it('is tier-resilient: a card missing cost still persists what it has, and never throws', () => {
+    const attrs = buildExternalAttributes('scrydex', {
+      mana_cost: null,          // land / missing
+      colors:    [],            // colourless
+      color_identity: ['B'],
+    })
+    expect(attrs).toEqual([{ name: '@scrydex.color_identity', value: 'B', position: 0 }])
+  })
+
+  it('skips an over-long value whole rather than truncating it (rule 4)', () => {
+    const attrs = buildExternalAttributes('scrydex', {
+      ok:  'x',
+      big: 'y'.repeat(ATTRIBUTE_VALUE_MAX + 1),
+    })
+    expect(attrs.map(a => a.name)).toEqual(['@scrydex.ok'])
+  })
+})
+
+describe('externalAttributeStatements — coexistence contract', () => {
+  it('deletes ONLY its own namespace and never stamps the TCGCSV hash', () => {
+    const attrs = buildExternalAttributes('scrydex', { mana_cost: '{1}{G}', colors: ['G'] })
+    const stmts = externalAttributeStatements(fakeDb(), 55, 'scrydex', attrs) as any[]
+
+    expect(stmts[0].sql).toBe('DELETE FROM product_attributes WHERE product_id = ? AND name LIKE ?')
+    expect(stmts[0].args).toEqual([55, '@scrydex.%'])
+    expect(stmts[1].sql).toContain('INSERT INTO product_attributes')
+    expect(stmts[1].args.slice(0, 4)).toEqual([55, '@scrydex.mana_cost', '{1}{G}', 0])
+    // No UPDATE products — extended_data_hash vouches for the TCGCSV rows alone.
+    expect(stmts.some(s => s.sql.includes('extended_data_hash'))).toBe(false)
+  })
+
+  it('a card with nothing to store still clears its stale rows (idempotent re-run)', () => {
+    const stmts = externalAttributeStatements(fakeDb(), 55, 'scrydex', []) as any[]
+    expect(stmts).toHaveLength(1)
+    expect(stmts[0].sql.startsWith('DELETE')).toBe(true)
+  })
+
+  it('chunks its inserts under D1\'s bound-param cap like the TCGCSV path', () => {
+    const attrs = Array.from({ length: 45 }, (_, i) => ({ name: `@scrydex.k${i}`, value: 'v', position: i }))
+    const inserts = (externalAttributeStatements(fakeDb(), 7, 'scrydex', attrs) as any[])
+      .filter(s => s.sql.startsWith('INSERT'))
+    expect(inserts).toHaveLength(Math.ceil(45 / ATTRIBUTE_INSERT_ROWS_PER_STATEMENT))
+    for (const s of inserts) expect(s.args.length).toBeLessThanOrEqual(100)
   })
 })

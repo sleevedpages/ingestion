@@ -21,6 +21,23 @@ export class ScrydexCreditLimitError extends Error {
   }
 }
 
+/**
+ * Statuses that mean "this key will not be served, and retrying now cannot help" — an ACCOUNT-level
+ * refusal, as opposed to a transient error worth another attempt:
+ *
+ *   403  CREDIT_CAP_HIT — the plan's monthly cap is spent (the June 2026 outage).
+ *   402  Payment Required — the plan is not currently serving this key (the 2026-08-04 outage:
+ *        every call refused for eight days while the daily drain re-attempted 600–1,000 rows a day
+ *        against a wall it could not pass, because only 403 broke the circuit).
+ *
+ * Every loop that fetches per-expansion or per-card MUST break on this, not just on 403.
+ */
+export const SCRYDEX_REFUSAL_STATUSES: ReadonlySet<number> = new Set([402, 403])
+
+export function isScrydexRefusal(status: number | null | undefined): boolean {
+  return status != null && SCRYDEX_REFUSAL_STATUSES.has(status)
+}
+
 async function getMonthlyCreditsUsed(db: D1Database): Promise<number> {
   const row = await db.prepare(`
     SELECT COALESCE(SUM(credits_used), 0) AS total
@@ -103,7 +120,8 @@ export async function scrydexFetch(
     })
   } catch (err) {
     try {
-      await logCall(env.DB, endpoint, jobName, 'error', null, 1, String(err))
+      // A call that never reached Scrydex served no data and is not billable — see below.
+      await logCall(env.DB, endpoint, jobName, 'error', null, 0, String(err))
     } catch {
       // non-blocking
     }
@@ -111,10 +129,16 @@ export async function scrydexFetch(
   }
 
   // ── Log the result ────────────────────────────────────────────────────────
+  // ⚠️ A FAILED CALL COSTS 0 CREDITS (2026-08-12). This row is what `getMonthlyCreditsUsed` sums to
+  // decide whether to block, so charging failures against the guard means an OUTAGE eats the budget:
+  // the 2026-08-04 402 wall alone booked 5,295 phantom credits in a single month, which on a
+  // correctly-set limit would have locked the worker out well after the provider had recovered. The
+  // row is still written with its real status — attempt volume stays visible in the burn tooling —
+  // it simply no longer counts against a cap it never spent.
   const logStatus = response.ok ? 'success' : 'error'
   const logNotes  = response.ok ? null : `HTTP ${response.status}`
   try {
-    await logCall(env.DB, endpoint, jobName, logStatus, response.status, 1, logNotes)
+    await logCall(env.DB, endpoint, jobName, logStatus, response.status, response.ok ? 1 : 0, logNotes)
   } catch {
     // non-blocking — a logging failure must never prevent the response from returning
   }
@@ -179,17 +203,18 @@ export async function scrydexVisionIdentify(
     })
   } catch (err) {
     try {
-      await logCall(env.DB, endpoint, jobName, 'error', null, VISION_CREDITS, String(err))
+      await logCall(env.DB, endpoint, jobName, 'error', null, 0, String(err))
     } catch { /* non-blocking */ }
     throw err
   }
 
   try {
+    // Same rule as scrydexFetch: only a served response is billable (5 credits for Vision).
     await logCall(
       env.DB, endpoint, jobName,
       response.ok ? 'success' : 'error',
       response.status,
-      VISION_CREDITS,
+      response.ok ? VISION_CREDITS : 0,
       response.ok ? null : `HTTP ${response.status}`,
     )
   } catch { /* non-blocking */ }

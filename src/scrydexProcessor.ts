@@ -95,7 +95,7 @@
  */
 
 import type { Env } from './worker.js'
-import { ScrydexCreditLimitError } from './lib/scrydexClient.js'
+import { ScrydexCreditLimitError, isScrydexRefusal } from './lib/scrydexClient.js'
 import { normaliseCompany } from './scrydexEnrich.js'
 import { fetchAllExpansionCards, ScrydexCardsError } from './lib/scrydexCards.js'
 // WP-3 (audit IMG-5): shared canonical-name → slug map. The local SLUG_TO_GAME here once
@@ -730,8 +730,11 @@ export async function processPendingWebhooks(
         await failKey(key, msg, false)
         break
       }
-      if (err instanceof ScrydexFetchError && err.status === 403) {
-        console.error(`[ScrydexProcessor] 403 (CREDIT_CAP_HIT) on ${wi.gameSlug}/${wi.expansionId} — circuit breaker, stopping run`)
+      if (err instanceof ScrydexFetchError && isScrydexRefusal(err.status)) {
+        // 403 = CREDIT_CAP_HIT, 402 = the plan is not serving this key. Either way every further
+        // expansion this run would fail identically, so break instead of burning the whole backlog
+        // against it (the 2026-08-04 outage: ~600–1,000 refused calls/day for eight days).
+        console.error(`[ScrydexProcessor] ${err.status} on ${wi.gameSlug}/${wi.expansionId} — circuit breaker, stopping run`)
         circuitBroken = true
         await failKey(key, msg, false)
         break

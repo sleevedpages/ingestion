@@ -4,7 +4,10 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 // is testable without real network/credits. The pure parsers below import nothing networked.
 vi.mock('./lib/scrydexClient.js', () => {
   class ScrydexCreditLimitError extends Error { constructor() { super('guard'); this.name = 'ScrydexCreditLimitError' } }
-  return { scrydexFetch: vi.fn(), ScrydexCreditLimitError }
+  // isScrydexRefusal must be part of the mock: enrichCard uses it to decide the credit_cap skip,
+  // and an undefined import would silently make every refusal look like a normal response.
+  const isScrydexRefusal = (status: number | null | undefined) => status === 402 || status === 403
+  return { scrydexFetch: vi.fn(), ScrydexCreditLimitError, isScrydexRefusal }
 })
 
 import {

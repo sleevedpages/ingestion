@@ -21,7 +21,7 @@
  */
 
 import type { Env } from './worker.js'
-import { ScrydexCreditLimitError } from './lib/scrydexClient.js'
+import { ScrydexCreditLimitError, isScrydexRefusal } from './lib/scrydexClient.js'
 import { fetchAllExpansionCards, ScrydexCardsError } from './lib/scrydexCards.js'
 import { sourceUrlUpsertByProductId, sourceUrlUpsertByGroupNumber } from './lib/productImages.js'
 import { loadImagePreferences, preferenceForCanonicalGameName } from './lib/imagePreference.js'
@@ -231,8 +231,9 @@ export async function syncScrydexImages(env: Env, game?: string): Promise<SyncRe
         console.warn('[ImageSync] Credit limit guard triggered — stopping set processing')
         break
       }
-      if (err instanceof ScrydexCardsError && err.status === 403) {
-        console.error('[ImageSync] 403 (CREDIT_CAP_HIT) — circuit breaker, stopping run')
+      if (err instanceof ScrydexCardsError && isScrydexRefusal(err.status)) {
+        // 403 = credit cap, 402 = the plan is not serving this key. Neither clears mid-run.
+        console.error(`[ImageSync] ${err.status} (Scrydex refusal) — circuit breaker, stopping run`)
         break
       }
       console.error(`[ImageSync] Error on ${set.name}:`, err)

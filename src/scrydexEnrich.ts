@@ -33,7 +33,7 @@
  */
 
 import type { Env } from './worker.js'
-import { scrydexFetch, ScrydexCreditLimitError } from './lib/scrydexClient.js'
+import { scrydexFetch, ScrydexCreditLimitError, isScrydexRefusal } from './lib/scrydexClient.js'
 import { variantFinish, tcgProductIdOf } from './lib/variantCapture.js'
 // WP-3 (audit IMG-5): the game-name → slug map is the SHARED canonical-name map. The local
 // copy here once keyed 'Lorcana'/'Riftbound' — spellings that matched NOTHING, so Lorcana TCG
@@ -464,7 +464,10 @@ export async function enrichCard(
       const res = await scrydexFetch(env, `/${gameSlug}/v1/cards/${idPath}`, 'enrichCard:core', {
         params: { include: 'prices,pop_reports' },
       })
-      if (res.status === 403) return { ...result, skipped: 'credit_cap' }
+      // 402 rides the SAME 'credit_cap' skip value as 403 on purpose: Content's bulk-enrich loop
+      // stops only on 'credit_guard'/'credit_cap', so a new label would leave it looping against a
+      // refusing account. The true status is in scrydex_api_log.
+      if (isScrydexRefusal(res.status)) return { ...result, skipped: 'credit_cap' }
       if (res.ok) {
         const body = await res.json().catch(() => ({})) as { data?: unknown }
         const card = (body?.data ?? body) as unknown
@@ -500,7 +503,10 @@ export async function enrichCard(
   if (classes.has('comps')) {
     try {
       const res = await scrydexFetch(env, `/${gameSlug}/v1/cards/${idPath}/listings`, 'enrichCard:comps')
-      if (res.status === 403) return { ...result, skipped: 'credit_cap' }
+      // 402 rides the SAME 'credit_cap' skip value as 403 on purpose: Content's bulk-enrich loop
+      // stops only on 'credit_guard'/'credit_cap', so a new label would leave it looping against a
+      // refusing account. The true status is in scrydex_api_log.
+      if (isScrydexRefusal(res.status)) return { ...result, skipped: 'credit_cap' }
       if (res.ok) {
         const body = await res.json().catch(() => ({}))
         const listings = parseListings(body, canonicalProductId)
@@ -529,7 +535,10 @@ export async function enrichCard(
   if (classes.has('history')) {
     try {
       const res = await scrydexFetch(env, `/${gameSlug}/v1/cards/${idPath}/price_history`, 'enrichCard:history')
-      if (res.status === 403) return { ...result, skipped: 'credit_cap' }
+      // 402 rides the SAME 'credit_cap' skip value as 403 on purpose: Content's bulk-enrich loop
+      // stops only on 'credit_guard'/'credit_cap', so a new label would leave it looping against a
+      // refusing account. The true status is in scrydex_api_log.
+      if (isScrydexRefusal(res.status)) return { ...result, skipped: 'credit_cap' }
       if (res.ok) {
         const body = await res.json().catch(() => ({}))
         const points = parsePriceHistory(body)

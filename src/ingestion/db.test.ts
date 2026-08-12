@@ -3,6 +3,8 @@ import { upsertProductSourceImages, syncProductAttributes } from './db.js'
 import {
   EMPTY_ATTRIBUTES_HASH,
   attributesHash,
+  buildExternalAttributes,
+  externalAttributeStatements,
   extractProductAttributes,
 } from '../lib/productAttributes.js'
 
@@ -232,5 +234,106 @@ describe('syncProductAttributes — the change guard', () => {
     const res = await syncProductAttributes(db as any, [])
     expect(res.productsChanged).toBe(0)
     expect(db._batched).toHaveLength(0)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COEXISTENCE — TCGCSV and an external filler share product_attributes (Session 3A)
+//
+// The hazard this locks down: `syncProductAttributes` rewrites a product's rows as one atomic
+// delete-then-insert group, so an UNSCOPED delete would wipe another source's rows on every day
+// the product's TCGCSV hash happened to change. These tests execute the statements both writers
+// actually emit against a tiny row store that implements the two LIKE predicates and the
+// PRIMARY KEY (product_id, name), and assert neither writer can touch the other's rows.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Applies the recorded statements to a row set, honouring the PK and the two LIKE patterns. */
+function applyStatements(store: { product_id: number; name: string; value: string }[],
+                         stmts: { sql: string; args: unknown[] }[]) {
+  for (const s of stmts) {
+    if (s.sql.startsWith('DELETE')) {
+      const productId = s.args[0] as number
+      const keep = s.sql.includes('NOT LIKE')
+        // TCGCSV: everything that is NOT namespaced
+        ? (n: string) => n.startsWith('@')
+        // external: everything that is NOT this source's prefix
+        : (n: string) => !n.startsWith(String(s.args[1]).replace(/%$/, ''))
+      for (let i = store.length - 1; i >= 0; i--) {
+        if (store[i].product_id === productId && !keep(store[i].name)) store.splice(i, 1)
+      }
+    } else if (s.sql.startsWith('INSERT INTO product_attributes')) {
+      for (let i = 0; i < s.args.length; i += 4) {
+        const rowIn = { product_id: s.args[i] as number, name: s.args[i + 1] as string, value: s.args[i + 2] as string }
+        if (store.some(r => r.product_id === rowIn.product_id && r.name === rowIn.name)) {
+          throw new Error(`PRIMARY KEY conflict on (${rowIn.product_id}, ${rowIn.name})`)
+        }
+        store.push(rowIn)
+      }
+    }
+  }
+}
+
+describe('product_attributes coexistence — TCGCSV rewrite vs an external filler', () => {
+  const SCRYDEX_ROWS = [
+    { product_id: 500, name: '@scrydex.mana_cost', value: '{2}{W}{U}' },
+    { product_id: 500, name: '@scrydex.colors',    value: 'W;U' },
+  ]
+
+  it('a TCGCSV hash-change rewrite PRESERVES the external rows', async () => {
+    const store = [
+      { product_id: 500, name: 'Rarity',  value: 'Uncommon' },   // stale TCGCSV row
+      { product_id: 500, name: 'SubType', value: 'Creature' },
+      ...SCRYDEX_ROWS.map(r => ({ ...r })),
+    ]
+    const db = makeFakeDB([{ id: 500, tcgplayer_product_id: 1, extended_data_hash: 'stale:0' }])
+    await syncProductAttributes(db as any, [attrRow({ tcgplayer_product_id: 1 })])
+    applyStatements(store, db._batched)
+
+    // The stale TCGCSV rows are gone and replaced by the new set…
+    expect(store.filter(r => !r.name.startsWith('@')).map(r => r.name).sort())
+      .toEqual(['Card Type', 'Rarity', 'Stage'])
+    expect(store.find(r => r.name === 'Rarity')?.value).toBe('Common')
+    // …while both Scrydex rows survived the rewrite untouched. This is the deciding assertion.
+    expect(store.filter(r => r.name.startsWith('@'))).toEqual(SCRYDEX_ROWS)
+  })
+
+  it('the external filler never touches TCGCSV rows, and re-running either writer is idempotent', async () => {
+    const store = [
+      { product_id: 500, name: 'Rarity',  value: 'Common' },
+      { product_id: 500, name: 'SubType', value: 'Creature' },
+    ]
+    const fill = () => externalAttributeStatements(
+      makeFakeDB() as any, 500, 'scrydex',
+      buildExternalAttributes('scrydex', { mana_cost: '{2}{W}{U}', colors: ['W', 'U'] }),
+    ) as any as { sql: string; args: unknown[] }[]
+
+    applyStatements(store, fill())
+    expect(store.map(r => r.name).sort())
+      .toEqual(['@scrydex.colors', '@scrydex.mana_cost', 'Rarity', 'SubType'])
+
+    // A second fill re-runs cleanly: its delete clears its own rows first, so no PK conflict and
+    // no duplicates — the property that makes a killed run safe to simply re-trigger.
+    applyStatements(store, fill())
+    expect(store).toHaveLength(4)
+
+    // And a TCGCSV rewrite on top still leaves exactly one copy of each Scrydex row.
+    const db = makeFakeDB([{ id: 500, tcgplayer_product_id: 1, extended_data_hash: 'stale:0' }])
+    await syncProductAttributes(db as any, [attrRow({ tcgplayer_product_id: 1 })])
+    applyStatements(store, db._batched)
+    expect(store.filter(r => r.name.startsWith('@scrydex.')).map(r => r.name).sort())
+      .toEqual(['@scrydex.colors', '@scrydex.mana_cost'])
+  })
+
+  it('a NEW TCGplayer key never strands — the scoped delete still owns every un-namespaced key', async () => {
+    const store = [
+      { product_id: 500, name: 'RetiredKey', value: 'x' },   // a key TCGCSV no longer sends
+      ...SCRYDEX_ROWS.map(r => ({ ...r })),
+    ]
+    const db = makeFakeDB([{ id: 500, tcgplayer_product_id: 1, extended_data_hash: 'stale:0' }])
+    await syncProductAttributes(db as any, [attrRow({ tcgplayer_product_id: 1 })])
+    applyStatements(store, db._batched)
+
+    expect(store.some(r => r.name === 'RetiredKey')).toBe(false)
+    expect(store.filter(r => r.name.startsWith('@'))).toHaveLength(2)
   })
 })
