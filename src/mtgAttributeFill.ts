@@ -63,8 +63,19 @@ export const FILL_FIELDS = ['mana_cost', 'mana_value', 'colors', 'color_identity
 
 const IN_CHUNK    = 90    // D1 caps bound params at 100/statement
 const BATCH_SIZE  = 100   // statements per db.batch()
-/** Expansions per invocation. The seed's measured `waitUntil` ceiling is ~25; this leaves headroom. */
-const DEFAULT_MAX_EXPANSIONS = 15
+/**
+ * Expansions per invocation. **ONE**, matching `scrydex-image-repair` (one set per call) and
+ * `purge-placeholder-mirrors` (one batch per call) — this endpoint is SYNCHRONOUS, so the whole
+ * batch has to finish inside a single client-facing request.
+ *
+ * ⚠️ Measured 2026-08-12: a default of 15 killed the connection outright — `fetch failed /
+ * UND_ERR_SOCKET, other side closed` with `bytesRead: 0`, i.e. the edge gave up long before the
+ * worker could answer. A big Magic expansion is several page fetches plus dozens of D1 batches; a
+ * dozen of them in one request is minutes of work. The driver script loops, so throughput is
+ * unchanged and every completed expansion is durably marked. Raise it with `maxExpansions` only for
+ * a run of known-small expansions.
+ */
+const DEFAULT_MAX_EXPANSIONS = 1
 
 function chunk<T>(arr: T[], size: number): T[][] {
   const out: T[][] = []

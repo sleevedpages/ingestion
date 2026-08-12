@@ -324,6 +324,11 @@ here). ⚠️ **The server caps `/cards` at 100/page** regardless of the 250 req
   `variant_name='attributes'`) — a recorded catalogue gap, never a forced match.
 - **A matched card with no fillable fields is LEFT ALONE** (no bare DELETE), so a later payload
   regression cannot silently wipe a good fill.
+- ⚠️ **ONE EXPANSION PER CALL (`DEFAULT_MAX_EXPANSIONS = 1`)** — the same shape as
+  `scrydex-image-repair` (one set/call) and `purge-placeholder-mirrors` (one batch/call), because
+  the endpoint is SYNCHRONOUS. A default of 15 was tried on 2026-08-12 and the edge closed the
+  connection before the worker could answer (`UND_ERR_SOCKET: other side closed`, `bytesRead: 0`).
+  The driver loops, so throughput is identical. Raise `maxExpansions` only for known-small sets.
 - **Resumable, zero-cost re-runs:** each finished expansion is marked in
   `scrydex_expansion_freshness` with its OWN class **`price_type='mtg_attrs'`** (never `raw`/
   `graded` — the fill must not fresh-skip a price fetch, or vice versa), and the mark is applied in

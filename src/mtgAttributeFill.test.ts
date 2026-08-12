@@ -210,6 +210,21 @@ describe('runMtgAttributeFill', () => {
     expect(fetchSpy).not.toHaveBeenCalled()     // resumability costs ZERO credits
   })
 
+  it('defaults to ONE expansion per call — the endpoint is synchronous (see DEFAULT_MAX_EXPANSIONS)', async () => {
+    const db = makeFakeDB({
+      expansions: [{ scrydex_expansion_id: 'A' }, { scrydex_expansion_id: 'B' }, { scrydex_expansion_id: 'C' }],
+      byTcgId: { '517534': 11 },
+    })
+    mockCards([MERFOLK])
+
+    const res = await runMtgAttributeFill(env(db))
+
+    // A larger default closed the connection before the worker could answer (2026-08-12).
+    expect(res.expansionsProcessed).toBe(1)
+    expect(res.expansionsRemaining).toBe(2)
+    expect(res.hasMore).toBe(true)
+  })
+
   it('bounds the invocation and reports the remainder for the loop driver', async () => {
     const db = makeFakeDB({
       expansions: [{ scrydex_expansion_id: 'A' }, { scrydex_expansion_id: 'B' }, { scrydex_expansion_id: 'C' }],

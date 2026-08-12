@@ -42,13 +42,42 @@ const maxCalls = arg('--max-calls') ? Number(arg('--max-calls')) : Infinity
 
 const totals = { calls: 0, expansions: 0, cards: 0, products: 0, rows: 0, unmatched: 0, credits: 0 }
 
+const ENDPOINT = `${WORKER_URL.replace(/\/$/, '')}/admin/mtg-attribute-fill`
+const REQUEST_TIMEOUT_MS = 120_000
+const NETWORK_RETRIES = 3
+
+/**
+ * One call, with retries on a NETWORK failure only (never on an application error).
+ *
+ * A long synchronous request can have its connection closed by the edge before the worker answers
+ * (`UND_ERR_SOCKET: other side closed`) — and the work may well have completed anyway. Retrying is
+ * safe precisely because the job is resumable and idempotent: a finished expansion is already
+ * marked, so the retry either resumes past it or redoes an unmarked one. Never a duplicate row.
+ */
+async function callOnce() {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const res = await fetch(ENDPOINT, {
+        method: 'POST',
+        headers: { 'x-worker-secret': WORKER_SECRET, 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      })
+      return await res.json().catch(() => ({ ok: false, error: `non-JSON response (HTTP ${res.status})` }))
+    } catch (err) {
+      const reason = err?.cause?.code ?? err?.name ?? String(err)
+      if (attempt > NETWORK_RETRIES) {
+        return { ok: false, stoppedReason: 'network', error: `${reason} after ${NETWORK_RETRIES} retries` }
+      }
+      const waitSec = attempt * 5
+      console.log(`  ⚠️ connection dropped (${reason}) — retry ${attempt}/${NETWORK_RETRIES} in ${waitSec}s (work already done is kept)`)
+      await new Promise(r => setTimeout(r, waitSec * 1000))
+    }
+  }
+}
+
 while (totals.calls < maxCalls) {
-  const res = await fetch(`${WORKER_URL.replace(/\/$/, '')}/admin/mtg-attribute-fill`, {
-    method: 'POST',
-    headers: { 'x-worker-secret': WORKER_SECRET, 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-  const data = await res.json().catch(() => ({ ok: false, error: `non-JSON response (HTTP ${res.status})` }))
+  const data = await callOnce()
   totals.calls++
 
   totals.expansions += data.expansionsProcessed ?? 0
@@ -72,6 +101,10 @@ while (totals.calls < maxCalls) {
     }
     if (data.stoppedReason === 'credit_guard') {
       console.error('  The monthly credit guard tripped. Check Admin → Scrydex before re-running.')
+    }
+    if (data.stoppedReason === 'network') {
+      console.error('  The connection kept dropping. Everything already marked is kept — just re-run.')
+      console.error('  If it repeats on one expansion, isolate it: --expansion <ID> --force')
     }
     break
   }
