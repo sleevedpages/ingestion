@@ -90,10 +90,12 @@ src/
     tcgcsv.ts         # TCGCSV API response types
 
 scripts/
+  lib/workerSecret.mjs # `resolveWorkerSecret()` — the ONE way a script gets INGESTION_WORKER_SECRET: env var, else the gitignored `.dev.vars`. ⛔ NEVER hardcode the value in a script (it happened twice on 2026-08-12; the files are version-controlled and the secret grants every admin endpoint + R2 writes).
   mirror-local.mjs    # Fetches images from local IP → uploads to Worker → R2
   mint-gem-packs.mjs  # Runbook for POST /admin/mint-pc-console: mints the 5 Gem Pack consoles (or --console <any>), prints the rollback map; --process enqueues the pokemon+one-piece re-PROCESS. Needs INGESTION_WORKER_SECRET env (never hardcoded).
   audit-extended-data.mjs # Read-only TCGCSV extendedData survey across every enabled game (the mig-0125 diagnostic; --summary/--out/--games/--sets). No credentials, never crons.
   probe-scrydex-fields.mjs # Runbook for POST /admin/scrydex-probe: prints the Scrydex card-payload field census + per-rung match rates for ONE expansion (~1 credit, read-only). Needs INGESTION_WORKER_SECRET.
+  sync-scrydex-sets.mjs # Runs POST /scrydex/sync-sets (fire-and-forget) and MEASURES the result: mapped/total sets per game + Magic's product ceiling, before vs after. `--measure-only` is read-only (no secret, no credits). Needs INGESTION_WORKER_SECRET otherwise.
   fill-mtg-attributes.mjs # Loop driver for POST /admin/mtg-attribute-fill (Magic mana cost + colour → product_attributes). Resumable, safe to re-run; --batch/--max-calls/--expansion/--force. SPENDS CREDITS. Needs INGESTION_WORKER_SECRET.
   update-prices.mjs   # On-demand price ingest: PROCESS the cached R2 CSVs (default all 4 categories; --category a,b to scope; --sync = one inline window with match counts incl. numberless/pre-stamped; --fetch = fresh download, cooldown-aware → falls back to cached on 429). Safe + idempotent.
 

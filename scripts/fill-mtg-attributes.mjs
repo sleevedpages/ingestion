@@ -21,6 +21,8 @@
  *   INGESTION_WORKER_SECRET=... node scripts/fill-mtg-attributes.mjs --url https://<uat-worker-url>
  */
 
+import { resolveWorkerSecret } from './lib/workerSecret.mjs'
+
 const args = process.argv.slice(2)
 const arg = (name, dflt) => {
   const i = args.indexOf(name)
@@ -28,11 +30,8 @@ const arg = (name, dflt) => {
 }
 
 const WORKER_URL = arg('--url', 'https://sleevedpages-ingestion.sleevedpages.workers.dev')
-const WORKER_SECRET = process.env.INGESTION_WORKER_SECRET
-if (!WORKER_SECRET) {
-  console.error("  ✗ INGESTION_WORKER_SECRET env var is required (matches the worker's secret; never hardcode it).")
-  process.exit(1)
-}
+// Resolved from the environment, else from the gitignored `.dev.vars` — never hardcoded here.
+const WORKER_SECRET = resolveWorkerSecret({ scriptName: 'fill-mtg-attributes.mjs' })
 
 const body = {
   maxExpansions: arg('--batch') ? Number(arg('--batch')) : undefined,

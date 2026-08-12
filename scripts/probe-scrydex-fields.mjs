@@ -24,6 +24,8 @@
  *   INGESTION_WORKER_SECRET=... node scripts/probe-scrydex-fields.mjs --json    # raw response
  */
 
+import { resolveWorkerSecret } from './lib/workerSecret.mjs'
+
 const args = process.argv.slice(2)
 const arg = (name, dflt) => {
   const i = args.indexOf(name)
@@ -31,11 +33,8 @@ const arg = (name, dflt) => {
 }
 
 const WORKER_URL = arg('--url', 'https://sleevedpages-ingestion.sleevedpages.workers.dev')
-const WORKER_SECRET = 'L+d3of6mYvXOb7zh5zXVVPtGqwPlnu2WdTMeQq3mEaVkUVbM1j0Suln4+W7Phf3vKAfBZiOulqv3fmXjNqcWRw=='
-if (!WORKER_SECRET) {
-  console.error("  ✗ INGESTION_WORKER_SECRET env var is required (matches the worker's secret; never hardcode it).")
-  process.exit(1)
-}
+// Resolved from the environment, else from the gitignored `.dev.vars` — never hardcoded here.
+const WORKER_SECRET = resolveWorkerSecret({ scriptName: 'probe-scrydex-fields.mjs' })
 
 const body = {
   game: arg('--game', 'Magic'),
