@@ -181,7 +181,9 @@ function nullResult(canonicalProductId: number, company: string, grade: string, 
 
 interface CardRow { name: string; number: string | null; set_name: string | null }
 
-async function pcGet(env: Env, path: string, params: Record<string, string>): Promise<{ status: number; body: any }> {
+/** Authenticated PriceCharting API GET. The token is injected into the URL here and never
+ * logged or returned. Shared with the UPC lookup (lib/pricechartingUpc.ts). */
+export async function pcGet(env: Env, path: string, params: Record<string, string>): Promise<{ status: number; body: any }> {
   const url = new URL(`${PC_BASE}${path}`)
   url.searchParams.set('t', env.PRICECHARTING_TOKEN as string)
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v)

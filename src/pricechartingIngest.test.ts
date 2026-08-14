@@ -30,7 +30,7 @@ interface Product {
 
 function makeFakeDb(products: Product[]) {
   const prices = new Map<string, number>()                       // `${productId}|${grade}` → value
-  const pcMap = new Map<string, { canonical_product_id: number | null; match_method: string | null }>()
+  const pcMap = new Map<string, { canonical_product_id: number | null; match_method: string | null; upc: string | null }>()
 
   function query(sql: string, args: any[]) {
     // loadExistingMatches: keyset-paginated already-matched map (mint stamps / prior runs).
@@ -67,13 +67,15 @@ function makeFakeDb(products: Product[]) {
   }
   function write(sql: string, args: any[]) {
     if (sql.includes('INTO pricecharting_products')) {
-      const pcId = String(args[0]); const canonical = args[2]; const method = args[3]
+      const pcId = String(args[0]); const canonical = args[2]; const method = args[3]; const upc = args[9]
       const prev = pcMap.get(pcId)
       // Mirrors the real upsert's COALESCE semantics: a NULL excluded value preserves the
-      // stored canonical_product_id / match_method (the mint-stamp survival contract).
+      // stored canonical_product_id / match_method (the mint-stamp survival contract) and
+      // the stored upc (mig 0127 — a CSV that stops publishing a UPC never blanks it).
       pcMap.set(pcId, {
         canonical_product_id: canonical ?? prev?.canonical_product_id ?? null,
         match_method:         method ?? prev?.match_method ?? null,
+        upc:                  upc ?? prev?.upc ?? null,
       })
     } else if (sql.includes('INTO prices')) {
       // binds: productId, condition, finish, grade, is_graded, value, retail_buy, retail_sell
@@ -146,7 +148,7 @@ function makeQueue() {
 const COLS = [
   'id', 'console-name', 'product-name', 'loose-price', 'cib-price', 'new-price', 'graded-price',
   'box-only-price', 'manual-only-price', 'bgs-10-price', 'condition-17-price', 'condition-18-price',
-  'sales-volume', 'genre', 'tcg-id',
+  'upc', 'sales-volume', 'genre', 'tcg-id',
 ]
 const HEADER = COLS.join('\t')
 function row(vals: Partial<Record<string, string>>): string {
@@ -251,7 +253,7 @@ describe('processPriceChartingWindow', () => {
     expect(db._prices.get('20|')).toBe(120)     // D (sealed) ungraded ONLY
     expect(db._prices.has('20|PSA 10')).toBe(false)
     // Unmatched row C recorded (null), matched rows persisted.
-    expect(db._pcMap.get('pcC')).toEqual({ canonical_product_id: null, match_method: null })
+    expect(db._pcMap.get('pcC')).toEqual({ canonical_product_id: null, match_method: null, upc: null })
     expect(db._pcMap.get('pcA')?.canonical_product_id).toBe(7)
     expect(db._pcMap.get('pcB')?.canonical_product_id).toBe(8)
   })
@@ -398,7 +400,7 @@ describe('number-less set-corroborated matching (One Piece DON!!s)', () => {
     expect(c.matchedNumberless).toBe(1)
     expect(c.numberlessAttempts).toBe(1)
     expect(c.unmatched).toBe(0)
-    expect(db._pcMap.get('pcDON')).toEqual({ canonical_product_id: 30, match_method: 'numberless' })
+    expect(db._pcMap.get('pcDON')).toEqual({ canonical_product_id: 30, match_method: 'numberless', upc: null })
     expect(db._prices.get('30|')).toBe(50)          // loose/ungraded
     expect(db._prices.get('30|Grade 9')).toBe(80)   // graded bucket flows too
   })
@@ -454,14 +456,58 @@ describe('number-less set-corroborated matching (One Piece DON!!s)', () => {
             'loose-price': '$12.00', 'manual-only-price': '$99.00', genre: 'Pokemon Card', 'tcg-id': '' }),
     ].join('\n'))
     const db = makeFakeDb([])   // minted product is NOT in the matcher index — the stamp alone carries it
-    db._pcMap.set('pcMINT', { canonical_product_id: 500, match_method: 'minted' })
+    db._pcMap.set('pcMINT', { canonical_product_id: 500, match_method: 'minted', upc: null })
     const c = await processPriceChartingWindow({ DB: db, IMAGES_BUCKET: r2 } as any, procMsg(key))
     expect(c.matchedExisting).toBe(1)
     expect(c.unmatched).toBe(0)
     // The stamp survives (matcher never fights it) and the ordinary price write path fires.
-    expect(db._pcMap.get('pcMINT')).toEqual({ canonical_product_id: 500, match_method: 'minted' })
+    expect(db._pcMap.get('pcMINT')).toEqual({ canonical_product_id: 500, match_method: 'minted', upc: null })
     expect(db._prices.get('500|')).toBe(12)
     expect(db._prices.get('500|PSA 10')).toBe(99)
+  })
+})
+
+// ── UPC capture (mig 0127 — sealed barcode lookup, Phase 1) ─────────────────────
+describe('UPC capture on the map upsert', () => {
+  it('captures a normalized UPC for matched AND unmatched rows (cards + sealed)', async () => {
+    const r2 = makeR2(); const key = rawKeyFor('pokemon-cards', today())
+    r2._store.set(key, [
+      HEADER,
+      // Sealed, tcg-id hit, hyphenated UPC → digits-only stored.
+      row({ id: 'pcU1', 'console-name': 'Pokemon', 'product-name': 'Booster Box',
+            'loose-price': '$120.00', upc: ' 0742818-061452 ', genre: 'Sealed Product', 'tcg-id': '55555' }),
+      // Unmatched card row with a UPC — captured anyway (the map records unmatched rows too).
+      row({ id: 'pcU2', 'console-name': 'Pokemon X', 'product-name': 'Mewtwo #10',
+            'loose-price': '$5.00', upc: '196214132474', genre: 'Pokemon X', 'tcg-id': '' }),
+    ].join('\n'))
+    const db = makeFakeDb(PRODUCTS)
+    await processPriceChartingWindow({ DB: db, IMAGES_BUCKET: r2 } as any, procMsg(key))
+    expect(db._pcMap.get('pcU1')).toEqual({ canonical_product_id: 20, match_method: 'tcg-id', upc: '0742818061452' })
+    expect(db._pcMap.get('pcU2')).toEqual({ canonical_product_id: null, match_method: null, upc: '196214132474' })
+  })
+
+  it('a pre-stamped (incremental) row still GAINS its UPC on re-ingest, and a later blank never erases it', async () => {
+    const r2 = makeR2(); const key = rawKeyFor('pokemon-cards', today())
+    const csvWithUpc = [
+      HEADER,
+      row({ id: 'pcMINT', 'console-name': 'Pokemon Chinese Gem Pack', 'product-name': 'Gengar #307',
+            'loose-price': '$12.00', upc: '196214141469', genre: 'Pokemon Card', 'tcg-id': '' }),
+    ].join('\n')
+    r2._store.set(key, csvWithUpc)
+    const db = makeFakeDb([])
+    // Stamped by the mint job BEFORE UPCs existed — the matcher-skip path must still write upc.
+    db._pcMap.set('pcMINT', { canonical_product_id: 500, match_method: 'minted', upc: null })
+    await processPriceChartingWindow({ DB: db, IMAGES_BUCKET: r2 } as any, procMsg(key))
+    expect(db._pcMap.get('pcMINT')).toEqual({ canonical_product_id: 500, match_method: 'minted', upc: '196214141469' })
+
+    // Re-ingest WITHOUT the upc column populated — COALESCE preserves the stored value.
+    r2._store.set(key, [
+      HEADER,
+      row({ id: 'pcMINT', 'console-name': 'Pokemon Chinese Gem Pack', 'product-name': 'Gengar #307',
+            'loose-price': '$12.00', genre: 'Pokemon Card', 'tcg-id': '' }),
+    ].join('\n'))
+    await processPriceChartingWindow({ DB: db, IMAGES_BUCKET: r2 } as any, procMsg(key))
+    expect(db._pcMap.get('pcMINT')?.upc).toBe('196214141469')
   })
 })
 

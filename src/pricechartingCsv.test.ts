@@ -18,6 +18,8 @@ import {
   PC_GRADED_COLUMNS,
   PRICECHARTING_CATEGORIES,
   buildDownloadUrl,
+  normalizeUpc,
+  pcCategoryForTcgplayerCategoryId,
 } from './lib/pricechartingCsv.js'
 
 // ── Dollar parsing → cents ─────────────────────────────────────────────────────
@@ -406,5 +408,33 @@ describe('categories + download URL', () => {
     expect(u.pathname).toBe('/price-guide/download-custom')
     expect(u.searchParams.get('t')).toBe('SECRET')
     expect(u.searchParams.get('category')).toBe('pokemon-cards')
+  })
+  it('reverses a tcgplayer category id to its PriceCharting category (null outside the 4)', () => {
+    expect(pcCategoryForTcgplayerCategoryId(3)).toBe('pokemon-cards')
+    expect(pcCategoryForTcgplayerCategoryId(1)).toBe('magic-cards')
+    expect(pcCategoryForTcgplayerCategoryId(2)).toBe('yugioh-cards')
+    expect(pcCategoryForTcgplayerCategoryId(68)).toBe('one-piece-cards')
+    expect(pcCategoryForTcgplayerCategoryId(71)).toBeNull()   // Lorcana — not ingested
+    expect(pcCategoryForTcgplayerCategoryId(null)).toBeNull()
+    expect(pcCategoryForTcgplayerCategoryId(undefined)).toBeNull()
+  })
+})
+
+// ── UPC normalization (mig 0127 — sealed barcode lookup) ────────────────────────
+describe('normalizeUpc', () => {
+  it('strips to digits only', () => {
+    expect(normalizeUpc('196214132474')).toBe('196214132474')
+    expect(normalizeUpc(' 0742818-061452 ')).toBe('0742818061452')
+    expect(normalizeUpc('0 12345 67890 5')).toBe('012345678905')
+  })
+  it('preserves a leading zero (EAN-13 form is distinct from its UPC-A twin at storage time)', () => {
+    expect(normalizeUpc('0196214132474')).toBe('0196214132474')
+  })
+  it('returns null when nothing digit-like remains', () => {
+    expect(normalizeUpc('')).toBeNull()
+    expect(normalizeUpc('   ')).toBeNull()
+    expect(normalizeUpc('N/A')).toBeNull()
+    expect(normalizeUpc(null)).toBeNull()
+    expect(normalizeUpc(undefined)).toBeNull()
   })
 })

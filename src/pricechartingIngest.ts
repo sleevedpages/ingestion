@@ -44,20 +44,13 @@ import {
   pickBestCanonicalMatch,
   pickNumberlessCanonicalMatch,
   cleanNumber,
+  normalizeUpc,
   PRICECHARTING_CATEGORIES,
+  CATEGORY_TCGPLAYER_IDS,
   type PcCsvRow,
   type PriceChartingCategory,
   type NumberlessCandidate,
 } from './lib/pricechartingCsv.js'
-
-/** TCGPlayer category id(s) per PriceCharting category — scopes the fuzzy candidate query.
- * (tcg-id matching needs no scope: tcgplayer_product_id is globally unique.) */
-const CATEGORY_TCGPLAYER_IDS: Record<string, number[]> = {
-  'pokemon-cards':   [3],
-  'magic-cards':     [1],
-  'yugioh-cards':    [2],
-  'one-piece-cards': [68],
-}
 
 /** R2 key scheme for the cached raw downloads. Reuses the worker's existing IMAGES_BUCKET binding. */
 export const R2_RAW_PREFIX = 'ingest-raw/pricecharting'
@@ -395,11 +388,16 @@ const PRICE_UPSERT_SQL = `
   DO UPDATE SET value = excluded.value, is_graded = excluded.is_graded, retail_buy = excluded.retail_buy,
                 retail_sell = excluded.retail_sell, fetched_at = excluded.fetched_at`
 
+// upc (mig 0127): captured for EVERY row (cards + sealed — cards occasionally carry one and it
+// costs nothing extra), normalized digits-only at write time. COALESCE on update so a CSV that
+// stops publishing a row's UPC never blanks a stored one — and because EVERY row gets a map
+// upsert each ingest (pre-stamped rows skip only the MATCHER, never this statement), already-
+// mapped rows gain their UPC on the next ordinary re-ingest with no separate backfill.
 const MAP_UPSERT_SQL = `
   INSERT INTO pricecharting_products
     (pc_id, game_category, canonical_product_id, match_method, tcg_id,
-     console_name, product_name, is_sealed, sales_volume, matched_at, last_seen_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+     console_name, product_name, is_sealed, sales_volume, upc, matched_at, last_seen_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
   ON CONFLICT (pc_id) DO UPDATE SET
     game_category        = excluded.game_category,
     canonical_product_id = COALESCE(excluded.canonical_product_id, pricecharting_products.canonical_product_id),
@@ -409,6 +407,7 @@ const MAP_UPSERT_SQL = `
     product_name         = excluded.product_name,
     is_sealed            = excluded.is_sealed,
     sales_volume         = excluded.sales_volume,
+    upc                  = COALESCE(excluded.upc, pricecharting_products.upc),
     matched_at           = COALESCE(pricecharting_products.matched_at, excluded.matched_at),
     last_seen_at         = unixepoch()`
 
@@ -556,6 +555,7 @@ async function processWindowFromBody(
           (res2.row['console-name'] ?? '').trim() || null,
           (res2.row['product-name'] ?? '').trim() || null,
           res2.sealed ? 1 : 0, salesVolume,
+          normalizeUpc(res2.row['upc']),
           res2.productId != null ? now : null,
         ),
       )

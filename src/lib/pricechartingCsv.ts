@@ -53,6 +53,42 @@ export function buildDownloadUrl(category: string, token: string): string {
 /** Genre value that flags a sealed-product row. */
 export const SEALED_GENRE = 'Sealed Product'
 
+/** TCGPlayer category id(s) per PriceCharting category — scopes the fuzzy candidate query
+ * (pricechartingIngest.ts) and reverses to derive a map row's game_category from a matched
+ * canonical product (pricechartingUpc.ts). Lives here (with PRICECHARTING_CATEGORIES) so
+ * both consumers share ONE mapping. (tcg-id matching needs no scope: tcgplayer_product_id
+ * is globally unique.) */
+export const CATEGORY_TCGPLAYER_IDS: Record<string, number[]> = {
+  'pokemon-cards':   [3],
+  'magic-cards':     [1],
+  'yugioh-cards':    [2],
+  'one-piece-cards': [68],
+}
+
+/** Reverse of CATEGORY_TCGPLAYER_IDS: the PriceCharting category a canonical product's
+ * tcgplayer_category_id belongs to, or null when the game is outside the 4 ingested
+ * categories (the caller must then skip the map write — game_category is NOT NULL). */
+export function pcCategoryForTcgplayerCategoryId(id: number | null | undefined): PriceChartingCategory | null {
+  if (id == null) return null
+  for (const [category, ids] of Object.entries(CATEGORY_TCGPLAYER_IDS)) {
+    if (ids.includes(Number(id))) return category as PriceChartingCategory
+  }
+  return null
+}
+
+/**
+ * Normalize a UPC/EAN barcode value to its digits (strip whitespace, hyphens, any
+ * non-digit), or null when nothing digit-like remains. Applied at WRITE time (CSV ingest +
+ * the live upc-lookup stamp) so `pricecharting_products.upc` holds one canonical form; the
+ * read side still queries both the 12-digit UPC-A and 13-digit leading-zero EAN-13 forms
+ * of a scanned code (they are the same product). PURE.
+ * Mirror of Content's functions/lib/upcLookup.js normalizeUpcCode (cross-repo, kept in step).
+ */
+export function normalizeUpc(raw: unknown): string | null {
+  const digits = String(raw ?? '').replace(/\D+/g, '')
+  return digits.length > 0 ? digits : null
+}
+
 /**
  * One write-path price column: a CSV column → the canonical `prices.grade` label it
  * decodes to (null for the ungraded/market row). Derived from the shared API decode map

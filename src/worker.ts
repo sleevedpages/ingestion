@@ -8,6 +8,7 @@ import { syncScrydexImages } from './scrydexImageSync.js';
 import { scrydexVisionIdentify, ScrydexCreditLimitError } from './lib/scrydexClient.js';
 import { searchTcggoArtists, fetchAllArtistCards } from './lib/tcggoClient.js';
 import { fetchPriceChartingGraded } from './lib/pricechartingClient.js';
+import { lookupPriceChartingUpc } from './lib/pricechartingUpc.js';
 import { fetchEbayGraded } from './lib/ebayGradedClient.js';
 import {
   fetchPriceChartingCsvToR2,
@@ -258,6 +259,36 @@ export default {
         return json({ ok: true, ...result });
       } catch (err) {
         logger.error('pricecharting graded fetch failed', { error: String(err), canonicalProductId });
+        return json({ ok: false, error: String(err) }, 502);
+      }
+    }
+
+    // GET /pricecharting/upc?upc= — LIVE UPC → canonical product lookup (sealed barcode
+    // scanning, Phase 1). The fallback behind Content's GET /api/products/upc-lookup: Content
+    // resolves the persisted map first and only proxies here on a D1 miss. Asks PriceCharting's
+    // /api/product?upc= (both UPC-A/EAN-13 forms, 1 req/sec apart), validates the returned
+    // product against our catalogue (stamped map row, else validated tcg-id — NEVER a weak
+    // fuzzy match), stamps pricecharting_products (upc + mapping) so the next scan is a D1
+    // hit, and KV-caches the outcome (pc_upc:{code}, 24h; definitive negatives 6h) so repeated
+    // scans of an unknown code never hammer the API. Token stays worker-side only.
+    if (pathname === '/pricecharting/upc' && request.method === 'GET') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      if (!env.PRICECHARTING_TOKEN) {
+        return json({ ok: false, error: 'PRICECHARTING_TOKEN not configured' }, 503);
+      }
+      const url = new URL(request.url);
+      const upcDigits = (url.searchParams.get('upc') ?? '').replace(/\D+/g, '');
+      if (upcDigits.length < 8 || upcDigits.length > 14) {
+        return json({ ok: false, error: 'upc must be an 8-14 digit barcode' }, 400);
+      }
+      try {
+        const result = await lookupPriceChartingUpc(env, upcDigits);
+        return json({ ok: true, ...result });
+      } catch (err) {
+        logger.error('pricecharting upc lookup failed', { error: String(err), upc: upcDigits });
         return json({ ok: false, error: String(err) }, 502);
       }
     }
