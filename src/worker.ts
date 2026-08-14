@@ -10,6 +10,8 @@ import { searchTcggoArtists, fetchAllArtistCards } from './lib/tcggoClient.js';
 import { fetchPriceChartingGraded } from './lib/pricechartingClient.js';
 import { lookupPriceChartingUpc } from './lib/pricechartingUpc.js';
 import { fetchEbayGraded } from './lib/ebayGradedClient.js';
+import { lookupEbayUpc } from './lib/ebayUpc.js';
+import { lookupUpcitemdbUpc } from './lib/upcitemdbUpc.js';
 import {
   fetchPriceChartingCsvToR2,
   runPriceChartingFetch,
@@ -81,6 +83,18 @@ export interface Env {
   // never in the Content app, never logged or returned). See lib/ebayGradedClient.ts.
   APIFY_TOKEN?: string;
   APIFY_EBAY_ACTOR_ID?: string;
+  // eBay Browse UPC resolver (UPC resolution ladder, 2026-08-14) — client-credentials
+  // OAuth pair for the app token behind GET /ebay/upc. WORKER-SIDE ONLY, never in the
+  // Content app, never logged/returned. Missing → the rung is a clean miss (fail-closed
+  // as a resolver, never a 500). Set via `wrangler secret put EBAY_CLIENT_ID` / `..._SECRET`.
+  EBAY_CLIENT_ID?: string;
+  EBAY_CLIENT_SECRET?: string;
+  // NO EBAY_VERIFICATION_TOKEN — the marketplace account-deletion notifications are OPTED
+  // OUT OF (2026-08-14 operator decision; we retain no eBay user data). See the route
+  // comment near /ebay/upc. Revoke the exemption + build the endpoint if that ever changes.
+  // OPTIONAL UPCitemdb key — absent (the default) uses the keyless /prod/trial path;
+  // present switches GET /upcitemdb/upc to /prod/v1 with the user_key/key_type headers.
+  UPCITEMDB_KEY?: string;
   // PriceCharting API token — PRIMARY admin graded-price source (operator sets it;
   // lives here, never in the Content app). Also powers the daily CSV bulk-ingest
   // (src/pricechartingIngest.ts). See lib/pricechartingClient.ts.
@@ -185,6 +199,63 @@ export default {
         return json({ ok: false, error: String(err) }, 502);
       }
     }
+
+    // GET /ebay/upc?upc= — eBay Browse UPC → canonical lookup (UPC resolution ladder,
+    // 2026-08-14). The PRIMARY external rung behind Content's GET /api/products/upc-lookup
+    // (consulted after the product_upcs map misses). One Browse GTIN search → majority-signal
+    // title aggregation → the SHARED catalogue matcher; KV-cached app token (never fetched
+    // per lookup), positive/negative result caching, `upc_ebay_daily_cap` soft cap. Missing
+    // credentials → clean miss (found:false), NEVER a 500 — the ladder falls through.
+    if (pathname === '/ebay/upc' && request.method === 'GET') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      const url = new URL(request.url);
+      const upcDigits = (url.searchParams.get('upc') ?? '').replace(/\D+/g, '');
+      if (upcDigits.length < 8 || upcDigits.length > 14) {
+        return json({ ok: false, error: 'upc must be an 8-14 digit barcode' }, 400);
+      }
+      try {
+        const result = await lookupEbayUpc(env, upcDigits);
+        return json({ ok: true, ...result });
+      } catch (err) {
+        // Defensive — lookupEbayUpc degrades internally; anything escaping is still a miss.
+        logger.error('ebay upc lookup failed', { error: String(err), upc: upcDigits });
+        return json({ ok: true, found: false });
+      }
+    }
+
+    // GET /upcitemdb/upc?upc= — UPCitemdb → canonical lookup (UPC resolution ladder,
+    // 2026-08-14). The SECONDARY external rung (after the map AND eBay miss). Keyless trial
+    // path by default (UPCITEMDB_KEY switches to /prod/v1); `upc_upcitemdb_daily_cap` soft
+    // cap (default well under the 100/day trial limit), 429 → 10-min KV backoff, positive +
+    // definitive-negative caching. Same shared title matcher as the eBay rung.
+    if (pathname === '/upcitemdb/upc' && request.method === 'GET') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      const url = new URL(request.url);
+      const upcDigits = (url.searchParams.get('upc') ?? '').replace(/\D+/g, '');
+      if (upcDigits.length < 8 || upcDigits.length > 14) {
+        return json({ ok: false, error: 'upc must be an 8-14 digit barcode' }, 400);
+      }
+      try {
+        const result = await lookupUpcitemdbUpc(env, upcDigits);
+        return json({ ok: true, ...result });
+      } catch (err) {
+        logger.error('upcitemdb upc lookup failed', { error: String(err), upc: upcDigits });
+        return json({ ok: true, found: false });
+      }
+    }
+
+    // NOTE (2026-08-14, operator decision): eBay's marketplace account-deletion
+    // notifications are OPTED OUT OF in the developer portal — this application retains NO
+    // eBay user data, which is the exemption's condition. No deletion-notification endpoint
+    // exists here ON PURPOSE. If any future feature stores eBay user data, the exemption
+    // must be revoked and the subscribe path (challenge endpoint + verification token)
+    // built at that time.
 
     // ── tcggo artist search (require x-worker-secret; GET) ──────────────────────
     // Repurposed tcggo: list/search artists so the Content admin can mint an owned
