@@ -26,6 +26,7 @@ import {
   DEFAULT_FRESHNESS_HOURS,
 } from './scrydexProcessor.js'
 import { sourceUrlUpsertByProductId, sourceUrlUpsertByGroupNumber } from './lib/productImages.js'
+import { getFxJpyPerUsd } from './lib/priceCurrency.js'
 import {
   collectVariantEntries,
   fetchExistingProducts,
@@ -126,10 +127,12 @@ export async function syncSingleSet(env: Env, opts: SyncSetOptions): Promise<Syn
     const { cards, requests } = await fetchAllExpansionCards(env, gameSlug, expansionId, 'syncSingleSet', true)
 
     // ── Prices (canonical, raw + graded) ──────────────────────────────────────────
+    // Currency gate (2026-08-17): same per-entry rule as the drain; fx read once per sync.
+    const fxJpyPerUsd = await getFxJpyPerUsd(env.DB)
     const priceStmts: D1PreparedStatement[] = []
     for (const card of cards) {
-      priceStmts.push(...await buildPriceUpserts(env.DB, card, expansionId, 'raw'))
-      priceStmts.push(...await buildPriceUpserts(env.DB, card, expansionId, 'graded'))
+      priceStmts.push(...await buildPriceUpserts(env.DB, card, expansionId, 'raw', undefined, fxJpyPerUsd))
+      priceStmts.push(...await buildPriceUpserts(env.DB, card, expansionId, 'graded', undefined, fxJpyPerUsd))
     }
     for (let i = 0; i < priceStmts.length; i += BATCH_SIZE) {
       await env.DB.batch(priceStmts.slice(i, i + BATCH_SIZE))

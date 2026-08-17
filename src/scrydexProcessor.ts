@@ -103,6 +103,9 @@ import { fetchAllExpansionCards, ScrydexCardsError } from './lib/scrydexCards.js
 // never resolve a slug for those two games. 'Pokemon Japan' is deliberately absent so a JP
 // card never collides onto the English 'pokemon' slug. See lib/gameNames.ts (the drift anchor).
 import { GAME_SLUG_BY_CANONICAL_NAME } from './lib/gameNames.js'
+// Write-time currency gate (2026-08-17): Scrydex serves per-entry `currency` (JP raw = JPY);
+// `prices.value` is a USD claim, so non-USD converts (fx_jpy_per_usd) or skips — never verbatim.
+import { getFxJpyPerUsd, resolveCurrencyFactor, convertMoney, newCurrencySkips, countSkip, type CurrencySkips } from './lib/priceCurrency.js'
 
 const BATCH_SIZE          = 100
 // Daily batch: a full day's backlog is larger than a 10-min one. Cap rows loaded per run
@@ -467,6 +470,11 @@ export async function processPendingWebhooks(
     ? new Set(env.SCRYDEX_PRICE_GAMES.split(',').map(s => s.trim()).filter(Boolean))
     : null
 
+  // Currency gate config — read ONCE per run, never per row. Unset/insane rate → JPY entries
+  // are counted skips this run (fail-closed), and the summary line below says so.
+  const fxJpyPerUsd = await getFxJpyPerUsd(env.DB)
+  const currencySkips: CurrencySkips = newCurrencySkips()
+
   // ── Load the day's candidate backlog (WP-8) ──────────────────────────────────
   // Three candidate classes in ONE scan, oldest first:
   //   1. status = 'pending' — normal backlog.
@@ -696,7 +704,7 @@ export async function processPendingWebhooks(
       const allUpserts: D1PreparedStatement[] = []
       const unmatched: UnmatchedCardEntry[] = []
       for (const card of cards) {
-        allUpserts.push(...await buildPriceUpserts(env.DB, card, wi.expansionId, wi.priceType, unmatched))
+        allUpserts.push(...await buildPriceUpserts(env.DB, card, wi.expansionId, wi.priceType, unmatched, fxJpyPerUsd, currencySkips))
       }
       for (let i = 0; i < allUpserts.length; i += BATCH_SIZE) {
         await env.DB.batch(allUpserts.slice(i, i + BATCH_SIZE))
@@ -792,6 +800,12 @@ export async function processPendingWebhooks(
     max_fetches:                maxFetches,
     freshness_hours:            freshnessHours,
     credits_by_game:            creditsByGame,
+    // Currency gate (2026-08-17): non-USD price entries skipped this run. `no_rate` > 0 with a
+    // JP expansion in the run means fx_jpy_per_usd needs setting — JP raw prices are being
+    // gated rather than converted (safe, but coverage is down until the rate lands).
+    currency_skipped_no_rate:      currencySkips.noRate,
+    currency_skipped_unsupported:  currencySkips.unsupported,
+    fx_jpy_per_usd_set:            fxJpyPerUsd != null,
   }))
 
   return { scope, expansionsFetched, refreshedExpansions }
@@ -871,8 +885,11 @@ export async function refreshCardPrices(env: Env, productId: number): Promise<Re
     if (!targetCard) return { ok: true, pricesUpserted: 0, requests }   // card not present / not priced
 
     let pricesUpserted = 0
+    // Currency gate: same per-entry rule as the drain (skips are per-request here — a vendor
+    // refresh of a JP card with no fx rate set simply upserts fewer rows).
+    const fxJpyPerUsd = await getFxJpyPerUsd(env.DB)
     for (const priceType of ['raw', 'graded']) {
-      const upserts = await buildPriceUpserts(env.DB, targetCard, expansionId, priceType)
+      const upserts = await buildPriceUpserts(env.DB, targetCard, expansionId, priceType, undefined, fxJpyPerUsd)
       for (let i = 0; i < upserts.length; i += BATCH_SIZE) {
         await env.DB.batch(upserts.slice(i, i + BATCH_SIZE))
       }
@@ -920,6 +937,8 @@ export async function buildPriceUpserts(
   expansionId: string,
   priceType:   string,
   unmatched?:  UnmatchedCardEntry[],
+  fxJpyPerUsd: number | null = null,
+  currencySkips?: CurrencySkips,
 ): Promise<D1PreparedStatement[]> {
   const c = card as any
   const upserts: D1PreparedStatement[] = []
@@ -974,6 +993,14 @@ export async function buildPriceUpserts(
 
       const fields = deriveCanonicalPriceFields(price, variantName, priceType)
       if (!fields) continue   // graded row with no resolvable label — never write it as raw
+
+      // WRITE-TIME CURRENCY GATE (2026-08-17, the Mega Dragonite ¥32,000→$32,000 fix).
+      // `prices.value` IS a USD claim — a non-USD entry is converted (JPY via the operator-set
+      // fx_jpy_per_usd rate) or SKIPPED-and-counted, never written verbatim. Absent currency
+      // stays USD (English payloads). Per-ENTRY on purpose: one JP card carries JPY raw
+      // beside USD graded, and each entry's own field decides.
+      const cur = resolveCurrencyFactor(price.currency, fxJpyPerUsd)
+      if (!cur.ok) { countSkip(currencySkips, cur.reason); continue }
       const trends = extractTrends(price.trends)
 
       upserts.push(
@@ -987,7 +1014,7 @@ export async function buildPriceUpserts(
           fields.is_error,
           fields.is_perfect,
           fields.is_graded,
-          price.market ?? null,
+          convertMoney(price.market, cur.factor),
           trends.trend_1d,
           trends.trend_7d,
           trends.trend_14d,

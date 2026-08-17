@@ -680,6 +680,20 @@ Scrydex expansion id (e.g. `OP09`, `GD04`), which is what `q=expansion.id:` matc
     overflow rows stay pending for the next run / a manual `POST /scrydex/process`.
   - Primary match: `variant.marketplaces[tcgplayer].product_id` → canonical `products.tcgplayer_product_id`;
     fallback `card.number` + `scrydex_expansion_id` join. Batches at 100 statements per `DB.batch()`.
+- **⚠️ WRITE-TIME CURRENCY GATE (2026-08-17 — the Mega Dragonite ¥32,000→$32,000 fix; the mig 0099
+  doctrine applied to money).** Scrydex price entries carry a per-entry `currency` field and JP RAW
+  prices arrive in **JPY**; canonical `prices.value` IS a USD claim. ONE shared gate
+  (`src/lib/priceCurrency.ts`) sits in BOTH writers — `buildPriceUpserts` (drain / sync-set /
+  refresh-card) and `parseCardPrices` (enrichment; value AND low/mid/high): absent/blank → USD;
+  `USD` → verbatim; `JPY` → ÷ `app_config.fx_jpy_per_usd` (yen-per-dollar, read ONCE per run,
+  sanity window [50,1000] — an inverted dollars-per-yen entry is REJECTED as unset, never clamped),
+  cents-rounded; any other currency → SKIPPED and counted. **Fail-closed: no/insane rate ⇒ JPY
+  entries skip** (drain summary logs `currency_skipped_no_rate`/`_unsupported` + `fx_jpy_per_usd_set`)
+  — never written verbatim. `card_listings`/`card_price_history` stay UNGATED (they store `currency`
+  verbatim — honest storage). Never re-collapse this to a payload-level assumption; per-ENTRY on
+  purpose (one JP card carries JPY raw beside USD graded). Tests: `src/lib/priceCurrency.test.ts` +
+  the two writers' "currency gate" describes. Contract:
+  Content `docs/context/pricing-and-valuation.md` → "Write-time currency gate".
 - **WP-8 retry semantics + atomic claims (2026-07-07; Content migration 0089 adds
   `attempts`/`last_attempt_at` + `scrydex_unmatched_cards`).** Row lifecycle:
   `pending → processing (claimed) → complete | error (retryable) | failed (TERMINAL)`.

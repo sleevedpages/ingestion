@@ -142,6 +142,63 @@ describe('parseCardPrices (Umbreon)', () => {
   })
 })
 
+// ─────────────────────────────────────────────────────────────────────────────
+// parseCardPrices — the write-time CURRENCY GATE (2026-08-17, the Mega Dragonite
+// ¥32,000→$32,000 fix). Canonical `prices` money (value/low/mid/high) is a USD claim:
+// JPY converts through the rate or the entry is dropped-and-counted — never verbatim.
+// The Umbreon fixture above carries currency: 'USD' rows and no fx argument, pinning
+// that the gate changes NOTHING for English payloads.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('parseCardPrices — currency gate', () => {
+  const JP_CARD = {
+    variants: [{
+      name: 'holofoil',
+      prices: [
+        // JP raw in JPY, graded in USD — per-ENTRY resolution on one card is the whole point.
+        { variant: 'holofoil', condition: 'NM', type: 'raw', market: 32000, low: 27000, mid: 30000, high: 36000, currency: 'JPY' },
+        { variant: 'holofoil', grade: '10', company: 'ARS', type: 'graded', market: 489.77, low: 400, currency: 'USD' },
+      ],
+    }],
+  }
+
+  it('JPY raw + rate → value AND low/mid/high all convert, cents-rounded; USD graded verbatim', () => {
+    const rows = parseCardPrices(JP_CARD, 150)
+    const nm = rows.find(r => r.condition === 'NM')!
+    expect(nm.value).toBe(213.33)   // ¥32,000 / 150
+    expect(nm.low).toBe(180)        // ¥27,000 / 150
+    expect(nm.mid).toBe(200)
+    expect(nm.high).toBe(240)
+    const ars = rows.find(r => r.grade === 'ARS 10')!
+    expect(ars.value).toBe(489.77)
+    expect(ars.low).toBe(400)
+  })
+
+  it('JPY with NO rate → the entry is DROPPED and counted; the USD entry survives', () => {
+    const skips = { noRate: 0, unsupported: 0 }
+    const rows = parseCardPrices(JP_CARD, null, skips)
+    expect(rows.find(r => r.condition === 'NM')).toBeUndefined()
+    expect(rows.find(r => r.grade === 'ARS 10')?.value).toBe(489.77)
+    expect(skips).toEqual({ noRate: 1, unsupported: 0 })
+  })
+
+  it('an unsupported currency is dropped-and-counted', () => {
+    const skips = { noRate: 0, unsupported: 0 }
+    const rows = parseCardPrices({
+      variants: [{ name: 'normal', prices: [{ type: 'raw', condition: 'NM', market: 10, currency: 'EUR' }] }],
+    }, 150, skips)
+    expect(rows).toEqual([])
+    expect(skips.unsupported).toBe(1)
+  })
+
+  it('a currency-LESS entry stays USD-verbatim (the baseline behaviour)', () => {
+    const rows = parseCardPrices({
+      variants: [{ name: 'normal', prices: [{ type: 'raw', condition: 'NM', market: 1.5 }] }],
+    })
+    expect(rows).toHaveLength(1)
+    expect(rows[0].value).toBe(1.5)
+  })
+})
+
 describe('parsePopReports', () => {
   it('parses pop reports nested per variant → one row per (variant, company, grade)', () => {
     const pops = parsePopReports(UMBREON)

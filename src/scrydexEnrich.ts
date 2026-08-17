@@ -40,6 +40,10 @@ import { variantFinish, tcgProductIdOf } from './lib/variantCapture.js'
 // and Riftbound cards could never detail-enrich; 'Pokemon Japan' is deliberately absent so a
 // JP card never rides the English slug. See lib/gameNames.ts (the drift anchor).
 import { GAME_SLUG_BY_CANONICAL_NAME } from './lib/gameNames.js'
+// Write-time currency gate (2026-08-17): canonical `prices` money is a USD claim — see the
+// parseCardPrices header. listings/history stay ungated (they store `currency` verbatim).
+import { getFxJpyPerUsd, resolveCurrencyFactor, convertMoney, newCurrencySkips, countSkip, type CurrencySkips } from './lib/priceCurrency.js'
+import { logger } from './ingestion/logger.js'
 
 const BATCH_SIZE          = 90    // D1 binds <= 100 params/statement; the prices upsert binds 22, batch by statement count
 const LISTINGS_RETENTION_DAYS = 180
@@ -131,8 +135,15 @@ export interface ParsedPriceRow {
  * TCGPlayer product id — `variant` is the disambiguator). Graded sub-variants
  * (signed/error/perfect) are captured with their flags so the serving layer can keep them
  * out of the default grid.
+ *
+ * WRITE-TIME CURRENCY GATE (2026-08-17, the Mega Dragonite ¥32,000→$32,000 fix): every money
+ * figure destined for canonical `prices` (value/low/mid/high) is a USD claim, so a non-USD
+ * entry converts through `fxJpyPerUsd` (JPY) or is DROPPED-and-counted — never parsed verbatim.
+ * Per-entry: a JP card carries JPY raw beside USD graded. Absent currency = USD (English
+ * payloads). Trends are percentages — currency-neutral, untouched. The listings/history
+ * writers below are NOT gated: their tables store `currency` verbatim (honest storage).
  */
-export function parseCardPrices(card: unknown): ParsedPriceRow[] {
+export function parseCardPrices(card: unknown, fxJpyPerUsd: number | null = null, currencySkips?: CurrencySkips): ParsedPriceRow[] {
   const c = card as any
   const out: ParsedPriceRow[] = []
   for (const variant of (c?.variants ?? []) as any[]) {
@@ -140,10 +151,15 @@ export function parseCardPrices(card: unknown): ParsedPriceRow[] {
     const tcgProductId = tcgProductIdOf(variant)
     const finish       = variantFinish(variantName)
     for (const price of (variant?.prices ?? []) as any[]) {
+      const cur = resolveCurrencyFactor(price?.currency, fxJpyPerUsd)
+      if (!cur.ok) { countSkip(currencySkips, cur.reason); continue }
       const trends = parseTrends6(price?.trends)
       const base = {
         tcgProductId, variant: variantName, finish,
-        value: num(price?.market), low: num(price?.low), mid: num(price?.mid), high: num(price?.high),
+        value: convertMoney(num(price?.market), cur.factor),
+        low:   convertMoney(num(price?.low), cur.factor),
+        mid:   convertMoney(num(price?.mid), cur.factor),
+        high:  convertMoney(num(price?.high), cur.factor),
         trends,
       }
       if (price?.type === 'graded') {
@@ -472,7 +488,16 @@ export async function enrichCard(
         const body = await res.json().catch(() => ({})) as { data?: unknown }
         const card = (body?.data ?? body) as unknown
 
-        const priceRows = parseCardPrices(card)
+        // Currency gate: fx read per enrich call (one card); a JPY entry with no rate set is
+        // dropped-and-counted rather than written verbatim — the run log's skip counts say so.
+        const fxJpyPerUsd = await getFxJpyPerUsd(env.DB)
+        const currencySkips = newCurrencySkips()
+        const priceRows = parseCardPrices(card, fxJpyPerUsd, currencySkips)
+        if (currencySkips.noRate > 0 || currencySkips.unsupported > 0) {
+          logger.warn('enrichCard: non-USD price entries skipped by the currency gate', {
+            canonicalProductId, ...currencySkips, fxSet: fxJpyPerUsd != null,
+          })
+        }
         const tcgIds = priceRows.map(r => r.tcgProductId).filter((n): n is number => n != null)
         const tcgToProduct = await mapTcgToProductId(env.DB, tcgIds)
         const priceStmts = priceRows.map(r => {

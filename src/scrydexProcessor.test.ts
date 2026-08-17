@@ -247,6 +247,77 @@ describe('buildPriceUpserts', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
+// buildPriceUpserts — the write-time CURRENCY GATE (2026-08-17, the Mega Dragonite
+// ¥32,000→$32,000 fix). `prices.value` is a USD claim: JPY converts through the
+// operator-set rate or the entry is skipped-and-counted — never bound verbatim.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('buildPriceUpserts — currency gate', () => {
+  const rawCard = {
+    number: '25',
+    variants: [{
+      name: 'normal',
+      marketplaces: [{ name: 'tcgplayer', product_id: '999' }],
+      prices: [{ type: 'raw', condition: 'NM', market: 1.5, trends: { days_1: { percent_change: 2 } } }],
+    }],
+  }
+  // The incident shape: a JP card whose RAW entry is JPY while its GRADED entry is USD —
+  // per-ENTRY resolution is the whole point.
+  const jpCard = {
+    number: '246',
+    variants: [{
+      name: 'holofoil',
+      marketplaces: [{ name: 'tcgplayer', product_id: '888' }],
+      prices: [
+        { type: 'raw', condition: 'NM', market: 32000, currency: 'JPY' },
+        { type: 'graded', company: 'ARS', grade: 10, market: 489.77, currency: 'USD' },
+      ],
+    }],
+  }
+
+  it('JPY raw + rate → cents-rounded USD; the sibling USD graded entry stays verbatim', async () => {
+    const db = makeFakeDB({ first: () => ({ id: 42 }) })
+    const raw = await buildPriceUpserts(db as any, jpCard, 'm2a', 'raw', undefined, 150) as unknown as FakeStmt[]
+    expect(raw).toHaveLength(1)
+    expect(raw[0].args[9]).toBe(213.33)     // ¥32,000 / 150 — condition-consistent under the ARS 10
+
+    const graded = await buildPriceUpserts(db as any, jpCard, 'm2a', 'graded', undefined, 150) as unknown as FakeStmt[]
+    expect(graded).toHaveLength(1)
+    expect(graded[0].args[9]).toBe(489.77)  // USD entry: factor 1
+  })
+
+  it('JPY with NO rate → SKIPPED and counted — ¥32,000 is never written as $32,000', async () => {
+    const db = makeFakeDB({ first: () => ({ id: 42 }) })
+    const skips = { noRate: 0, unsupported: 0 }
+    const upserts = await buildPriceUpserts(db as any, jpCard, 'm2a', 'raw', undefined, null, skips) as unknown as FakeStmt[]
+    expect(upserts).toHaveLength(0)
+    expect(skips).toEqual({ noRate: 1, unsupported: 0 })
+  })
+
+  it('an unsupported currency (EUR) is skipped-and-counted, never a wrong dollar', async () => {
+    const eurCard = {
+      number: '1',
+      variants: [{
+        name: 'normal',
+        marketplaces: [{ name: 'tcgplayer', product_id: '77' }],
+        prices: [{ type: 'raw', condition: 'NM', market: 12, currency: 'EUR' }],
+      }],
+    }
+    const db = makeFakeDB({ first: () => ({ id: 7 }) })
+    const skips = { noRate: 0, unsupported: 0 }
+    const upserts = await buildPriceUpserts(db as any, eurCard, 'exp1', 'raw', undefined, 150, skips) as unknown as FakeStmt[]
+    expect(upserts).toHaveLength(0)
+    expect(skips.unsupported).toBe(1)
+  })
+
+  it('a currency-LESS entry stays USD-verbatim (English payloads; the baseline behaviour)', async () => {
+    const db = makeFakeDB({ first: () => ({ id: 42 }) })
+    const upserts = await buildPriceUpserts(db as any, rawCard, 'exp1', 'raw', undefined, null) as unknown as FakeStmt[]
+    expect(upserts).toHaveLength(1)
+    expect(upserts[0].args[9]).toBe(1.5)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
 // processPendingWebhooks — 403 circuit breaker + freshness write.
 // ─────────────────────────────────────────────────────────────────────────────
 function webhookFirstRouter(sql: string) {
