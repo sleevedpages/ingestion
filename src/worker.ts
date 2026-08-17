@@ -32,6 +32,7 @@ import { runMtgAttributeFill } from './mtgAttributeFill.js';
 import { runNewsPoll } from './newsPoll.js';
 import { runHashProductImages, HASH_SWEEP_MAX_LIMIT } from './hashProductImages.js';
 import { runValueSnapshots } from './valueSnapshots.js';
+import { runPriceAnomalyScan } from './priceAnomalyScan.js';
 import { runWatchAlerts } from './watchAlerts.js';
 import {
   ADMIN_JOB_IDS,
@@ -841,7 +842,7 @@ export default {
       // fallback origin (a default would make the UAT worker write into the prod DB). Surface the
       // misconfiguration as a 503 here rather than letting the fire-and-forget run self-skip into
       // a log line the operator has to go looking for.
-      if (job === 'value-snapshots' && !env.CONTENT_APP_URL) {
+      if ((job === 'value-snapshots' || job === 'price-anomaly-scan') && !env.CONTENT_APP_URL) {
         return json({ ok: false, error: 'CONTENT_APP_URL not configured' }, 503);
       }
       // PriceCharting's per-game CSV download is HARD rate-limited (~1/10min, abuse → account
@@ -924,6 +925,15 @@ export default {
                 // already run today simply reports skipped. Use this to seed/verify UAT, which
                 // has no snapshot cron (the news-poll precedent).
                 await runStage(env.DB, 'value-snapshots', 'run', () => runValueSnapshots(env));
+                break;
+              case 'price-anomaly-scan':
+                // POST Content's /api/internal/price-anomalies/run (Content mig 0129). This
+                // worker prices nothing — Content detects with its own provenance chain.
+                // Safe to re-fire: detection upserts per (product, rule) and the baseline
+                // refresh is change-filtered. Use this to run the sentinel on demand (e.g.
+                // right after a suspect ingest) or to drive it on UAT, which has no cron for
+                // it (the news-poll precedent).
+                await runStage(env.DB, 'price-anomaly-scan', 'run', () => runPriceAnomalyScan(env));
                 break;
             }
           } catch (err) {
@@ -1130,6 +1140,22 @@ export default {
         ctx.waitUntil(
           runStage(env.DB, 'value-snapshots', 'run', () => runValueSnapshots(env)).catch((err) =>
             logger.error('Value snapshot run failed', { error: String(err) })
+          )
+        );
+        break;
+
+      case '0 8 * * *':
+        // DAILY: ask the Content app to run the PRICE ANOMALY SCAN (Content mig 0129) — the
+        // report-only pricing sentinel born from the 2026-08-16 Mega Dragonite $32,000 incident.
+        // This worker prices nothing — it POSTs /api/internal/price-anomalies/run with the
+        // shared secret and logs the counts; the detection rules run in Content against the ONE
+        // provenance chain (see src/priceAnomalyScan.ts for the seam + the 08:00 rationale:
+        // after the 04:00 Scrydex drain / 05:00 PriceCharting / 06:00 TCG sync ingest block,
+        // before the 10:00 value snapshot). LOG-AND-CONTINUE: a failed run records an honest
+        // `status='error'` row via runStage and tomorrow's run (or a manual fire) is the retry.
+        ctx.waitUntil(
+          runStage(env.DB, 'price-anomaly-scan', 'run', () => runPriceAnomalyScan(env)).catch((err) =>
+            logger.error('Price anomaly scan failed', { error: String(err) })
           )
         );
         break;

@@ -123,7 +123,14 @@ id      = "d8b69df87a0143b699e8dc75d286cdcb"
 # The 10:00 slot coincides with the value-snapshot cron (`0 10 * * *`) but they are SEPARATE
 # scheduled invocations (distinct event.cron) — no conflict, and a few watched-card refreshes never
 # materially move a whole-inventory snapshot. PROD ONLY — never add Scrydex crons to [env.preview.triggers].
-crons = ["0 2 * * *", "0 6 * * *", "0 3 * * SUN", "0 4 * * *", "0 10,16,22 * * *", "0 5 * * *", "0 7 * * *", "0 10 * * *"]
+# PRICE ANOMALY SCAN — `0 8 * * *` (Content mig 0129, report-only). POSTs Content's
+# /api/internal/price-anomalies/run (the value-snapshots seam: this worker prices nothing).
+# 08:00 = first free hour AFTER the whole ingest block (04:00 Scrydex drain, 05:00 PriceCharting
+# fetch + its queue PROCESS, 06:00 TCG sync; 07:00 is news-poll) and BEFORE the 10:00 value
+# snapshot, so a currency-scale anomaly is flagged before it lands in the value series.
+# PROD ONLY — never add it to [env.preview.triggers]; UAT fires it on demand via
+# POST /admin/run-job { job: 'price-anomaly-scan' } (the news-poll precedent).
+crons = ["0 2 * * *", "0 6 * * *", "0 3 * * SUN", "0 4 * * *", "0 10,16,22 * * *", "0 5 * * *", "0 7 * * *", "0 8 * * *", "0 10 * * *"]
 
 [vars]
 TCGCSV_BASE_URL = "https://tcgcsv.com"
