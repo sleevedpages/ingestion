@@ -33,6 +33,7 @@ import { runNewsPoll } from './newsPoll.js';
 import { runHashProductImages, HASH_SWEEP_MAX_LIMIT } from './hashProductImages.js';
 import { runValueSnapshots } from './valueSnapshots.js';
 import { runPriceAnomalyScan } from './priceAnomalyScan.js';
+import { runEbayOrderSync } from './ebayOrderSync.js';
 import { runWatchAlerts } from './watchAlerts.js';
 import {
   ADMIN_JOB_IDS,
@@ -1156,6 +1157,25 @@ export default {
         ctx.waitUntil(
           runStage(env.DB, 'price-anomaly-scan', 'run', () => runPriceAnomalyScan(env)).catch((err) =>
             logger.error('Price anomaly scan failed', { error: String(err) })
+          )
+        );
+        break;
+
+      case '*/15 * * * *':
+        // EVERY 15 MIN: ask the Content app to sync eBay ORDERS for every linked seller
+        // account (eBay Sell Phase 3, Content mig 0133). The value-snapshots seam exactly:
+        // this worker POSTs /api/internal/ebay/sync-orders with the shared secret and logs
+        // the counts — it holds NO eBay seller token and computes nothing (the checkout
+        // core, the ledger and the token store all live in Content). Content self-gates on
+        // the dark-wall flag + its own kill switch + the config-driven per-account
+        // interval, so a dark/disabled feature makes this tick a cheap no-op.
+        // LOG-AND-CONTINUE: a failed run records an honest `status='error'` row via
+        // runStage and the next 15-minute tick is the retry — everything Content-side is
+        // idempotent under the UNIQUE(order, line item) key, so a re-fire can never
+        // double-decrement. Separate cron case; can never touch the ingest jobs.
+        ctx.waitUntil(
+          runStage(env.DB, 'ebay-order-sync', 'run', () => runEbayOrderSync(env)).catch((err) =>
+            logger.error('eBay order sync failed', { error: String(err) })
           )
         );
         break;

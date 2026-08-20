@@ -130,7 +130,15 @@ id      = "d8b69df87a0143b699e8dc75d286cdcb"
 # snapshot, so a currency-scale anomaly is flagged before it lands in the value series.
 # PROD ONLY — never add it to [env.preview.triggers]; UAT fires it on demand via
 # POST /admin/run-job { job: 'price-anomaly-scan' } (the news-poll precedent).
-crons = ["0 2 * * *", "0 6 * * *", "0 3 * * SUN", "0 4 * * *", "0 10,16,22 * * *", "0 5 * * *", "0 7 * * *", "0 8 * * *", "0 10 * * *"]
+# EBAY ORDER SYNC — `*/15 * * * *` (eBay Sell Phase 3, Content mig 0133). POSTs Content's
+# /api/internal/ebay/sync-orders (the value-snapshots seam again: this worker holds NO eBay
+# seller token and computes nothing — Content polls getOrders, writes the ledger and moves
+# inventory). The 15-min tick is the FLOOR; the effective per-account interval is Content's
+# app_config.ebay_order_sync_interval_min (default 15), so slowing it is an UPDATE, not a
+# cron edit. Content self-gates on ebay_listings_enabled + ebay_order_sync_enabled, making
+# every tick a cheap no-op while the feature is dark. PROD ONLY — never add it to
+# [env.preview.triggers]; UAT syncs on demand via the EbayCard "Sync now" button.
+crons = ["0 2 * * *", "0 6 * * *", "0 3 * * SUN", "0 4 * * *", "0 10,16,22 * * *", "0 5 * * *", "0 7 * * *", "0 8 * * *", "0 10 * * *", "*/15 * * * *"]
 
 [vars]
 TCGCSV_BASE_URL = "https://tcgcsv.com"
