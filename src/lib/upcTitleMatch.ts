@@ -24,9 +24,32 @@
  *
  * Also here: the shared per-provider DAILY CALL CAP (app_config-with-code-default read +
  * a KV day counter) both resolvers use to respect their quotas.
+ *
+ * ── WHAT "CONFIDENT" MEANS (the word the ladder contract used without defining — 2026-08-21)
+ *
+ * A CONFIDENT external hit — the only kind that is ever returned, and therefore the only kind
+ * Content ever WRITES BACK to `product_upcs` — is an aggregate that clears ALL FOUR of these
+ * for EXACTLY ONE canonical product. It is a CONJUNCTION OF GATES, never a score or a
+ * threshold, and every gate fails toward rejection:
+ *   1. NAME CONTAINMENT — every ≥3-character, non-purely-numeric token of the CANONICAL
+ *      product name appears in the provider haystack. (Direction matters: the catalogue name
+ *      is the authority; extra provider tokens are free.)
+ *   2. LANGUAGE AGREEMENT — the haystack and the product's SET name resolve to the same
+ *      language (`textLanguage`).
+ *   3. SET CORROBORATION — `consoleCorroboratesSet` between the haystack and the set name.
+ *   4. UNIQUENESS — exactly one candidate clears 1–3. TWO accepts is an AMBIGUITY and returns
+ *      a MISS, never a pick. This is deliberate and load-bearing: sibling sealed products
+ *      nest by name ("Mega Evolution Booster Box" ⊂ "Mega Evolution Enhanced Booster Box",
+ *      "… Booster Box" ⊂ "… Booster Box Case"), and a wrong confident hit writes a PERMANENT
+ *      map row that silently adds the wrong product to every future scanner's inventory.
+ *      The vendor-teach flow and `/api/admin/upc-mappings` are the designed backstops for the
+ *      misses this costs.
+ * Gates 1–3 are `pickNumberlessCanonicalMatch` (the ONE shared catalogue matcher — never a
+ * second one); gate 4 is its unique-accept rule. Nothing here re-implements them.
  */
 
 import { norm, pickNumberlessCanonicalMatch, type NumberlessCandidate } from './pricechartingCsv.js'
+import { logger } from '../ingestion/logger.js'
 
 /** Seller vocabulary stripped BEFORE aggregation — these describe the LISTING, not the
  * product. Kept conservative: never strip a token that could be product identity (numbers
@@ -43,9 +66,24 @@ export const LISTING_NOISE_TOKENS = new Set([
  * (Pokémon "151" is a real set). */
 const QUANTITY_TOKEN = /^(x\d{1,3}|\d{1,3}x)$/
 
-/** Normalise ONE title to its identity tokens (norm() + noise stripping). PURE. */
+/**
+ * Strip combining diacritical marks so an accented brand folds to its ASCII spelling.
+ * PURE. **Why this is not cosmetic:** `norm()` turns every non-`[a-z0-9]` byte into a
+ * space, so "Pokémon" became the two junk tokens `pok` + `mon` — both ≥3 chars and both
+ * absent from `GENERIC_CANDIDATE_TOKENS`, so on a short title one of them could win a
+ * slot in `distinctiveTokens` and be required of every catalogue name, guaranteeing an
+ * empty candidate pool. Folding first yields the single token `pokemon`, which is already
+ * generic vocabulary and drops out of the discriminators harmlessly. Applied HERE (the UPC
+ * rung's own tokenizer) and deliberately NOT inside the shared `norm()` — that function is
+ * also the PriceCharting bulk-ingest matcher's, and this rung must not change its behaviour.
+ */
+export function foldDiacritics(s: unknown): string {
+  return String(s ?? '').normalize('NFD').replace(/\p{M}/gu, '')
+}
+
+/** Normalise ONE title to its identity tokens (fold → norm() → noise stripping). PURE. */
 export function titleTokens(title: unknown): string[] {
-  return norm(title)
+  return norm(foldDiacritics(title))
     .split(' ')
     .filter((t) => t.length > 0 && !LISTING_NOISE_TOKENS.has(t) && !QUANTITY_TOKEN.test(t))
 }
@@ -96,9 +134,29 @@ export function distinctiveTokens(aggregate: string, max = 3): string[] {
 /** Bounded candidate pool — big enough that truncation is rare, small enough for one query. */
 const CANDIDATE_LIMIT = 250
 
+/** How many discriminators the candidate query starts with, and the floor it relaxes to. */
+export const DISCRIMINATOR_MAX = 3
+export const DISCRIMINATOR_MIN = 2
+
 export interface UpcTitleMatch {
   canonicalProductId: number
   productKind: string | null
+  /** How many discriminators the accepting query used (observability; MAX = no relaxation). */
+  discriminatorsUsed?: number
+}
+
+/** Why an aggregate did not resolve — the WP4 observability field. Never user-facing. */
+export type UpcRejectStage =
+  | 'no_discriminators'      // the aggregate was entirely generic vocabulary — never queried
+  | 'no_candidates'          // every discriminator set (incl. the relaxed one) pulled 0 rows
+  | 'no_confident_match'     // real candidates existed; none cleared the gates, or ≥2 did
+
+export interface MatchTrace {
+  rejectStage?: UpcRejectStage
+  discriminators: string[]
+  discriminatorsUsed: number
+  candidatePool: number
+  relaxed: boolean
 }
 
 /**
@@ -106,33 +164,116 @@ export interface UpcTitleMatch {
  * pull (every distinctive token must appear in the product's name+set text; sealed rows
  * first), then the shared pickNumberlessCanonicalMatch with the aggregate as BOTH the
  * product-name and console-name (a listing title carries name, set and game in one string —
- * it is its own corroboration text). Returns null on no/ambiguous match.
+ * it is its own corroboration text). Returns null on no/ambiguous match — see the
+ * "WHAT CONFIDENT MEANS" block at the top of this file for the exact gate set.
+ *
+ * ⚠️ CANDIDATE-POOL RELAXATION (2026-08-21 — the fix for the measured zero-pool defect).
+ * The pool query ANDs the distinctive tokens, i.e. it requires PROVIDER-derived tokens of the
+ * CATALOGUE. That is backwards whenever the provider title carries a word our names never use,
+ * and it was zeroing the pool before the matcher ever ran. Two real examples, both measured
+ * against prod on 2026-08-21:
+ *   - "… Enhanced Booster Display Box - 36 Packs & Box Topper" → discriminators
+ *     [evolution, enhanced, TOPPER]; no catalogue name contains "topper" → 0 rows.
+ *   - "… Scarlet & Violet Prismatic Evolutions Elite Trainer Box" → [evolutions, prismatic,
+ *     SCARLET]; our set is spelled "SV: Prismatic Evolutions" → 0 rows.
+ * So: on an EMPTY pool the weakest (shortest) discriminator is dropped and the query is retried
+ * once, down to DISCRIMINATOR_MIN. Relaxation is deliberately NOT attempted after the matcher
+ * REJECTS a non-empty pool — an empty pool means the pool was over-constrained (a pool-building
+ * defect), whereas a rejection means the matcher saw real candidates and made its call; widening
+ * the pool then could only add accepts, i.e. trade precision for recall. Bounded at ONE retry so
+ * a miss costs at most two catalogue scans.
  */
-export async function matchAggregateToCatalogue(db: D1Database, aggregate: string): Promise<UpcTitleMatch | null> {
-  const discriminators = distinctiveTokens(aggregate)
-  if (discriminators.length === 0) return null   // nothing but generic vocabulary → unmatchable
+export async function matchAggregateToCatalogue(
+  db: D1Database,
+  aggregate: string,
+  opts: { onTrace?: (t: MatchTrace) => void } = {},
+): Promise<UpcTitleMatch | null> {
+  const trace = (t: MatchTrace) => { try { opts.onTrace?.(t) } catch { /* never break a lookup to log */ } }
 
-  const clause = discriminators.map(() => `instr(lower(p.name) || ' ' || lower(s.name), ?) > 0`).join(' AND ')
-  const { results } = await db.prepare(`
-    SELECT p.id, p.name, p.product_kind AS productKind, s.name AS setName
-    FROM products p
-    JOIN sets s ON s.id = p.set_id
-    WHERE ${clause}
-    ORDER BY (CASE WHEN p.product_kind = 'sealed' THEN 0 ELSE 1 END), p.id DESC
-    LIMIT ${CANDIDATE_LIMIT}
-  `).bind(...discriminators).all<{ id: number; name: string | null; productKind: string | null; setName: string | null }>()
+  const discriminators = distinctiveTokens(aggregate, DISCRIMINATOR_MAX)
+  if (discriminators.length === 0) {
+    // nothing but generic vocabulary → unmatchable, and never worth a catalogue scan
+    trace({ rejectStage: 'no_discriminators', discriminators, discriminatorsUsed: 0, candidatePool: 0, relaxed: false })
+    return null
+  }
 
-  const rows = results ?? []
-  if (rows.length === 0) return null
+  const floor = Math.min(DISCRIMINATOR_MIN, discriminators.length)
+  for (let used = discriminators.length; used >= floor; used--) {
+    // longest-first ordering means slicing from the front drops the WEAKEST token
+    const active = discriminators.slice(0, used)
+    const relaxed = used < discriminators.length
+    const clause = active.map(() => `instr(lower(p.name) || ' ' || lower(s.name), ?) > 0`).join(' AND ')
+    const { results } = await db.prepare(`
+      SELECT p.id, p.name, p.product_kind AS productKind, s.name AS setName
+      FROM products p
+      JOIN sets s ON s.id = p.set_id
+      WHERE ${clause}
+      ORDER BY (CASE WHEN p.product_kind = 'sealed' THEN 0 ELSE 1 END), p.id DESC
+      LIMIT ${CANDIDATE_LIMIT}
+    `).bind(...active).all<{ id: number; name: string | null; productKind: string | null; setName: string | null }>()
 
-  const candidates: NumberlessCandidate[] = rows.map((r) => ({ id: r.id, name: r.name, setName: r.setName }))
-  const matchedId = pickNumberlessCanonicalMatch(
-    { 'product-name': aggregate, 'console-name': aggregate },
-    candidates,
-  )
-  if (matchedId == null) return null
-  const row = rows.find((r) => r.id === matchedId)
-  return { canonicalProductId: matchedId, productKind: row?.productKind ?? null }
+    const rows = results ?? []
+    if (rows.length === 0) continue   // over-constrained pool → relax once, else fall out below
+
+    const candidates: NumberlessCandidate[] = rows.map((r) => ({ id: r.id, name: r.name, setName: r.setName }))
+    const matchedId = pickNumberlessCanonicalMatch(
+      { 'product-name': aggregate, 'console-name': aggregate },
+      candidates,
+    )
+    if (matchedId == null) {
+      trace({ rejectStage: 'no_confident_match', discriminators, discriminatorsUsed: used, candidatePool: rows.length, relaxed })
+      return null
+    }
+    const row = rows.find((r) => r.id === matchedId)
+    trace({ discriminators, discriminatorsUsed: used, candidatePool: rows.length, relaxed })
+    return { canonicalProductId: matchedId, productKind: row?.productKind ?? null, discriminatorsUsed: used }
+  }
+
+  trace({ rejectStage: 'no_candidates', discriminators, discriminatorsUsed: floor, candidatePool: 0, relaxed: discriminators.length > floor })
+  return null
+}
+
+// ── Shared rung observability (WP4, 2026-08-21) ──────────────────────────────
+//
+// THE POINT OF THIS: for a full week a completely non-functional external rung and a
+// legitimate "this barcode isn't in the catalogue" miss produced byte-identical output —
+// `{found:false}` and silence. Nothing in the tail could tell them apart, so nobody looked.
+// Every external-rung resolution now emits ONE structured line naming the rung, the outcome
+// and, on a near-miss, WHICH STAGE rejected it. A resolution is not a failure, so this is
+// `info`, not `warn` — the handled-fallback severity rule (CLAUDE.md → observability) reserves
+// `warn` for a fallback the caller absorbed, which is what the not-configured/cap/backoff
+// gates below use.
+
+export interface RungResolutionLog {
+  rung: 'ebay' | 'upcitemdb'
+  code: string
+  outcome: 'hit' | 'miss' | 'skipped'
+  /** How many provider titles the aggregation saw (0 = the provider knows nothing). */
+  titles?: number
+  aggregate?: string | null
+  canonicalProductId?: number
+  skipped?: string
+  trace?: MatchTrace
+}
+
+/** ONE structured resolution line per external-rung lookup. Never throws. */
+export function logRungResolution(entry: RungResolutionLog): void {
+  try {
+    logger.info('upc_rung_resolution', {
+      rung: entry.rung,
+      upc: entry.code,
+      outcome: entry.outcome,
+      titles: entry.titles ?? 0,
+      aggregate: entry.aggregate ?? null,
+      canonical_product_id: entry.canonicalProductId ?? null,
+      skipped: entry.skipped ?? null,
+      reject_stage: entry.trace?.rejectStage ?? null,
+      discriminators: entry.trace?.discriminators ?? null,
+      discriminators_used: entry.trace?.discriminatorsUsed ?? null,
+      candidate_pool: entry.trace?.candidatePool ?? null,
+      relaxed: entry.trace?.relaxed ?? null,
+    })
+  } catch { /* observability must never break a lookup */ }
 }
 
 // ── Shared daily call cap (per provider) ─────────────────────────────────────

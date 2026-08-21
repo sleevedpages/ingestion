@@ -21,7 +21,7 @@
  */
 
 import type { Env } from '../worker.js'
-import { aggregateTitles, matchAggregateToCatalogue, readConfigInt, dailyCapExhausted, bumpDailyCount } from './upcTitleMatch.js'
+import { aggregateTitles, matchAggregateToCatalogue, readConfigInt, dailyCapExhausted, bumpDailyCount, logRungResolution, type MatchTrace } from './upcTitleMatch.js'
 import { logger } from '../ingestion/logger.js'
 
 export const UPCITEMDB_TRIAL_URL = 'https://api.upcitemdb.com/prod/trial/lookup'
@@ -54,14 +54,26 @@ export async function lookupUpcitemdbUpc(env: Env, code: string, fetchFn: FetchF
   if (kv) {
     const raw = await kv.get(cacheKey)
     if (raw != null) {
-      try { return { ...(JSON.parse(raw) as UpcitemdbUpcResult), cached: true } } catch { /* fall through */ }
+      try {
+        const cached = { ...(JSON.parse(raw) as UpcitemdbUpcResult), cached: true }
+        logRungResolution({ rung: 'upcitemdb', code, outcome: cached.found ? 'hit' : 'miss', skipped: 'kv_cache', canonicalProductId: cached.canonicalProductId })
+        return cached
+      } catch { /* fall through */ }
     }
-    if (await kv.get(UPCITEMDB_BACKOFF_KEY) != null) return { found: false, skipped: 'backoff' }
+    // ⚠️ This gate was SILENT until 2026-08-21: a lookup inside the 10-minute post-429 window
+    // returned a bare miss with nothing in the tail, indistinguishable from a real miss. The
+    // rung still answers correctly by falling through, so this is `warn`, never `error`.
+    if (await kv.get(UPCITEMDB_BACKOFF_KEY) != null) {
+      logger.warn('upcitemdb rung in post-429 BACKOFF — treating as miss', { backoffTtlSec: UPCITEMDB_BACKOFF_TTL })
+      logRungResolution({ rung: 'upcitemdb', code, outcome: 'skipped', skipped: 'backoff' })
+      return { found: false, skipped: 'backoff' }
+    }
   }
 
   const cap = await readConfigInt(env.DB, UPCITEMDB_DAILY_CAP_KEY, UPCITEMDB_DAILY_CAP_DEFAULT)
   if (await dailyCapExhausted(kv, UPCITEMDB_DAILY_COUNTER_PREFIX, cap)) {
     logger.warn('upcitemdb daily cap reached — treating as miss', { cap })
+    logRungResolution({ rung: 'upcitemdb', code, outcome: 'skipped', skipped: 'daily_cap' })
     return { found: false, skipped: 'daily_cap' }
   }
 
@@ -78,6 +90,7 @@ export async function lookupUpcitemdbUpc(env: Env, code: string, fetchFn: FetchF
     res = await fetchFn(url, { headers })
   } catch (err) {
     logger.warn('upcitemdb lookup failed — treating as miss', { error: String(err) })
+    logRungResolution({ rung: 'upcitemdb', code, outcome: 'miss', skipped: 'transport_error' })
     return { found: false }   // transport failure — never negative-cached
   }
 
@@ -85,10 +98,12 @@ export async function lookupUpcitemdbUpc(env: Env, code: string, fetchFn: FetchF
     // Rate-limited: arm the backoff window and miss. NEVER retry-loop.
     if (kv) await kv.put(UPCITEMDB_BACKOFF_KEY, '1', { expirationTtl: UPCITEMDB_BACKOFF_TTL })
     logger.warn('upcitemdb 429 — backoff armed', {})
+    logRungResolution({ rung: 'upcitemdb', code, outcome: 'skipped', skipped: 'rate_limited' })
     return { found: false, skipped: 'backoff' }
   }
   if (!res.ok) {
     logger.warn('upcitemdb non-OK response — treating as miss', { status: res.status })
+    logRungResolution({ rung: 'upcitemdb', code, outcome: 'miss', skipped: `http_${res.status}` })
     return { found: false }   // transient/unknown — never negative-cached
   }
 
@@ -96,15 +111,20 @@ export async function lookupUpcitemdbUpc(env: Env, code: string, fetchFn: FetchF
   const titles = (body?.items ?? []).map((i) => String(i?.title ?? '')).filter((t) => t.length > 0)
 
   const aggregate = titles.length > 0 ? aggregateTitles(titles) : null
-  const match = aggregate ? await matchAggregateToCatalogue(env.DB, aggregate) : null
+  let trace: MatchTrace | undefined
+  const match = aggregate
+    ? await matchAggregateToCatalogue(env.DB, aggregate, { onTrace: (t) => { trace = t } })
+    : null
 
   if (!match) {
+    logRungResolution({ rung: 'upcitemdb', code, outcome: 'miss', titles: titles.length, aggregate, trace })
     // A served response with no confident match is a DEFINITIVE miss → negative-cache.
     if (kv) await kv.put(cacheKey, JSON.stringify({ found: false } satisfies UpcitemdbUpcResult), { expirationTtl: UPCITEMDB_UPC_NEGATIVE_TTL })
     return { found: false }
   }
 
   const positive: UpcitemdbUpcResult = { found: true, canonicalProductId: match.canonicalProductId, productKind: match.productKind }
+  logRungResolution({ rung: 'upcitemdb', code, outcome: 'hit', titles: titles.length, aggregate, canonicalProductId: match.canonicalProductId, trace })
   if (kv) await kv.put(cacheKey, JSON.stringify(positive), { expirationTtl: UPCITEMDB_UPC_TTL })
   return positive
 }

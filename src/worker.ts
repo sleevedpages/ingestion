@@ -12,6 +12,7 @@ import { lookupPriceChartingUpc } from './lib/pricechartingUpc.js';
 import { fetchEbayGraded } from './lib/ebayGradedClient.js';
 import { lookupEbayUpc } from './lib/ebayUpc.js';
 import { lookupUpcitemdbUpc } from './lib/upcitemdbUpc.js';
+import { invalidateUpcCache } from './lib/upcCache.js';
 import {
   fetchPriceChartingCsvToR2,
   runPriceChartingFetch,
@@ -250,6 +251,25 @@ export default {
         logger.error('upcitemdb upc lookup failed', { error: String(err), upc: upcDigits });
         return json({ ok: true, found: false });
       }
+    }
+
+    // POST /upc/cache/invalidate — drop BOTH external rungs' KV entries for one barcode
+    // (2026-08-21). The rungs negative-cache a definitive miss for 24h, so without this a
+    // matcher fix cannot be verified against any code already tested, and a newly-listed
+    // product stays dead for a day. Body `{ upc }`. Idempotent, non-destructive (the durable
+    // record is Content's product_upcs map, never KV) — worst case the next scan costs one
+    // provider call. Content's admin correction endpoint calls this; the operator can too.
+    if (pathname === '/upc/cache/invalidate' && request.method === 'POST') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      const body = await request.json().catch(() => null) as { upc?: unknown } | null;
+      const upcDigits = String(body?.upc ?? '').replace(/\D+/g, '');
+      if (upcDigits.length < 8 || upcDigits.length > 14) {
+        return json({ ok: false, error: 'upc must be an 8-14 digit barcode' }, 400);
+      }
+      return json(await invalidateUpcCache(env.SLEEVEDPAGES_KV, upcDigits));
     }
 
     // NOTE (2026-08-14, operator decision): eBay's marketplace account-deletion

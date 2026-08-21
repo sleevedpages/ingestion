@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import {
   lookupEbayUpc,
+  missingEbayCredentials,
   getEbayAppToken,
   EBAY_TOKEN_URL,
   EBAY_BROWSE_SEARCH_URL,
@@ -111,12 +112,56 @@ describe('getEbayAppToken', () => {
   })
 })
 
+// ── The credential guard (WP1, 2026-08-21) ───────────────────────────────────
+//
+// This guard ran in PRODUCTION for a week reporting `not_configured` while
+// `wrangler secret list` showed both secrets present — because on Workers a secret belongs to
+// a VERSION and `secret list` reports the LATEST version while traffic is served by the
+// DEPLOYED one. Nothing in the response or the tail said which value was missing, or that
+// anything was wrong at all. The guard is UNCHANGED (loosening it would have shipped a rung
+// that 500s instead of one that falls through); what changed is that it now says so.
+describe('missingEbayCredentials', () => {
+  it('reports each unusable value by NAME with absent-vs-blank, and never a value', () => {
+    expect(missingEbayCredentials({ EBAY_CLIENT_ID: 'id', EBAY_CLIENT_SECRET: 'sec' })).toEqual([])
+    expect(missingEbayCredentials({ EBAY_CLIENT_ID: undefined, EBAY_CLIENT_SECRET: 'sec' }))
+      .toEqual([{ name: 'EBAY_CLIENT_ID', reason: 'absent' }])
+    // A `[vars]` entry shadowing the secret, or a shell pipe that swallowed it, lands here.
+    expect(missingEbayCredentials({ EBAY_CLIENT_ID: '', EBAY_CLIENT_SECRET: '   ' })).toEqual([
+      { name: 'EBAY_CLIENT_ID', reason: 'blank' },
+      { name: 'EBAY_CLIENT_SECRET', reason: 'blank' },
+    ])
+  })
+  it('the report can never leak a credential — it carries names and reasons only', () => {
+    const report = missingEbayCredentials({ EBAY_CLIENT_ID: '', EBAY_CLIENT_SECRET: undefined })
+    expect(JSON.stringify(report)).not.toContain('EBAY_CLIENT_ID=')
+    for (const entry of report) expect(Object.keys(entry).sort()).toEqual(['name', 'reason'])
+  })
+})
+
 describe('lookupEbayUpc', () => {
   it('missing credentials → CLEAN miss (skipped not_configured), no network call', async () => {
     const fetchFn = makeFetch({})
     const res = await lookupEbayUpc(baseEnv({ EBAY_CLIENT_ID: undefined }) as any, '196214132474', fetchFn as any)
     expect(res).toEqual({ found: false, skipped: 'not_configured' })
     expect(fetchFn).not.toHaveBeenCalled()
+  })
+
+  it('a BLANK credential is treated exactly like an absent one (an empty string is falsy)', async () => {
+    const fetchFn = makeFetch({})
+    const res = await lookupEbayUpc(baseEnv({ EBAY_CLIENT_SECRET: '  ' }) as any, '196214132474', fetchFn as any)
+    expect(res).toEqual({ found: false, skipped: 'not_configured' })
+    expect(fetchFn).not.toHaveBeenCalled()
+  })
+
+  it('the not-configured fallback logs at WARN, never ERROR, and names the missing value', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    await lookupEbayUpc(baseEnv({ EBAY_CLIENT_ID: undefined }) as any, '196214132474', makeFetch({}) as any)
+    const line = warn.mock.calls.map((c) => String(c[0])).join('\n')
+    expect(line).toContain('EBAY_CLIENT_ID')
+    expect(line).toContain('absent')
+    expect(error).not.toHaveBeenCalled()   // a handled fallback is never an error
+    warn.mockRestore(); error.mockRestore()
   })
 
   it('confident title-aggregate match → canonical id; positive cached long', async () => {

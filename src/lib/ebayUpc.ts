@@ -22,10 +22,21 @@
  *
  * FAIL-CLOSED: missing EBAY_CLIENT_ID/SECRET → clean miss (skipped:'not_configured'),
  * never a 500 to the caller — the ladder just falls through to the next rung.
+ *
+ * ⚠️ 2026-08-21 — WHY `skipped:'not_configured'` RAN IN PRODUCTION FOR A WEEK, and what it
+ * does NOT mean. `EBAY_CLIENT_ID`/`EBAY_CLIENT_SECRET` were never present on the DEPLOYED
+ * VERSION of this worker: on Workers, a secret belongs to a VERSION, and `wrangler secret
+ * list` reports the LATEST version's secret set while traffic is served by the DEPLOYED one.
+ * The two disagreed, so "the secrets exist" and "the guard says not configured" were both
+ * true at once. Verified with `wrangler versions view <id>` — the versions deployed on
+ * 2026-08-14 and 2026-08-17 carry zero eBay credentials. **A secret added in the dashboard
+ * is not live until a deploy** (`npm run deploy`, or `wrangler versions deploy <id>`); do not
+ * "fix" a repeat of this by loosening the guard below. `logMissingCredentials` now names
+ * WHICH env value was absent-vs-blank so the next occurrence is one log line, not three days.
  */
 
 import type { Env } from '../worker.js'
-import { aggregateTitles, matchAggregateToCatalogue, readConfigInt, dailyCapExhausted, bumpDailyCount } from './upcTitleMatch.js'
+import { aggregateTitles, matchAggregateToCatalogue, readConfigInt, dailyCapExhausted, bumpDailyCount, logRungResolution, type MatchTrace } from './upcTitleMatch.js'
 import { logger } from '../ingestion/logger.js'
 
 export const EBAY_TOKEN_URL = 'https://api.ebay.com/identity/v1/oauth2/token'
@@ -45,6 +56,32 @@ export const EBAY_DAILY_CAP_DEFAULT = 4000
 export const EBAY_TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000
 
 interface CachedToken { token: string; expiresAt: number }
+
+/**
+ * Which of the two credential env values is unusable, and how — 'absent' (the binding is not
+ * on the deployed version at all) vs 'blank' (present but empty/whitespace, e.g. a `[vars]`
+ * entry shadowing the secret, or a shell pipe that swallowed the value). **Names only, never
+ * a value and never a prefix of one.** PURE.
+ */
+export function missingEbayCredentials(env: Pick<Env, 'EBAY_CLIENT_ID' | 'EBAY_CLIENT_SECRET'>): Array<{ name: string; reason: 'absent' | 'blank' }> {
+  const out: Array<{ name: string; reason: 'absent' | 'blank' }> = []
+  for (const name of ['EBAY_CLIENT_ID', 'EBAY_CLIENT_SECRET'] as const) {
+    const raw = env[name]
+    if (raw == null) out.push({ name, reason: 'absent' })
+    else if (String(raw).trim() === '') out.push({ name, reason: 'blank' })
+  }
+  return out
+}
+
+/** A HANDLED FALLBACK — warn, never error (CLAUDE.md → observability). The ladder still
+ * answers correctly by falling through to the next rung; a human just needs to know the
+ * rung is dark, which is exactly what nobody could see between 2026-08-14 and 2026-08-21. */
+function logMissingCredentials(missing: Array<{ name: string; reason: string }>): void {
+  logger.warn('ebay upc rung NOT CONFIGURED — falling through to the next rung', {
+    missing,
+    hint: 'a Workers secret belongs to a VERSION; `wrangler secret list` shows the LATEST version, traffic uses the DEPLOYED one. Redeploy the worker after adding it.',
+  })
+}
 
 export interface EbayUpcResult {
   found: boolean
@@ -122,7 +159,12 @@ async function fetchListingTitles(env: Env, code: string, fetchFn: FetchFn): Pro
  * call must not suppress retries for a day).
  */
 export async function lookupEbayUpc(env: Env, code: string, fetchFn: FetchFn = fetch): Promise<EbayUpcResult> {
-  if (!env.EBAY_CLIENT_ID || !env.EBAY_CLIENT_SECRET) return { found: false, skipped: 'not_configured' }
+  const missing = missingEbayCredentials(env)
+  if (missing.length > 0) {
+    logMissingCredentials(missing)
+    logRungResolution({ rung: 'ebay', code, outcome: 'skipped', skipped: 'not_configured' })
+    return { found: false, skipped: 'not_configured' }
+  }
   const kv = env.SLEEVEDPAGES_KV
   const cacheKey = `${EBAY_UPC_PREFIX}${code}`
 
@@ -136,6 +178,7 @@ export async function lookupEbayUpc(env: Env, code: string, fetchFn: FetchFn = f
   const cap = await readConfigInt(env.DB, EBAY_DAILY_CAP_KEY, EBAY_DAILY_CAP_DEFAULT)
   if (await dailyCapExhausted(kv, EBAY_DAILY_COUNTER_PREFIX, cap)) {
     logger.warn('ebay upc daily cap reached — treating as miss', { cap })
+    logRungResolution({ rung: 'ebay', code, outcome: 'skipped', skipped: 'daily_cap' })
     return { found: false, skipped: 'daily_cap' }
   }
 
@@ -145,19 +188,25 @@ export async function lookupEbayUpc(env: Env, code: string, fetchFn: FetchFn = f
     titles = await fetchListingTitles(env, code, fetchFn)
   } catch (err) {
     logger.warn('ebay upc lookup failed — treating as miss', { error: String(err) })
+    logRungResolution({ rung: 'ebay', code, outcome: 'miss', skipped: 'transport_error' })
     return { found: false }   // transient — never negative-cached
   }
 
   const aggregate = titles.length > 0 ? aggregateTitles(titles) : null
-  const match = aggregate ? await matchAggregateToCatalogue(env.DB, aggregate) : null
+  let trace: MatchTrace | undefined
+  const match = aggregate
+    ? await matchAggregateToCatalogue(env.DB, aggregate, { onTrace: (t) => { trace = t } })
+    : null
 
   if (!match) {
+    logRungResolution({ rung: 'ebay', code, outcome: 'miss', titles: titles.length, aggregate, trace })
     // DEFINITIVE miss for this code today (no listings, or nothing confident) → cache it.
     if (kv) await kv.put(cacheKey, JSON.stringify({ found: false } satisfies EbayUpcResult), { expirationTtl: EBAY_UPC_NEGATIVE_TTL })
     return { found: false }
   }
 
   const positive: EbayUpcResult = { found: true, canonicalProductId: match.canonicalProductId, productKind: match.productKind }
+  logRungResolution({ rung: 'ebay', code, outcome: 'hit', titles: titles.length, aggregate, canonicalProductId: match.canonicalProductId, trace })
   if (kv) await kv.put(cacheKey, JSON.stringify(positive), { expirationTtl: EBAY_UPC_TTL })
   return positive
 }
