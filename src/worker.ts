@@ -34,6 +34,7 @@ import { runNewsPoll } from './newsPoll.js';
 import { runHashProductImages, HASH_SWEEP_MAX_LIMIT } from './hashProductImages.js';
 import { runValueSnapshots } from './valueSnapshots.js';
 import { runPriceAnomalyScan } from './priceAnomalyScan.js';
+import { runTradeTalkImageReap } from './tradeTalkImageReap.js';
 import { runEbayOrderSync } from './ebayOrderSync.js';
 import { runWatchAlerts } from './watchAlerts.js';
 import {
@@ -863,7 +864,10 @@ export default {
       // fallback origin (a default would make the UAT worker write into the prod DB). Surface the
       // misconfiguration as a 503 here rather than letting the fire-and-forget run self-skip into
       // a log line the operator has to go looking for.
-      if ((job === 'value-snapshots' || job === 'price-anomaly-scan') && !env.CONTENT_APP_URL) {
+      if (
+        (job === 'value-snapshots' || job === 'price-anomaly-scan' || job === 'trade-talk-image-reap')
+        && !env.CONTENT_APP_URL
+      ) {
         return json({ ok: false, error: 'CONTENT_APP_URL not configured' }, 503);
       }
       // PriceCharting's per-game CSV download is HARD rate-limited (~1/10min, abuse → account
@@ -955,6 +959,14 @@ export default {
                 // right after a suspect ingest) or to drive it on UAT, which has no cron for
                 // it (the news-poll precedent).
                 await runStage(env.DB, 'price-anomaly-scan', 'run', () => runPriceAnomalyScan(env));
+                break;
+              case 'trade-talk-image-reap':
+                // POST Content's /api/internal/trade-talk-images/reap (Content mig 0137). This
+                // worker deletes nothing — Content owns the table, the R2 prefix and the
+                // retention semantics. Bounded to 500 rows per run and idempotent, so re-fire
+                // while the result reports remaining > 0. Use this to sweep on demand or to
+                // drive it on UAT, which has no cron for it (the news-poll precedent).
+                await runStage(env.DB, 'trade-talk-image-reap', 'run', () => runTradeTalkImageReap(env));
                 break;
             }
           } catch (err) {
@@ -1177,6 +1189,30 @@ export default {
         ctx.waitUntil(
           runStage(env.DB, 'price-anomaly-scan', 'run', () => runPriceAnomalyScan(env)).catch((err) =>
             logger.error('Price anomaly scan failed', { error: String(err) })
+          )
+        );
+        break;
+
+      case '0 9 * * *':
+        // DAILY: ask the Content app to REAP EXPIRED TRADE-TALK PHOTOS (Content mig 0137) —
+        // delete the rows past their retention TTL and sweep their R2 objects. This worker
+        // deletes nothing: the table, the bucket prefix and the expiry semantics all live in
+        // Content, and a second definition of "which photos are due" would fork a PRIVACY
+        // question (see src/tradeTalkImageReap.ts).
+        //
+        // ⚠️ HOUSEKEEPING, NOT THE PRIVACY CONTROL. Content's read path re-checks expires_at on
+        // every request and 404s an expired photo whether or not this ever runs, so a dead cron
+        // costs storage, not confidentiality — and the R2 lifecycle rule on the
+        // `trade-talk-images/` prefix is the third layer under both.
+        //
+        // WHY 09:00: the reap depends on nothing (it reads only its own table), so it just wants
+        // a free hour — 09:00 sits between the 08:00 price-anomaly scan and the 10:00 value
+        // snapshot / card-watch lane. (07:00 is the news-poll, despite what the brief assumed.)
+        // LOG-AND-CONTINUE: a failed run records an honest `status='error'` row via runStage and
+        // tomorrow's run (or a manual fire) is the retry; the job is idempotent.
+        ctx.waitUntil(
+          runStage(env.DB, 'trade-talk-image-reap', 'run', () => runTradeTalkImageReap(env)).catch((err) =>
+            logger.error('Trade-talk image reap failed', { error: String(err) })
           )
         );
         break;

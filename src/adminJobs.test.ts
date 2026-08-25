@@ -29,6 +29,7 @@ describe('ADMIN_JOB_IDS / isAdminJobId', () => {
     expect(ADMIN_JOB_IDS).toEqual([
       'tcg-sync', 'image-mirror', 'scrydex-drain', 'card-watch-drain', 'pricecharting-csv', 'pricecharting-download',
       'news-poll', 'hash-product-images', 'value-snapshots', 'price-anomaly-scan',
+      'trade-talk-image-reap',
     ])
   })
   it('accepts known ids and rejects everything else', () => {
