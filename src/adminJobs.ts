@@ -41,7 +41,8 @@ export type AdminJobId =
   | 'hash-product-images'      // perceptual-hash corpus sweep + packed index rebuild (bulk scan intake; no API key)
   | 'value-snapshots'          // POST Content's /api/internal/snapshots/run — daily inventory value history (Content mig 0115)
   | 'price-anomaly-scan'       // POST Content's /api/internal/price-anomalies/run — the nightly pricing anomaly sentinel (Content mig 0129, report-only)
-  | 'trade-talk-image-reap';   // POST Content's /api/internal/trade-talk-images/reap — delete EXPIRED trade-talk photos (Content mig 0137). HOUSEKEEPING, not the privacy control: Content's read path already 404s an expired photo
+  | 'trade-talk-image-reap'    // POST Content's /api/internal/trade-talk-images/reap — delete EXPIRED trade-talk photos (Content mig 0137). HOUSEKEEPING, not the privacy control: Content's read path already 404s an expired photo
+  | 'price-archive-capture';   // LOOP Content's /api/internal/price-archive/run until done — archive the whole prices table into the private R2 bucket, one partition per local day (Price Index Capture Phase 1). This worker prices/archives nothing
 
 export const ADMIN_JOB_IDS: AdminJobId[] = [
   'tcg-sync',
@@ -55,6 +56,7 @@ export const ADMIN_JOB_IDS: AdminJobId[] = [
   'value-snapshots',
   'price-anomaly-scan',
   'trade-talk-image-reap',
+  'price-archive-capture',
 ];
 
 export function isAdminJobId(value: unknown): value is AdminJobId {
@@ -132,6 +134,7 @@ const JOB_LOCK_TTL_SECONDS: Record<AdminJobId, number> = {
   'value-snapshots': 300,        // one HTTP POST to Content (capped at 60s); short backstop
   'price-anomaly-scan': 300,     // one HTTP POST to Content (capped at 120s); short backstop
   'trade-talk-image-reap': 300,  // one HTTP POST to Content (capped at 60s); short backstop
+  'price-archive-capture': 1800, // a LOOP of bounded Content batches (~1.33M rows/day); generous backstop
 };
 
 export async function isJobRunning(env: Env, job: AdminJobId): Promise<boolean> {

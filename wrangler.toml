@@ -73,6 +73,7 @@ id      = "d8b69df87a0143b699e8dc75d286cdcb"
 #   0 5 * * *    — DAILY PriceCharting FETCH (download ONE rotated category → R2, then queue PROCESS)
 #   0 7 * * *    — DAILY News poll (DotGG WordPress RSS → news_items; headline+link+date only, link-out)
 #   0 10 * * *   — DAILY inventory VALUE SNAPSHOT trigger (POST Content /api/internal/snapshots/run)
+#   0 12 * * *   — DAILY PRICE ARCHIVE capture trigger (LOOP Content /api/internal/price-archive/run until done)
 #
 # VALUE SNAPSHOTS (Content migration 0115): the worker prices NOTHING. It POSTs the Content app's
 # secret-gated internal endpoint and logs the counts; Content computes every figure with its own
@@ -143,6 +144,19 @@ id      = "d8b69df87a0143b699e8dc75d286cdcb"
 # fallback would let a UAT worker reap PROD photos). PROD ONLY — never add it to
 # [env.preview.triggers]; UAT reaps on demand via POST /admin/run-job
 # { job: 'trade-talk-image-reap' }.
+# PRICE ARCHIVE CAPTURE — `0 12 * * *` (Price Index Capture Phase 1). LOOPS Content's
+# /api/internal/price-archive/run (bounded batches, resumable via R2 part metadata) until the
+# day reports done — the value-snapshots seam with a loop, because the full prices table
+# (~1.33M rows measured 2026-08-31) cannot fit one Content invocation. This worker prices and
+# archives NOTHING; Content owns the table, the day convention (snapshot_tz_offset_min — the
+# SAME fixed offset as the value snapshots, so the two series agree on what a day is) and the
+# PRICE_ARCHIVE bucket. Why 12:00: the capture must land AFTER the day's last bulk price write —
+# the 04/05/06 ingest block's QUEUES keep draining well past their trigger hours, so 12:00 gives
+# the 06:00 TCG fan-out six hours, sits clear of the 10:00 snapshot/watch pair, and precedes the
+# 16:00 watch lane. Same CONTENT_APP_URL no-default rule (absent → self-skip; a prod fallback
+# would let a UAT worker drive PROD captures). PROD ONLY — never add it to
+# [env.preview.triggers]; UAT captures on demand via POST /admin/run-job
+# { job: 'price-archive-capture' } (the news-poll precedent).
 # EBAY ORDER SYNC — `*/15 * * * *` (eBay Sell Phase 3, Content mig 0133). POSTs Content's
 # /api/internal/ebay/sync-orders (the value-snapshots seam again: this worker holds NO eBay
 # seller token and computes nothing — Content polls getOrders, writes the ledger and moves
@@ -151,7 +165,7 @@ id      = "d8b69df87a0143b699e8dc75d286cdcb"
 # cron edit. Content self-gates on ebay_listings_enabled + ebay_order_sync_enabled, making
 # every tick a cheap no-op while the feature is dark. PROD ONLY — never add it to
 # [env.preview.triggers]; UAT syncs on demand via the EbayCard "Sync now" button.
-crons = ["0 2 * * *", "0 6 * * *", "0 3 * * SUN", "0 4 * * *", "0 10,16,22 * * *", "0 5 * * *", "0 7 * * *", "0 8 * * *", "0 9 * * *", "0 10 * * *", "*/15 * * * *"]
+crons = ["0 2 * * *", "0 6 * * *", "0 3 * * SUN", "0 4 * * *", "0 10,16,22 * * *", "0 5 * * *", "0 7 * * *", "0 8 * * *", "0 9 * * *", "0 10 * * *", "0 12 * * *", "*/15 * * * *"]
 
 [vars]
 TCGCSV_BASE_URL = "https://tcgcsv.com"

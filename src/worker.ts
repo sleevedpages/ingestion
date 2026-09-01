@@ -35,6 +35,7 @@ import { runHashProductImages, HASH_SWEEP_MAX_LIMIT } from './hashProductImages.
 import { runValueSnapshots } from './valueSnapshots.js';
 import { runPriceAnomalyScan } from './priceAnomalyScan.js';
 import { runTradeTalkImageReap } from './tradeTalkImageReap.js';
+import { runPriceArchive } from './priceArchive.js';
 import { runEbayOrderSync } from './ebayOrderSync.js';
 import { runWatchAlerts } from './watchAlerts.js';
 import {
@@ -865,7 +866,8 @@ export default {
       // misconfiguration as a 503 here rather than letting the fire-and-forget run self-skip into
       // a log line the operator has to go looking for.
       if (
-        (job === 'value-snapshots' || job === 'price-anomaly-scan' || job === 'trade-talk-image-reap')
+        (job === 'value-snapshots' || job === 'price-anomaly-scan' || job === 'trade-talk-image-reap'
+          || job === 'price-archive-capture')
         && !env.CONTENT_APP_URL
       ) {
         return json({ ok: false, error: 'CONTENT_APP_URL not configured' }, 503);
@@ -967,6 +969,15 @@ export default {
                 // while the result reports remaining > 0. Use this to sweep on demand or to
                 // drive it on UAT, which has no cron for it (the news-poll precedent).
                 await runStage(env.DB, 'trade-talk-image-reap', 'run', () => runTradeTalkImageReap(env));
+                break;
+              case 'price-archive-capture':
+                // LOOP Content's /api/internal/price-archive/run until the day reports done
+                // (Price Index Capture Phase 1). This worker prices and archives nothing —
+                // Content owns the prices table, the day convention and the PRICE_ARCHIVE
+                // bucket. Idempotent per day: a completed day short-circuits on its manifest,
+                // a partial day RESUMES from the last landed part — so re-firing after a
+                // cut-short cron run finishes the same day rather than duplicating it.
+                await runStage(env.DB, 'price-archive-capture', 'run', () => runPriceArchive(env));
                 break;
             }
           } catch (err) {
@@ -1213,6 +1224,35 @@ export default {
         ctx.waitUntil(
           runStage(env.DB, 'trade-talk-image-reap', 'run', () => runTradeTalkImageReap(env)).catch((err) =>
             logger.error('Trade-talk image reap failed', { error: String(err) })
+          )
+        );
+        break;
+
+      case '0 12 * * *':
+        // DAILY: ask the Content app to CAPTURE TODAY'S PRICE ARCHIVE (Price Index Capture
+        // Phase 1) — the whole prices table, verbatim, into the private R2 price-archive
+        // bucket, one partition per local day. This worker prices and archives nothing: the
+        // trigger LOOPS Content's bounded /api/internal/price-archive/run until the day
+        // reports done (see src/priceArchive.ts — the value-snapshots seam, looped, because
+        // ~1.33M rows cannot fit one Content invocation).
+        //
+        // WHY 12:00 UTC. The capture must run AFTER the last bulk price write of the day
+        // lands. The write block is 04:00 Scrydex drain, 05:00 PriceCharting fetch + its
+        // queue PROCESS, 06:00 TCG sync + its queue consumers — and the two QUEUES drain for
+        // a while after their triggers fire, so "first free hour after the block" is not
+        // enough headroom for a snapshot that must reflect the day's final state. 12:00 gives
+        // the 06:00 fan-out six hours, sits clear of the 10:00 value-snapshot/watch pair, and
+        // finishes long before the 16:00 watch lane. (The 10/16/22 watched-expansion lanes
+        // write small intraday updates by design; a day's archived value for a watched card
+        // is whichever reading held at capture time — the same convention the 10:00 value
+        // snapshot lives with.) LOG-AND-CONTINUE: a failed run records an honest
+        // `status='error'` row via runStage; landed parts are KEPT and a manual re-fire the
+        // same day resumes from the last part. A day never captured stays an absent day —
+        // gaps stay gaps, never backfilled. PROD ONLY — never in [env.preview.triggers];
+        // UAT captures on demand via POST /admin/run-job { job: 'price-archive-capture' }.
+        ctx.waitUntil(
+          runStage(env.DB, 'price-archive-capture', 'run', () => runPriceArchive(env)).catch((err) =>
+            logger.error('Price archive capture failed', { error: String(err) })
           )
         );
         break;
