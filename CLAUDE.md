@@ -264,6 +264,10 @@ this worker writes with `db.ts PRICE_SQL` — never a second mapper. Content's
 (`'tcgplayer', NULL, ?, NULL, 0, …`) / bind order as SOURCE TEXT. **Changing either breaks the
 Content suite until the mirror in `tcgcsvMapping.mjs` is updated deliberately** — that is the
 point. Keep `transformPrice` a pure function with no Worker-only imports (it runs under Node).
+The import resolves from the sibling checkout (`G:\SleevedPages\Ingestion`) or Content's
+`INGESTION_ROOT` env; Content's CI checks out this repo only when its optional
+`INGESTION_CHECKOUT_TOKEN` secret (a fine-grained read PAT for `sleevedpages/ingestion`) is set —
+otherwise those pins skip there and run only on the operator's machine.
 The backfill's one-download constraint (every tcgcsv.com archive file exactly once, ever) lives in
 `Content/CLAUDE.md` and `Content/docs/context/ingestion-and-ops.md`; nothing in THIS repo may ever
 request `https://tcgcsv.com/archive/…` — `runIngestion` reads the live API only.
