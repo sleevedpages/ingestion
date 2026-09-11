@@ -253,6 +253,21 @@ last sync — exiting early`). A manual `tcg-sync` fired after that day's 06:00 
 NOTHING. To force one, set the `FORCE_SYNC=true` worker var; otherwise the next daily cron is the
 reliable trigger. Do not read the early exit as a failure.
 
+## ⚠️ Cross-repo consumer of `transformPrice()` — the TCGCSV archive backfill (2026-09-10)
+
+`Content/scripts/price-archive-backfill/lib/tcgcsvMapping.mjs` **imports `transformPrice` from
+`src/ingestion/transformer.ts` directly** (relative path across the two checkouts, run under
+`tsx`) so the offline TCGCSV price-archive backfill uses THE SAME `subTypeName → finish` mapping
+this worker writes with `db.ts PRICE_SQL` — never a second mapper. Content's
+`tests/unit/scripts/priceArchiveBackfill/mapping.test.js` pins the transformer's
+`sub_type_name: price.subTypeName` line AND `PRICE_SQL`'s column list / literal VALUES
+(`'tcgplayer', NULL, ?, NULL, 0, …`) / bind order as SOURCE TEXT. **Changing either breaks the
+Content suite until the mirror in `tcgcsvMapping.mjs` is updated deliberately** — that is the
+point. Keep `transformPrice` a pure function with no Worker-only imports (it runs under Node).
+The backfill's one-download constraint (every tcgcsv.com archive file exactly once, ever) lives in
+`Content/CLAUDE.md` and `Content/docs/context/ingestion-and-ops.md`; nothing in THIS repo may ever
+request `https://tcgcsv.com/archive/…` — `runIngestion` reads the live API only.
+
 ## Card attribute metadata → `product_attributes` (Content mig 0125, 2026-08-11)
 
 TCGCSV's per-product `extendedData` block carries the deck-building metadata the ingest used to
