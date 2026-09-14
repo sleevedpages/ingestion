@@ -36,6 +36,7 @@ import { runValueSnapshots } from './valueSnapshots.js';
 import { runPriceAnomalyScan } from './priceAnomalyScan.js';
 import { runTradeTalkImageReap } from './tradeTalkImageReap.js';
 import { runPriceArchive } from './priceArchive.js';
+import { runPriceDailyCapture } from './priceDailyCapture.js';
 import { runEbayOrderSync } from './ebayOrderSync.js';
 import { runWatchAlerts } from './watchAlerts.js';
 import {
@@ -867,7 +868,7 @@ export default {
       // a log line the operator has to go looking for.
       if (
         (job === 'value-snapshots' || job === 'price-anomaly-scan' || job === 'trade-talk-image-reap'
-          || job === 'price-archive-capture')
+          || job === 'price-archive-capture' || job === 'price-daily-capture')
         && !env.CONTENT_APP_URL
       ) {
         return json({ ok: false, error: 'CONTENT_APP_URL not configured' }, 503);
@@ -978,6 +979,14 @@ export default {
                 // a partial day RESUMES from the last landed part — so re-firing after a
                 // cut-short cron run finishes the same day rather than duplicating it.
                 await runStage(env.DB, 'price-archive-capture', 'run', () => runPriceArchive(env));
+                break;
+              case 'price-daily-capture':
+                // LOOP Content's /api/internal/price-daily/run until it reports done (Price
+                // Index Capture Phase 2). This worker projects nothing — Content reads its own
+                // R2 captures and writes price_daily in the dedicated price DB. Idempotent:
+                // a completed day short-circuits on its price_daily_days row, a cut-short day
+                // resumes from its next unread part — re-fire to finish a catch-up.
+                await runStage(env.DB, 'price-daily-capture', 'run', () => runPriceDailyCapture(env));
                 break;
             }
           } catch (err) {
@@ -1253,6 +1262,34 @@ export default {
         ctx.waitUntil(
           runStage(env.DB, 'price-archive-capture', 'run', () => runPriceArchive(env)).catch((err) =>
             logger.error('Price archive capture failed', { error: String(err) })
+          )
+        );
+        break;
+
+      case '0 13 * * *':
+        // DAILY: ask the Content app to PROJECT its own R2 daily price captures into
+        // `price_daily` (Price Index Capture Phase 2, capture_method='daily_capture', the
+        // dedicated price DB). This worker projects nothing: the trigger LOOPS Content's
+        // bounded /api/internal/price-daily/run until it reports done — every completed
+        // archive day not yet projected, oldest first (see src/priceDailyCapture.ts; the
+        // price-archive seam, looped, because one day is ~69 archive parts and the initial
+        // catch-up spans the days accumulated before this shipped).
+        //
+        // WHY 13:00 UTC. The projection READS the day the 12:00 capture WRITES, and reads
+        // only days whose manifest exists (the manifest is written LAST). Every prod capture
+        // to date completed by ~12:04 (manifests 2026-09-01 → 09-13: 12:02–12:04 UTC), so
+        // 13:00 gives it ~15× its typical duration; a capture still running at 13:00 simply
+        // has no manifest yet — that day is skipped this firing and projected tomorrow,
+        // oldest first, never partially. The hour is otherwise free (12:00 capture, then
+        // nothing until the 16:00 watch lane; 14/15:00 are free too but buy nothing).
+        // LOG-AND-CONTINUE: a failed run records an honest `status='error'` row via runStage;
+        // progress persists in price_daily_days and the next fire resumes from the day
+        // cursor. Only days with a manifest are ever written — catch-up, never backfill.
+        // PROD ONLY — never in [env.preview.triggers]; UAT projects on demand via
+        // POST /admin/run-job { job: 'price-daily-capture' }.
+        ctx.waitUntil(
+          runStage(env.DB, 'price-daily-capture', 'run', () => runPriceDailyCapture(env)).catch((err) =>
+            logger.error('Price daily capture failed', { error: String(err) })
           )
         );
         break;

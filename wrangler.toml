@@ -74,6 +74,7 @@ id      = "d8b69df87a0143b699e8dc75d286cdcb"
 #   0 7 * * *    — DAILY News poll (DotGG WordPress RSS → news_items; headline+link+date only, link-out)
 #   0 10 * * *   — DAILY inventory VALUE SNAPSHOT trigger (POST Content /api/internal/snapshots/run)
 #   0 12 * * *   — DAILY PRICE ARCHIVE capture trigger (LOOP Content /api/internal/price-archive/run until done)
+#   0 13 * * *   — DAILY PRICE DAILY PROJECTION trigger (LOOP Content /api/internal/price-daily/run until done — Phase 2)
 #
 # VALUE SNAPSHOTS (Content migration 0115): the worker prices NOTHING. It POSTs the Content app's
 # secret-gated internal endpoint and logs the counts; Content computes every figure with its own
@@ -165,7 +166,18 @@ id      = "d8b69df87a0143b699e8dc75d286cdcb"
 # cron edit. Content self-gates on ebay_listings_enabled + ebay_order_sync_enabled, making
 # every tick a cheap no-op while the feature is dark. PROD ONLY — never add it to
 # [env.preview.triggers]; UAT syncs on demand via the EbayCard "Sync now" button.
-crons = ["0 2 * * *", "0 6 * * *", "0 3 * * SUN", "0 4 * * *", "0 10,16,22 * * *", "0 5 * * *", "0 7 * * *", "0 8 * * *", "0 9 * * *", "0 10 * * *", "0 12 * * *", "*/15 * * * *"]
+# PRICE DAILY PROJECTION — `0 13 * * *` (Price Index Capture Phase 2). LOOPS Content's
+# /api/internal/price-daily/run until it reports done: Content reads its OWN completed R2
+# daily captures (only days with a manifest, oldest first — catch-up, never backfill) and
+# projects the TCGplayer-basis rows into `price_daily` in the dedicated price DB
+# (capture_method='daily_capture', write-on-change, retention = Content app_config). This
+# worker projects NOTHING. Why 13:00: it reads what the 12:00 capture writes; every prod
+# capture to date has completed by ~12:04, so 13:00 is ~15× headroom, and a capture still in
+# flight has no manifest yet → that day is skipped this firing and projected tomorrow. The
+# hour is free (nothing between the 12:00 capture and the 16:00 watch lane). Same
+# CONTENT_APP_URL no-default rule. PROD ONLY — never in [env.preview.triggers]; UAT projects
+# on demand via POST /admin/run-job { job: 'price-daily-capture' }.
+crons = ["0 2 * * *", "0 6 * * *", "0 3 * * SUN", "0 4 * * *", "0 10,16,22 * * *", "0 5 * * *", "0 7 * * *", "0 8 * * *", "0 9 * * *", "0 10 * * *", "0 12 * * *", "0 13 * * *", "*/15 * * * *"]
 
 [vars]
 TCGCSV_BASE_URL = "https://tcgcsv.com"
