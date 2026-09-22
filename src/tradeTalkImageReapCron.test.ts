@@ -13,6 +13,12 @@ vi.mock('./tradeTalkImageReap.js', async (importOriginal) => {
   return { ...actual, runTradeTalkImageReap: vi.fn(async () => ({ ok: true, rowsDeleted: 3, objectsDeleted: 3, remaining: 0 })) }
 })
 
+// The child-consent reap shares the 0 9 slot (Content child-accounts S2) — mocked so no real fetch runs.
+vi.mock('./childConsentReap.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./childConsentReap.js')>()
+  return { ...actual, runChildConsentReap: vi.fn(async () => ({ ok: true, deleted: 0, failed: 0, remaining: 0 })) }
+})
+
 vi.mock('./priceAnomalyScan.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./priceAnomalyScan.js')>()
   return { ...actual, runPriceAnomalyScan: vi.fn(async () => ({ ok: true })) }
@@ -45,6 +51,7 @@ vi.mock('./newsPoll.js', async (importOriginal) => {
 
 import worker from './worker.js'
 import { runTradeTalkImageReap } from './tradeTalkImageReap.js'
+import { runChildConsentReap } from './childConsentReap.js'
 import { runPriceAnomalyScan } from './priceAnomalyScan.js'
 import { runValueSnapshots } from './valueSnapshots.js'
 import { runIngestion } from './ingestion/index.js'
@@ -79,12 +86,13 @@ function collectingCtx() {
 afterEach(() => { vi.clearAllMocks() })
 
 describe('cron "0 9 * * *" — the trade-talk photo reap', () => {
-  it('runs the reap and NOTHING else', async () => {
+  it('runs the two reaps (photos + unconfirmed child consents) and NOTHING else', async () => {
     const { ctx, scheduled } = collectingCtx()
     await worker.scheduled({ cron: '0 9 * * *' } as any, makeEnv(), ctx)
     await Promise.all(scheduled)
 
     expect(runTradeTalkImageReap).toHaveBeenCalledTimes(1)
+    expect(runChildConsentReap).toHaveBeenCalledTimes(1)
     expect(runIngestion).not.toHaveBeenCalled()
     expect(processPendingWebhooks).not.toHaveBeenCalled()
     expect(runPriceChartingFetch).not.toHaveBeenCalled()
@@ -98,6 +106,20 @@ describe('cron "0 9 * * *" — the trade-talk photo reap', () => {
     const { ctx, scheduled } = collectingCtx()
     await worker.scheduled({ cron: '0 9 * * *' } as any, makeEnv(), ctx)
     await expect(Promise.all(scheduled)).resolves.toBeDefined()
+  })
+
+  it('the two reaps are INDEPENDENT: either one failing never stops the other', async () => {
+    vi.mocked(runTradeTalkImageReap).mockRejectedValueOnce(new Error('photo reap down'))
+    let r = collectingCtx()
+    await worker.scheduled({ cron: '0 9 * * *' } as any, makeEnv(), r.ctx)
+    await expect(Promise.all(r.scheduled)).resolves.toBeDefined()
+    expect(runChildConsentReap).toHaveBeenCalledTimes(1)
+    vi.clearAllMocks()
+    vi.mocked(runChildConsentReap).mockRejectedValueOnce(new Error('child reap down'))
+    r = collectingCtx()
+    await worker.scheduled({ cron: '0 9 * * *' } as any, makeEnv(), r.ctx)
+    await expect(Promise.all(r.scheduled)).resolves.toBeDefined()
+    expect(runTradeTalkImageReap).toHaveBeenCalledTimes(1)
   })
 
   it('the daily TCG sync still owns the DEFAULT case (a new case must not steal it)', async () => {
