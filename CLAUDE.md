@@ -40,9 +40,16 @@ Shares the same D1 database (`sleevedpagesdb`) and R2 bucket (`sleeved-pages-ima
 - **Data source**: TCGCSV API (`https://tcgcsv.com`) for card/set/price data
 
 ## Commands
+
+> **⚠️ AUTO-DEPLOY (operator, 2026-09-22): Cloudflare deploys this worker on EVERY push to `main`.** A merge to
+> `main` IS a production deploy — including a docs-only commit. So the cross-repo deploy order (e.g. "Content's
+> endpoint FIRST, then the worker") is kept by the ORDER OF MERGES: merge here only after the Content change it
+> calls is live. Whether the preview (UAT) worker also auto-deploys was not stated — check the Cloudflare dashboard
+> (Workers → sleevedpages-ingestion → Deployments) before relying on it.
+
 ```bash
 npm run dev          # wrangler dev (port 8788)
-npm run deploy       # Deploy to Cloudflare Workers
+npm run deploy       # Deploy to Cloudflare Workers (manual — normally not needed, see below)
 npm run typecheck    # tsc --noEmit
 npm run test         # vitest run
 npm run migrate:remote  # Apply pending D1 migrations (production)
