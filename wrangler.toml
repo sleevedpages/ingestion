@@ -145,6 +145,11 @@ id      = "d8b69df87a0143b699e8dc75d286cdcb"
 # fallback would let a UAT worker reap PROD photos). PROD ONLY — never add it to
 # [env.preview.triggers]; UAT reaps on demand via POST /admin/run-job
 # { job: 'trade-talk-image-reap' }.
+# CHILD-CONSENT REAP — the SAME `0 9 * * *` slot (Content child-accounts S2, 2026-09-22), run as a
+# separate promise beside the photo reap. POSTs Content's /api/internal/child-consents/reap: Content
+# deletes child accounts whose parental consent was never confirmed within 7 days (this worker deletes
+# nothing). Housekeeping — Content refuses an expired consent at read time. Same CONTENT_APP_URL
+# no-default rule. PROD ONLY; UAT reaps on demand via POST /admin/run-job { job: 'child-consent-reap' }.
 # PRICE ARCHIVE CAPTURE — `0 12 * * *` (Price Index Capture Phase 1). LOOPS Content's
 # /api/internal/price-archive/run (bounded batches, resumable via R2 part metadata) until the
 # day reports done — the value-snapshots seam with a loop, because the full prices table

@@ -35,6 +35,7 @@ import { runHashProductImages, HASH_SWEEP_MAX_LIMIT } from './hashProductImages.
 import { runValueSnapshots } from './valueSnapshots.js';
 import { runPriceAnomalyScan } from './priceAnomalyScan.js';
 import { runTradeTalkImageReap } from './tradeTalkImageReap.js';
+import { runChildConsentReap } from './childConsentReap.js';
 import { runPriceArchive } from './priceArchive.js';
 import { runPriceDailyCapture } from './priceDailyCapture.js';
 import { runEbayOrderSync } from './ebayOrderSync.js';
@@ -868,7 +869,7 @@ export default {
       // a log line the operator has to go looking for.
       if (
         (job === 'value-snapshots' || job === 'price-anomaly-scan' || job === 'trade-talk-image-reap'
-          || job === 'price-archive-capture' || job === 'price-daily-capture')
+          || job === 'child-consent-reap' || job === 'price-archive-capture' || job === 'price-daily-capture')
         && !env.CONTENT_APP_URL
       ) {
         return json({ ok: false, error: 'CONTENT_APP_URL not configured' }, 503);
@@ -970,6 +971,13 @@ export default {
                 // while the result reports remaining > 0. Use this to sweep on demand or to
                 // drive it on UAT, which has no cron for it (the news-poll precedent).
                 await runStage(env.DB, 'trade-talk-image-reap', 'run', () => runTradeTalkImageReap(env));
+                break;
+              case 'child-consent-reap':
+                // POST Content's /api/internal/child-consents/reap (Content child-accounts S2). This
+                // worker deletes nothing — Content owns the consent table, the window and the ONE
+                // deletion plan. Bounded batch, idempotent: re-fire while remaining > 0. UAT has no
+                // cron for it — this is how the UAT walk drives it.
+                await runStage(env.DB, 'child-consent-reap', 'run', () => runChildConsentReap(env));
                 break;
               case 'price-archive-capture':
                 // LOOP Content's /api/internal/price-archive/run until the day reports done
@@ -1233,6 +1241,14 @@ export default {
         ctx.waitUntil(
           runStage(env.DB, 'trade-talk-image-reap', 'run', () => runTradeTalkImageReap(env)).catch((err) =>
             logger.error('Trade-talk image reap failed', { error: String(err) })
+          )
+        );
+        // Same slot, SEPARATE promise (Content child-accounts S2): delete child accounts whose
+        // parental consent was never confirmed within 7 days. Housekeeping only — Content refuses
+        // an expired consent at read time — and a failure here never touches the photo reap above.
+        ctx.waitUntil(
+          runStage(env.DB, 'child-consent-reap', 'run', () => runChildConsentReap(env)).catch((err) =>
+            logger.error('Child consent reap failed', { error: String(err) })
           )
         );
         break;
