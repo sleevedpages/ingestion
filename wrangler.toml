@@ -71,7 +71,8 @@ id      = "d8b69df87a0143b699e8dc75d286cdcb"
 #       `wrangler secret put JUSTTCG_API_KEY --env preview`. NEVER on prod, never in the
 #       Content app, never logged or returned; absent → 503 justtcg_not_configured. Optional
 #       knobs JUSTTCG_DAILY_CAP (100) / JUSTTCG_DAILY_RESERVE (10) / JUSTTCG_BATCH_SIZE (20) /
-#       JUSTTCG_MIN_INTERVAL_MS (6500) default to the Free plan. See src/lib/justtcgClient.ts.
+#       JUSTTCG_MIN_INTERVAL_MS (12000 — never lower on a Free key; 6.5 s drew the abuse 429)
+#       default to the Free plan. See src/lib/justtcgClient.ts.
 #   PRICECHARTING_TOKEN — PriceCharting on-demand graded + daily CSV bulk-ingest
 #   TCGGO_RAPIDAPI_KEY — STILL REQUIRED: powers the Artist→Binder-Template tool
 #       (/tcggo/artists, /tcggo/artists/:id/cards). Its graded eBay-sold role was

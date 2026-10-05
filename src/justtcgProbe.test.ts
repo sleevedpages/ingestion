@@ -237,7 +237,7 @@ describe('justtcgClient', () => {
     expect(justtcgConfigured({ JUSTTCG_API_KEY: '  ' })).toBe(false)
     expect(justtcgConfigured({ JUSTTCG_API_KEY: 'tcg_x' })).toBe(true)
     expect(dailyCounterKey(new Date('2026-10-05T23:59:00Z'))).toBe('justtcg_calls:2026-10-05')
-    expect(justtcgLimits({})).toEqual({ dailyCap: 100, dailyReserve: 10, batchSize: 20, minIntervalMs: 6500 })
+    expect(justtcgLimits({})).toEqual({ dailyCap: 100, dailyReserve: 10, batchSize: 20, minIntervalMs: 12_000 })
     expect(justtcgLimits({ JUSTTCG_DAILY_CAP: '1000', JUSTTCG_BATCH_SIZE: '100' }).batchSize).toBe(100)
   })
   it('refuses at cap − reserve and increments before the call', async () => {
@@ -260,9 +260,14 @@ describe('justtcgClient', () => {
     let status = 200
     let body: unknown = { data: [], _metadata: { apiPlan: 'free', apiDailyRequestsUsed: 3 } }
     vi.stubGlobal('fetch', vi.fn(async (url: string, init: any) => { calls.push({ url, init }); return new Response(JSON.stringify(body), { status }) }))
-    const env = { SLEEVEDPAGES_KV: fakeKV(), JUSTTCG_API_KEY: 'tcg_secret' } as any
+    const kv = fakeKV()
+    const env = { SLEEVEDPAGES_KV: kv, JUSTTCG_API_KEY: 'tcg_secret', JUSTTCG_MIN_INTERVAL_MS: '1' } as any   // 1 ms: pacing on, no real wait
     const ok = await justtcgFetch(env, '/v1/cards', { method: 'POST', body: [{ tcgplayerId: '1' }], query: { priceHistoryDuration: '30d' }, jobName: 'b' })
     expect(ok.usage).toEqual({ apiPlan: 'free', apiDailyRequestsUsed: 3 })
+    // JustTCG's own meter resyncs the day's ledger (it read 1 locally; JustTCG says 3) and stamps the last-call time.
+    expect(kv.store.get(dailyCounterKey())).toBe('3')
+    expect(ok.counter.used).toBe(3)
+    expect(Number(kv.store.get('justtcg_last_call_at'))).toBeGreaterThan(0)
     expect(calls[0].url).toBe('https://api.justtcg.com/v1/cards?priceHistoryDuration=30d')
     expect(calls[0].init.headers['x-api-key']).toBe('tcg_secret')
     expect(calls[0].init.method).toBe('POST')
@@ -435,6 +440,40 @@ describe('POST /admin/justtcg-probe', () => {
     expect(r.calls.total).toBe(3)                     // games + raw batch + the 404'd graded call (a spent request)
     expect(r.comparisons?.[0]).toMatchObject({ resolved: true, raw: { justtcgNm: 11 } })
     expect(r.comparisons?.[0].graded.justtcg).toEqual([])
+  })
+
+  it('429 EXCESSIVE_FREE_TIER_USAGE (the Free-tier abuse heuristic) STOPS the run — resumable, never retried', async () => {
+    let n = 0
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      n += 1
+      if (url.endsWith('/v1/games')) return new Response(JSON.stringify({ data: [{ id: 'pokemon', name: 'Pokemon' }] }))
+      return new Response(JSON.stringify({ error: 'Unusual Activity Pattern Detected', code: 'EXCESSIVE_FREE_TIER_USAGE' }), { status: 429 })
+    }))
+    const env = routeEnv({ JUSTTCG_API_KEY: 'k', JUSTTCG_MIN_INTERVAL_MS: '0' })
+    const r = await runJustTcgProbe(env, { canonicalProductIds: [1], maxCalls: 10 })
+    expect(r.done).toBe(false)
+    expect(r.stopped).toBe('abuse')
+    expect(r.capHit).toBe(false)
+    expect(n).toBe(2)                                   // games, then ONE refused batch — no retry storm
+    expect(r.state?.queue[0]).toEqual({ kind: 'raw-batch', tcgplayerIds: [11] })   // the item stays queued
+    expect(r.errors[0].kind).toBe('abuse')
+  })
+
+  it('a true per-minute 429 keeps the item, retries once, then hands back `paused` on the second in a row', async () => {
+    const seen: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      seen.push(url.split('?')[0])
+      if (url.endsWith('/v1/games')) return new Response(JSON.stringify({ data: [] }))
+      return new Response(JSON.stringify({ error: 'slow down', code: 'RATE_LIMIT_EXCEEDED' }), { status: 429, headers: { 'retry-after': '0' } })
+    }))
+    const env = routeEnv({ JUSTTCG_API_KEY: 'k', JUSTTCG_MIN_INTERVAL_MS: '0' })
+    const r = await runJustTcgProbe(env, { canonicalProductIds: [1], maxCalls: 10 })
+    expect(r.done).toBe(false)
+    expect(r.paused).toBe('rate_limit')
+    expect(r.stopped).toBeNull()
+    expect(seen.filter(u => u.endsWith('/v1/cards'))).toHaveLength(2)         // the same batch, tried twice
+    expect(r.state?.queue[0]).toEqual({ kind: 'raw-batch', tcgplayerIds: [11] })   // still queued for the resume
+    expect(r.calls.total).toBe(1)                                                // only the games call counted as made
   })
 
   it('selectProducts falls back to the TCGplayer-raw pool when a game has no Scrydex tiers (UAT)', async () => {

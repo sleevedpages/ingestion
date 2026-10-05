@@ -37,12 +37,19 @@ export const JUSTTCG_BASE = 'https://api.justtcg.com'
 export const DEFAULT_DAILY_CAP      = 100
 export const DEFAULT_DAILY_RESERVE  = 10
 export const DEFAULT_BATCH_SIZE     = 20
-/** 10 calls/min on Free → 6,500 ms between calls keeps a run under the per-minute limit. */
-export const DEFAULT_MIN_INTERVAL_MS = 6500
+/**
+ * Pacing between calls, kept in KV (`justtcg_last_call_at`) so it holds ACROSS worker invocations.
+ * 10 calls/min on Free would allow 6 s; OBSERVED 2026-10-05: a run of single-card lookups at 6.5 s
+ * drew 429 `EXCESSIVE_FREE_TIER_USAGE` ("Unusual Activity Pattern Detected") — JustTCG's Free-tier
+ * abuse heuristic, not the per-minute limit. 12 s (5/min) is the gentle default; raise it, never lower
+ * it, while the key is a Free key.
+ */
+export const DEFAULT_MIN_INTERVAL_MS = 12_000
 export const REQUEST_TIMEOUT_MS     = 20_000
+export const LAST_CALL_KEY          = 'justtcg_last_call_at'
 
 export type JustTcgErrorKind =
-  | 'not_configured' | 'cap' | 'auth' | 'rate_limit' | 'quota' | 'http' | 'network' | 'timeout'
+  | 'not_configured' | 'cap' | 'auth' | 'rate_limit' | 'abuse' | 'quota' | 'http' | 'network' | 'timeout'
 
 export class JustTcgError extends Error {
   constructor(
@@ -50,11 +57,17 @@ export class JustTcgError extends Error {
     message:       string,
     public status: number | null = null,
     public code:   string | null = null,
+    /** From a 429's `Retry-After` header (seconds), when JustTCG sent one. */
+    public retryAfterSec: number | null = null,
   ) {
     super(message)
     this.name = 'JustTcgError'
   }
 }
+
+/** Codes JustTCG sends on 429 that mean "stop the run", not "slow down a little". */
+export const ABUSE_CODES: ReadonlySet<string> = new Set(['EXCESSIVE_FREE_TIER_USAGE'])
+export const QUOTA_CODES: ReadonlySet<string> = new Set(['DAILY_LIMIT_EXCEEDED', 'REQUEST_LIMIT_EXCEEDED'])
 
 /** True when a key is present. The key's VALUE never leaves this module. */
 export function justtcgConfigured(env: Pick<Env, 'JUSTTCG_API_KEY'>): boolean {
@@ -106,6 +119,33 @@ export async function reserveDailyCall(env: Env, now: Date = new Date()): Promis
   return { ...state, used: next }
 }
 
+/**
+ * Resync the day's counter from JustTCG's OWN meter (`_metadata.apiDailyRequestsUsed`, carried by
+ * every v1 response). Authoritative in both directions: OBSERVED 2026-10-05 that JustTCG did not bill
+ * the v2 graded 404s / 429s our ledger had counted (36 local attempts → their meter read 2), so a
+ * ledger that only ever counts up wastes the Free day on its own caution. Between v1 responses the
+ * local increments stand as the floor.
+ */
+export async function syncDailyCounter(env: Env, used: unknown, now: Date = new Date()): Promise<void> {
+  if (typeof used !== 'number' || !Number.isFinite(used) || used < 0 || !env.SLEEVEDPAGES_KV) return
+  await env.SLEEVEDPAGES_KV.put(dailyCounterKey(now), String(Math.floor(used)), { expirationTtl: 2 * 86_400 })
+}
+
+/**
+ * Cross-invocation pacing: wait until `minIntervalMs` have passed since the LAST call anyone made
+ * through this worker (KV timestamp), then stamp now. A new invocation therefore never fires its
+ * first call on the heels of the previous invocation's last one.
+ */
+export async function paceBeforeCall(env: Env, minIntervalMs: number): Promise<number> {
+  if (!env.SLEEVEDPAGES_KV || minIntervalMs <= 0) return 0
+  const raw = await env.SLEEVEDPAGES_KV.get(LAST_CALL_KEY)
+  const last = raw ? Number(raw) : 0
+  const wait = Math.max(0, last + minIntervalMs - Date.now())
+  if (wait > 0) await new Promise<void>(r => setTimeout(r, wait))
+  await env.SLEEVEDPAGES_KV.put(LAST_CALL_KEY, String(Date.now()), { expirationTtl: 3600 })
+  return wait
+}
+
 export interface JustTcgUsage {
   apiPlan?:                string
   apiRequestLimit?:        number
@@ -138,6 +178,7 @@ interface FetchOpts {
 export async function justtcgFetch<T = unknown>(env: Env, path: string, opts: FetchOpts): Promise<JustTcgResponse<T>> {
   if (!justtcgConfigured(env)) throw new JustTcgError('not_configured', 'JUSTTCG_API_KEY is not configured')
   const counter = await reserveDailyCall(env)
+  await paceBeforeCall(env, justtcgLimits(env).minIntervalMs)
 
   const url = new URL(`${JUSTTCG_BASE}${path}`)
   for (const [k, v] of Object.entries(opts.query ?? {})) if (v != null && v !== '') url.searchParams.set(k, v)
@@ -178,8 +219,11 @@ export async function justtcgFetch<T = unknown>(env: Env, path: string, opts: Fe
   }
   if (res.status === 429) {
     const code = errBody.code ?? null
-    const kind: JustTcgErrorKind = (code === 'DAILY_LIMIT_EXCEEDED' || code === 'REQUEST_LIMIT_EXCEEDED') ? 'quota' : 'rate_limit'
-    throw new JustTcgError(kind, `${opts.jobName}: JustTCG 429 ${code ?? ''} ${errBody.error ?? ''}`.trim(), 429, code)
+    const retryAfter = Number(res.headers.get('retry-after'))
+    // OBSERVED 2026-10-05: 429 `EXCESSIVE_FREE_TIER_USAGE` "Unusual Activity Pattern Detected" is the
+    // Free-tier abuse heuristic — a STOP, never a retry (the caller ends the run and waits, hours).
+    const kind: JustTcgErrorKind = (code && ABUSE_CODES.has(code)) ? 'abuse' : (code && QUOTA_CODES.has(code)) ? 'quota' : 'rate_limit'
+    throw new JustTcgError(kind, `${opts.jobName}: JustTCG 429 ${code ?? ''} ${errBody.error ?? ''}`.trim(), 429, code, Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : null)
   }
   if (!res.ok) {
     throw new JustTcgError('http', `${opts.jobName}: JustTCG HTTP ${res.status} ${errBody.code ?? ''} ${errBody.error ?? ''}`.trim(), res.status, errBody.code ?? null)
@@ -187,6 +231,11 @@ export async function justtcgFetch<T = unknown>(env: Env, path: string, opts: Fe
   const usage = (body && typeof body === 'object' && '_metadata' in (body as object))
     ? ((body as { _metadata?: JustTcgUsage })._metadata ?? null)
     : null
+  // JustTCG's meter is authoritative for the day: resync the KV ledger from it (best effort).
+  if (usage && typeof usage.apiDailyRequestsUsed === 'number') {
+    try { await syncDailyCounter(env, usage.apiDailyRequestsUsed) } catch { /* the local count stands */ }
+    counter.used = usage.apiDailyRequestsUsed
+  }
   return { status: res.status, body: body as T, usage, counter }
 }
 

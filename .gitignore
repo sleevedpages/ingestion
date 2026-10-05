@@ -141,3 +141,6 @@ dist
 
 # JustTCG probe run outputs (raw provider payloads — never committed)
 justtcg-probe-*.json
+
+# wrangler local state (miniflare)
+.wrangler/

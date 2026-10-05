@@ -14,9 +14,13 @@
  *
  * The Free plan allows 100 calls/day at 10/min and 20 cards per batch request. A full run is
  * ONE /games call + ONE raw batch per 20 products + ONE graded call PER PRODUCT (+ one search per
- * product without a TCGplayer id) — the worker paces 9 calls per invocation (≈ 1 min each) and
- * hands back a resumable `state`; this script loops until `done`, and stops cleanly on `capHit`
- * (re-run tomorrow with `--resume <file>`).
+ * product without a TCGplayer id) — the worker paces 12 s per call from a KV timestamp (5 calls per
+ * invocation ≈ 1 min each) and hands back a resumable `state`; this script loops until `done`,
+ * waits a minute on a per-minute 429 (`paused`), stops cleanly on `capHit` (re-run tomorrow with
+ * `--resume <file>`) and REFUSES to auto-resume after 429 EXCESSIVE_FREE_TIER_USAGE — JustTCG's
+ * Free-tier abuse heuristic (observed 2026-10-05 on a ~100-lookup run): wait an hour, go smaller.
+ * The graded comparison needs products that HOLD a graded row of ours (`--graded-per-game N`);
+ * a random common has no graded market anywhere and answers 404 ("no graded variants").
  *
  * Usage (from Ingestion/):
  *   node scripts/justtcg-probe.mjs --uat --per-game 10 --no-tcgplayer 50
@@ -135,15 +139,20 @@ async function runLoop(first) {
       process.exit(1)
     }
     if (!data.ok) { console.error(`  ✗ probe failed (HTTP ${status}): ${data.error ?? 'unknown'}`); process.exit(1) }
-    console.error(`  [${i}] calls ${data.calls.thisInvocation} (run ${data.calls.total}, day ${data.calls.dailyUsed}/${data.calls.dailyAllowed}) · queue ${data.queueRemaining}${data.stopped ? ` · STOPPED ${data.stopped}` : ''}${data.errors?.length ? ` · errors ${data.errors.length}` : ''}`)
+    console.error(`  [${i}] calls ${data.calls.thisInvocation} (run ${data.calls.total}, day ${data.calls.dailyUsed}/${data.calls.dailyAllowed}) · queue ${data.queueRemaining}${data.gradedNotFound404 ? ` · graded 404s ${data.gradedNotFound404}` : ''}${data.paused ? ` · PAUSED ${data.paused}` : ''}${data.stopped ? ` · STOPPED ${data.stopped}` : ''}${data.errors?.length ? ` · errors ${data.errors.length}` : ''}`)
     if (data.done) return data
     writeFileSync(STATE_FILE, JSON.stringify(data.state), 'utf8')
+    if (data.stopped === 'abuse') {
+      console.error(`  ⛔ JustTCG answered 429 EXCESSIVE_FREE_TIER_USAGE ("Unusual Activity Pattern Detected") — the Free-tier abuse heuristic. State saved to ${STATE_FILE}. Do NOT re-run soon: wait at least an hour, then --resume with a SMALLER sample (the worker now paces 12 s/call, 5 calls per invocation). A paid plan is the real answer for a run this size.`)
+      process.exit(3)
+    }
     if (data.capHit || data.stopped) {
       console.error(`  ⏸ stopped on ${data.stopped} — state saved to ${STATE_FILE}; re-run with --resume ${STATE_FILE} after the cap resets (00:00 UTC)`)
       process.exit(2)
     }
     body = { state: data.state }
-    await sleep(2_000)
+    if (data.paused) { console.error('  … two per-minute 429s in a row — waiting 65 s before continuing'); await sleep(65_000) }
+    else await sleep(3_000)   // the worker paces calls from a KV timestamp; this gap is only courtesy
   }
 }
 

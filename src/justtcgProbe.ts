@@ -99,6 +99,8 @@ export interface ProbeResult {
   calls:       { thisInvocation: number; total: number; dailyUsed: number; dailyAllowed: number; dailyCap: number; justtcgReported: JustTcgUsage | null }
   gradedNotFound404: number
   gradedNotFoundDetail: string | null
+  /** 'rate_limit' when two per-minute 429s in a row handed the state back early — wait a minute, re-post. */
+  paused:      string | null
   queueRemaining: number
   products:    number
   state?:      ProbeState
@@ -263,7 +265,8 @@ export function buildQueue(products: ProbeProduct[], batchSize: number): QueueIt
 const searchKey = (item: { productId: number | null; tcgplayerProductId: number | null }) =>
   item.productId != null ? `p${item.productId}` : `t${item.tcgplayerProductId}`
 
-export const DEFAULT_MAX_CALLS = 9
+/** Calls per invocation. 5 × the 12 s pacing ≈ one minute of wall time per worker request. */
+export const DEFAULT_MAX_CALLS = 5
 
 // ── The run ────────────────────────────────────────────────────────────────────────────────────
 
@@ -285,14 +288,17 @@ export async function runJustTcgProbe(env: Env, body: ProbeBody): Promise<ProbeR
 
   let thisInvocation = 0
   let capHit = false
+  let paused: string | null = null
+  let consecutive429 = 0
   const note = (item: QueueItem, err: unknown) => {
     const e = err as JustTcgError
     state.errors.push({ item: JSON.stringify(item), kind: e?.kind ?? 'unknown', message: String(e?.message ?? err) })
   }
 
-  while (state.queue.length && thisInvocation < maxCalls && !state.stopped) {
+  // Pacing lives in the client (KV `justtcg_last_call_at`, so it holds ACROSS invocations — the
+  // 2026-10-05 run burst past the per-minute limit at every invocation boundary when it lived here).
+  while (state.queue.length && thisInvocation < maxCalls && !state.stopped && !paused) {
     const item = state.queue[0]
-    if (thisInvocation > 0) await sleep(limits.minIntervalMs)
     try {
       if (item.kind === 'games') {
         const res = await justtcgGames(env)
@@ -336,20 +342,33 @@ export async function runJustTcgProbe(env: Env, body: ProbeBody): Promise<ProbeR
       }
       state.calls += 1
       thisInvocation += 1
+      consecutive429 = 0
       state.queue.shift()
     } catch (err) {
       const e = err as JustTcgError
-      if (e instanceof JustTcgError && (e.kind === 'cap' || e.kind === 'quota' || e.kind === 'auth' || e.kind === 'not_configured')) {
+      // A STOP: the day's ledger, JustTCG's quota, the Free-tier abuse heuristic, the key. The item
+      // stays at the head of the queue; the state goes back to the caller, resumable later.
+      if (e instanceof JustTcgError && (e.kind === 'cap' || e.kind === 'quota' || e.kind === 'abuse' || e.kind === 'auth' || e.kind === 'not_configured')) {
         state.stopped = e.kind
         capHit = e.kind === 'cap' || e.kind === 'quota'
         note(item, err)
         break
       }
-      // rate_limit / timeout / network / http: record, count the attempt (JustTCG may have billed it), move on.
-      if (e instanceof JustTcgError && e.kind !== 'rate_limit') { state.calls += 1; thisInvocation += 1 }
+      // A true per-minute 429: KEEP the item (the 2026-10-05 run dropped it — a bug), back off, retry
+      // once in this invocation; a second one in a row hands the state back with `paused` so the
+      // caller waits a full minute before continuing.
+      if (e instanceof JustTcgError && e.kind === 'rate_limit') {
+        consecutive429 += 1
+        note(item, err)
+        if (consecutive429 >= 2) { paused = 'rate_limit'; break }
+        await sleep((e.retryAfterSec ?? 0) * 1000 || limits.minIntervalMs * 2)
+        continue
+      }
+      // timeout / network / other http: record, count the attempt (JustTCG may have billed it), move on.
+      state.calls += 1
+      thisInvocation += 1
       note(item, err)
       state.queue.shift()
-      if (e instanceof JustTcgError && e.kind === 'rate_limit') { await sleep(limits.minIntervalMs * 2); thisInvocation += 1 }
     }
   }
 
@@ -359,7 +378,7 @@ export async function runJustTcgProbe(env: Env, body: ProbeBody): Promise<ProbeR
   const base: ProbeResult = {
     ok: true, runId: state.runId, done: false, capHit, stopped: state.stopped,
     calls: { thisInvocation, total: state.calls, dailyUsed: counter.used, dailyAllowed: counter.allowed, dailyCap: counter.cap, justtcgReported: state.usage },
-    gradedNotFound404: state.gradedNotFound404 ?? 0, gradedNotFoundDetail: state.gradedNotFoundDetail ?? null,
+    gradedNotFound404: state.gradedNotFound404 ?? 0, gradedNotFoundDetail: state.gradedNotFoundDetail ?? null, paused,
     queueRemaining: state.queue.length, products: state.products.length, persisted: null, errors: state.errors,
   }
 
