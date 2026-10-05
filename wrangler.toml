@@ -44,6 +44,15 @@ max_concurrency   = 1
 binding     = "IMAGES_BUCKET"
 bucket_name = "sleeved-pages-images"
 
+# The PRIVATE price-archive bucket — the SAME bucket the Content app binds as PRICE_ARCHIVE (no new
+# bucket; it already exists per env). Bound here ONLY so `POST /admin/justtcg-probe` (2026-10-05)
+# can persist its raw JustTCG payloads under `probes/justtcg/<date>/<run>.json`. Deliberately NOT
+# IMAGES_BUCKET (publicly served — a probe dump there would be enumerable). No cron, no read path,
+# no Content code reads this prefix. Unbound → the probe runs and reports nothing persisted.
+[[r2_buckets]]
+binding     = "PRICE_ARCHIVE"
+bucket_name = "sleeved-pages-price-archive"
+
 # Shared KV namespace (the Content app's SLEEVEDPAGES_KV). Caches resolved
 # PriceCharting ids (pc_id:*) and raw /api/product responses (pc_product:*) so each
 # card is searched once and the free-tier rate limit is respected. Same namespace id
@@ -56,7 +65,13 @@ id      = "d8b69df87a0143b699e8dc75d286cdcb"
 #   INGESTION_WORKER_SECRET — shared secret for the admin-proxied HTTP endpoints. ALSO sent
 #       OUTBOUND on the daily value-snapshot POST into the Content app (same secret, same
 #       x-worker-secret header, opposite direction). See src/valueSnapshots.ts.
-#   SCRYDEX_API_KEY / SCRYDEX_TEAM_ID — Scrydex price/image/Vision
+#   SCRYDEX_API_KEY / SCRYDEX_TEAM_ID — Scrydex price/image (Vision REMOVED 2026-10-05)
+#   JUSTTCG_API_KEY — the JustTCG EVALUATION PROBE's key (POST /admin/justtcg-probe, 2026-10-05).
+#       ⚠️ UAT ONLY while it is a Free-tier key (non-commercial by JustTCG's terms):
+#       `wrangler secret put JUSTTCG_API_KEY --env preview`. NEVER on prod, never in the
+#       Content app, never logged or returned; absent → 503 justtcg_not_configured. Optional
+#       knobs JUSTTCG_DAILY_CAP (100) / JUSTTCG_DAILY_RESERVE (10) / JUSTTCG_BATCH_SIZE (20) /
+#       JUSTTCG_MIN_INTERVAL_MS (6500) default to the Free plan. See src/lib/justtcgClient.ts.
 #   PRICECHARTING_TOKEN — PriceCharting on-demand graded + daily CSV bulk-ingest
 #   TCGGO_RAPIDAPI_KEY — STILL REQUIRED: powers the Artist→Binder-Template tool
 #       (/tcggo/artists, /tcggo/artists/:id/cards). Its graded eBay-sold role was
@@ -257,6 +272,12 @@ max_concurrency   = 1
 [[env.preview.r2_buckets]]
 binding     = "IMAGES_BUCKET"
 bucket_name = "sleeved-pages-images"
+
+# UAT twin of the private price-archive bucket (Content preview's PRICE_ARCHIVE) — the JustTCG
+# probe's persistence target on UAT, where the probe actually runs (the Free key is UAT-only).
+[[env.preview.r2_buckets]]
+binding     = "PRICE_ARCHIVE"
+bucket_name = "sleeved-pages-price-archive-uat"
 
 # Shared UAT KV namespace (Content app's preview SLEEVEDPAGES_KV).
 [[env.preview.kv_namespaces]]

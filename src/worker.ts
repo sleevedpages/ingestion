@@ -5,7 +5,6 @@ import { enrichCard, type EnrichClass } from './scrydexEnrich.js';
 import { syncSingleSet } from './scrydexSyncSet.js';
 import { syncScrydexSetMappings } from './scrydexSetMapping.js';
 import { syncScrydexImages } from './scrydexImageSync.js';
-import { scrydexVisionIdentify, ScrydexCreditLimitError } from './lib/scrydexClient.js';
 import { searchTcggoArtists, fetchAllArtistCards } from './lib/tcggoClient.js';
 import { fetchPriceChartingGraded } from './lib/pricechartingClient.js';
 import { lookupPriceChartingUpc } from './lib/pricechartingUpc.js';
@@ -40,6 +39,7 @@ import { runPriceArchive } from './priceArchive.js';
 import { runPriceDailyCapture } from './priceDailyCapture.js';
 import { runEbayOrderSync } from './ebayOrderSync.js';
 import { runWatchAlerts } from './watchAlerts.js';
+import { runJustTcgProbe, probeNotConfigured, type ProbeBody } from './justtcgProbe.js';
 import {
   ADMIN_JOB_IDS,
   isAdminJobId,
@@ -125,6 +125,20 @@ export interface Env {
   // stay < the lane's cron interval (WATCH_LANE_INTERVAL_HOURS) or watched prices freeze. See
   // scrydexProcessor.ts watchFreshnessSafeForLane.
   SCRYDEX_WATCH_FRESHNESS_HOURS?: string;  // default 4
+  // JustTCG EVALUATION PROBE (2026-10-05) — `POST /admin/justtcg-probe` only. The key is UAT-ONLY
+  // while the account is on the Free tier (non-commercial by its terms): `wrangler secret put
+  // JUSTTCG_API_KEY --env preview`. NEVER on prod, never in the Content app, never logged or
+  // returned; absent → 503 `justtcg_not_configured`. Nothing else reads it. See lib/justtcgClient.ts.
+  JUSTTCG_API_KEY?: string;
+  JUSTTCG_DAILY_CAP?: string;        // default 100 (Free) — the plan's daily request cap
+  JUSTTCG_DAILY_RESERVE?: string;    // default 10 — the KV counter refuses at cap − reserve
+  JUSTTCG_BATCH_SIZE?: string;       // default 20 (Free) — cards per POST /v1/cards request
+  JUSTTCG_MIN_INTERVAL_MS?: string;  // default 6500 — pacing under the 10/min Free limit
+  // The PRIVATE price-archive bucket (the Content app's PRICE_ARCHIVE: prod
+  // `sleeved-pages-price-archive`, preview `…-uat`), bound here ONLY so the JustTCG probe can
+  // persist its raw payloads under `probes/justtcg/…`. Deliberately NOT IMAGES_BUCKET, which is
+  // publicly served. Unbound → the probe still runs and says nothing was persisted.
+  PRICE_ARCHIVE?: R2Bucket;
 }
 
 function buildConfig(env: Env): IngestionConfig {
@@ -519,44 +533,10 @@ export default {
         return json(result, result.ok ? 200 : 502);
       }
 
-      // Scrydex Vision — identify a card from an image. BLOCKING (returns matches).
-      // multipart/form-data: `image` (file) + optional `games` (csv scope). The Content
-      // app proxies here admin-only; this centralises the key, credit guard, and the
-      // 5-credit scrydex_api_log debit. 403 (credit cap / forbidden) → 502 with a flag so
-      // the caller can fall back to Claude.
-      if (pathname === '/scrydex/vision-identify') {
-        const form = await request.formData().catch(() => null);
-        const imageEntry = form?.get('image');
-        const games = (form?.get('games') as string) || undefined;
-        if (!imageEntry || typeof imageEntry === 'string') {
-          return json({ ok: false, error: 'image file is required' }, 400);
-        }
-        const image = imageEntry as unknown as Blob;
-        if (image.size > 20 * 1024 * 1024) {
-          return json({ ok: false, error: 'image too large (max 20MB)' }, 413);
-        }
-        try {
-          const res = await scrydexVisionIdentify(env, image, games);
-          if (res.status === 403) {
-            return json({ ok: false, error: 'Scrydex 403 (credit cap / forbidden)', status: 403 }, 502);
-          }
-          if (!res.ok) {
-            return json({ ok: false, error: `Scrydex ${res.status}`, status: res.status }, 502);
-          }
-          const data = await res.json().catch(() => ({})) as { data?: { analysis?: unknown; matches?: unknown[] } };
-          return json({
-            ok:       true,
-            analysis: data?.data?.analysis ?? null,
-            matches:  data?.data?.matches ?? [],
-          });
-        } catch (err) {
-          if (err instanceof ScrydexCreditLimitError) {
-            return json({ ok: false, error: 'Scrydex credit guard triggered' }, 502);
-          }
-          logger.error('Vision identify failed', { error: String(err) });
-          return json({ ok: false, error: String(err) }, 502);
-        }
-      }
+      // `/scrydex/vision-identify` (Scrydex Vision, admin-only scanner engine, 5 credits/call)
+      // was REMOVED 2026-10-05 (Part B of the JustTCG probe session): 0 calls in September 2026,
+      // 16 in the 90-day log, 0 `scan_staging` rows attributed to it. Scanning is Claude + the
+      // hash matcher. A call to the old path now falls through to the 404 below.
 
       // Vendor on-demand single-card refresh — BLOCKING (returns the fresh result).
       // The Content app gates this (vendor access + ownership + 1/hour rate limit)
@@ -834,6 +814,33 @@ export default {
         return json(result, result.ok ? 200 : 400);
       } catch (err) {
         logger.error('mint-pc-console failed', { error: String(err), console: body.console_name });
+        return json({ ok: false, error: String(err) }, 500);
+      }
+    }
+
+    // POST /admin/justtcg-probe — the JustTCG EVALUATION PROBE (2026-10-05; UAT only while the
+    // key is a Free-tier key). Measures JustTCG against the rows this database already holds:
+    // ONE raw batch per 20 products (POST /v1/cards) + ONE graded-only call per product
+    // (GET /v2/cards … graded=only; never `include`). WRITES NOTHING TO D1; persists the raw
+    // payloads + comparison to the private PRICE_ARCHIVE bucket (probes/justtcg/<date>/<run>.json).
+    // Body { canonicalProductIds?, tcgplayerProductIds?, sample?:{perGame,games?},
+    // includeNoTcgplayer?, maxCalls?, includeRaw?, state? } — resumable: a response with
+    // done:false carries `state`; post it back until done:true. 503 `justtcg_not_configured`
+    // when the key is absent (fail closed — proves prod holds no key). See src/justtcgProbe.ts.
+    if (pathname === '/admin/justtcg-probe' && request.method === 'POST') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      if (probeNotConfigured(env)) {
+        return json({ ok: false, error: 'justtcg_not_configured' }, 503);
+      }
+      const body = await request.json().catch(() => ({})) as ProbeBody;
+      try {
+        const result = await runJustTcgProbe(env, body);
+        return json(result, result.ok ? 200 : 502);
+      } catch (err) {
+        logger.error('justtcg-probe failed', { error: String(err) });
         return json({ ok: false, error: String(err) }, 500);
       }
     }
