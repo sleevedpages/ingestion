@@ -28,6 +28,23 @@ export interface IngestionConfig {
   dryRun: boolean;
   backfillLimit: number | null;
   forceSync: boolean;
+  /**
+   * ONE-GAME RUN (admin "Sync now" on a supported game): the `tcg_supported_games.label` to sync,
+   * alone. Such a run (1) syncs only that ENABLED game, (2) skips the "TCGCSV unchanged since the
+   * last sync" early exit — it always runs, and (3) writes NO `tcg_sync_log` row, so it can never
+   * become the "last successful sync" the daily full run's change detection compares against (a
+   * one-game run after TCGCSV's daily update would otherwise make the next full sync skip EVERY
+   * game). Its outcome is recorded by the caller's `runStage` row instead. Absent → the full run,
+   * exactly as before.
+   */
+  onlyLabel?: string | null;
+}
+
+/** What a run did — the one-game run's `runStage` counts. */
+export interface IngestionSummary {
+  tcgsProcessed: string[];
+  groupsEnqueued: number;
+  categoryIds: number[];
 }
 
 export interface SyncGroupMessage {
@@ -57,23 +74,33 @@ async function getLastUpdated(httpClient: RateLimitedClient): Promise<Date | nul
 // synchronous inline processing (the pre-queue behaviour).
 // ---------------------------------------------------------------------------
 
-export async function runIngestion(config: IngestionConfig): Promise<void> {
+export async function runIngestion(config: IngestionConfig): Promise<IngestionSummary | void> {
   const startedAt = Date.now();
   setLogLevel(config.logLevel);
+  const onlyLabel = config.onlyLabel ?? null;
 
   logger.info('Starting TCGCSV ingestion run', {
     dryRun: config.dryRun,
     forceSync: config.forceSync,
     backfillLimit: config.backfillLimit ?? 'none',
     mode: config.syncQueue ? 'queue' : 'inline',
+    scope: onlyLabel ? `one game: ${onlyLabel}` : 'all enabled games',
   });
 
   const httpClient = new RateLimitedClient(config.tcgcsvBaseUrl);
 
-  const [supportedTcgs, priceConfig] = await Promise.all([
+  const [allSupportedTcgs, priceConfig] = await Promise.all([
     loadSupportedTcgs(config.db),
     loadPriceConfig(config.db),
   ]);
+
+  // A one-game run syncs exactly that ENABLED game (loadSupportedTcgs reads enabled rows only).
+  const supportedTcgs = onlyLabel
+    ? allSupportedTcgs.filter((t) => t.label === onlyLabel)
+    : allSupportedTcgs;
+  if (onlyLabel && supportedTcgs.length === 0) {
+    throw new Error(`No ENABLED supported game labelled "${onlyLabel}"`);
+  }
 
   logger.info('Loaded supported TCGs from database', {
     count: supportedTcgs.length,
@@ -84,7 +111,8 @@ export async function runIngestion(config: IngestionConfig): Promise<void> {
   // Change detection
   const [lastUpdated, lastSync] = await Promise.all([
     getLastUpdated(httpClient),
-    config.dryRun ? Promise.resolve(null) : getLastSuccessfulSync(config.db),
+    // A one-game run skips change detection entirely (it always runs).
+    config.dryRun || onlyLabel ? Promise.resolve(null) : getLastSuccessfulSync(config.db),
   ]);
 
   logger.info('Change detection', {
@@ -92,7 +120,7 @@ export async function runIngestion(config: IngestionConfig): Promise<void> {
     lastSuccessfulSync: lastSync?.toISOString() ?? 'never',
   });
 
-  if (lastUpdated && lastSync && lastUpdated <= lastSync) {
+  if (!onlyLabel && lastUpdated && lastSync && lastUpdated <= lastSync) {
     if (config.forceSync) {
       logger.warn('TCGCSV unchanged since last sync but FORCE_SYNC=true — proceeding anyway', {
         lastUpdated: lastUpdated.toISOString(),
@@ -108,12 +136,15 @@ export async function runIngestion(config: IngestionConfig): Promise<void> {
     }
   }
 
+  // A one-game run never writes tcg_sync_log (see IngestionConfig.onlyLabel). Its queue messages
+  // carry syncLogId 0, so each consumer's progress UPDATE matches no row — a no-op.
   let syncLogId: number | null = null;
-  if (!config.dryRun) {
+  if (!config.dryRun && !onlyLabel) {
     syncLogId = await createSyncLog(config.db);
   }
 
   const now = new Date();
+  const summary: IngestionSummary = { tcgsProcessed: [], groupsEnqueued: 0, categoryIds: [] };
 
   try {
     const categories = await resolveCategories(httpClient, supportedTcgs);
@@ -122,6 +153,13 @@ export async function runIngestion(config: IngestionConfig): Promise<void> {
     const allSetRows = [];
     const allMessages: SyncGroupMessage[] = [];
     const tcgLabels: string[] = [];
+    const categoryIds: number[] = [];
+
+    // A one-game run whose terms match no TCGCSV category has nothing to do — say so loudly
+    // (resolveCategories has already logged the available category names).
+    if (onlyLabel && categories.size === 0) {
+      throw new Error(`"${onlyLabel}" matched no TCGCSV category — check its search terms in the admin TCG Sync panel`);
+    }
 
     for (const [label, category] of categories) {
       logger.info('Resolving groups for TCG', {
@@ -172,12 +210,17 @@ export async function runIngestion(config: IngestionConfig): Promise<void> {
       }
 
       tcgLabels.push(label);
+      categoryIds.push(category.categoryId);
       logger.info('Groups resolved', {
         tcg: label,
         totalGroups: groups.length,
         enqueueing: groupsToProcess.length,
       });
     }
+
+    summary.tcgsProcessed = tcgLabels;
+    summary.groupsEnqueued = allMessages.length;
+    summary.categoryIds = categoryIds;
 
     // Batch-upsert all sets in one pass (~8 subrequests for 800 sets).
     if (!config.dryRun && allSetRows.length > 0) {
@@ -193,7 +236,9 @@ export async function runIngestion(config: IngestionConfig): Promise<void> {
         );
       }
 
-      await setGroupsEnqueued(config.db, syncLogId!, allMessages.length, tcgLabels);
+      if (syncLogId !== null) {
+        await setGroupsEnqueued(config.db, syncLogId, allMessages.length, tcgLabels);
+      }
 
       logger.info('All groups enqueued — consumers will process asynchronously', {
         groupsEnqueued: allMessages.length,
@@ -253,6 +298,8 @@ export async function runIngestion(config: IngestionConfig): Promise<void> {
 
     throw err;
   }
+
+  return summary;
 }
 
 // ---------------------------------------------------------------------------

@@ -164,6 +164,33 @@ export async function releaseJobLock(env: Env, job: AdminJobId): Promise<void> {
   await env.SLEEVEDPAGES_KV.delete(JOB_LOCK_PREFIX + job).catch(() => {});
 }
 
+// ── One-game TCG sync lock (POST /admin/sync-game) ─────────────────────────────
+// The same best-effort KV guard, keyed per game label under the job-lock prefix
+// (`ingestion_job_lock:tcg-sync-game:<label>`). A one-game run is refused while the FULL
+// tcg-sync's manual lock is held (that run already covers the game) or while the same game is
+// already syncing. The orchestration only resolves the category and enqueues its groups, so the
+// lock is short-lived; the TTL is the backstop if the worker dies mid-run.
+export const GAME_SYNC_LOCK_TTL_SECONDS = 900;
+export const gameSyncLockKey = (label: string): string => `${JOB_LOCK_PREFIX}tcg-sync-game:${label}`;
+
+export async function acquireGameSyncLock(
+  env: Env,
+  label: string,
+): Promise<'acquired' | 'full-sync-running' | 'game-sync-running'> {
+  if (!env.SLEEVEDPAGES_KV) return 'acquired'; // no KV bound → can't lock; allow (best-effort)
+  if (await isJobRunning(env, 'tcg-sync')) return 'full-sync-running';
+  if (await env.SLEEVEDPAGES_KV.get(gameSyncLockKey(label))) return 'game-sync-running';
+  await env.SLEEVEDPAGES_KV.put(gameSyncLockKey(label), new Date().toISOString(), {
+    expirationTtl: GAME_SYNC_LOCK_TTL_SECONDS,
+  });
+  return 'acquired';
+}
+
+export async function releaseGameSyncLock(env: Env, label: string): Promise<void> {
+  if (!env.SLEEVEDPAGES_KV) return;
+  await env.SLEEVEDPAGES_KV.delete(gameSyncLockKey(label)).catch(() => {});
+}
+
 // ── PriceCharting CSV download cooldown ───────────────────────────────────────
 // PriceCharting's per-game CSV download is HARD rate-limited to ~1 per 10 minutes (abuse →
 // account revocation), and the CSV only regenerates ~once/24h. The in-flight lock above

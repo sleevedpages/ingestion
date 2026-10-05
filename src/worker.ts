@@ -47,6 +47,8 @@ import {
   priceChartingCategoryForDay,
   acquireJobLock,
   releaseJobLock,
+  acquireGameSyncLock,
+  releaseGameSyncLock,
   priceChartingCooldownRemaining,
 } from './adminJobs.js';
 import { runStage } from './lib/runLog.js';
@@ -834,6 +836,58 @@ export default {
         logger.error('mint-pc-console failed', { error: String(err), console: body.console_name });
         return json({ ok: false, error: String(err) }, 500);
       }
+    }
+
+    // POST /admin/sync-game — ONE supported game's TCGCSV sync (the admin TCG Sync panel's
+    // "Sync now"; requires x-worker-secret). Body { label } = a `tcg_supported_games.label`.
+    // Runs the SAME runIngestion as the daily cron, filtered to that ENABLED game, always (no
+    // "TCGCSV unchanged" early exit), and writing NO tcg_sync_log row — so it never becomes the
+    // "last successful sync" the daily full run's change detection reads (see
+    // IngestionConfig.onlyLabel). The outcome is the runStage row (job 'tcg-sync', stage
+    // 'sync-game', counts = the game's label, category and groups enqueued). Fire-and-forget like
+    // /admin/run-job: the orchestrator enqueues the game's groups and the queue consumers fetch +
+    // upsert them over the next minutes. 404 unknown label · 409 disabled / already running.
+    if (pathname === '/admin/sync-game' && request.method === 'POST') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      const body = await request.json().catch(() => ({})) as { label?: unknown };
+      const label = typeof body.label === 'string' ? body.label.trim() : '';
+      if (!label) {
+        return json({ ok: false, error: 'label is required' }, 400);
+      }
+      const game = await env.DB
+        .prepare('SELECT label, enabled FROM tcg_supported_games WHERE label = ?')
+        .bind(label)
+        .first<{ label: string; enabled: number }>();
+      if (!game) {
+        return json({ ok: false, error: `No supported game labelled "${label}"` }, 404);
+      }
+      if (!game.enabled) {
+        return json({ ok: false, error: `"${label}" is switched off — turn it on first.` }, 409);
+      }
+      const lock = await acquireGameSyncLock(env, label);
+      if (lock === 'full-sync-running') {
+        return json({ ok: false, error: 'The full TCG sync is running now, and it includes this game.', alreadyRunning: true }, 409);
+      }
+      if (lock === 'game-sync-running') {
+        return json({ ok: false, error: `A sync of "${label}" is already running.`, alreadyRunning: true }, 409);
+      }
+
+      ctx.waitUntil(
+        (async () => {
+          try {
+            await runStage(env.DB, 'tcg-sync', 'sync-game', () =>
+              runIngestion({ ...buildConfig(env), onlyLabel: label }));
+          } catch (err) {
+            logger.error('One-game sync failed', { label, error: String(err) });
+          } finally {
+            await releaseGameSyncLock(env, label);
+          }
+        })()
+      );
+      return json({ ok: true, label, started: true });
     }
 
     // POST /admin/run-job — manual, on-demand trigger for a scheduled ingestion job
