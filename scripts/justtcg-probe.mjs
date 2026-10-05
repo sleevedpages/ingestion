@@ -20,7 +20,9 @@
  * `--resume <file>`) and REFUSES to auto-resume after 429 EXCESSIVE_FREE_TIER_USAGE — JustTCG's
  * Free-tier abuse heuristic (observed 2026-10-05 on a ~100-lookup run): wait an hour, go smaller.
  * The graded comparison needs products that HOLD a graded row of ours (`--graded-per-game N`);
- * a random common has no graded market anywhere and answers 404 ("no graded variants").
+ * a random common has no graded market anywhere and answers 404 ("no graded variants" — settled
+ * by `--diag` on 2026-10-05: both v2 lookups find the card, graded=only 404s when it has none).
+ * `--sample-from prod --per-game 0 --owned-slabs` probes EXACTLY the products users own as slabs.
  *
  * Usage (from Ingestion/):
  *   node scripts/justtcg-probe.mjs --uat --per-game 10 --no-tcgplayer 50
@@ -98,8 +100,15 @@ function sampleFromProd(perGame, noTcg, gradedPerGame = 0) {
   }
   if (noTcg) {
     const rows = prodSelect(`${PRODUCT_SELECT} WHERE pr.product_kind = 'card' AND NOT ${TCG_RAW_EXISTS} ORDER BY CASE WHEN ${ANY_RAW_EXISTS} THEN 0 ELSE 1 END, RANDOM() LIMIT ${noTcg}`)
-    for (const r of rows) picked.push({ ...r, pool: 'no_tcgplayer' })
+    for (const r of rows) push(r, 'no_tcgplayer')
     console.error(`  sampled ${rows.length} products with no TCGplayer raw row`)
+  }
+  // --owned-slabs: EVERY product a user owns as a graded slab (Phase 0 Q4's population — the one that
+  // decides whether JustTCG can value the slabs we actually hold; ~41 products on 2026-10-05).
+  if (has('--owned-slabs')) {
+    const rows = prodSelect(`${PRODUCT_SELECT} WHERE pr.id IN (SELECT DISTINCT COALESCE(ui.canonical_product_id, pe.id) FROM user_inventory ui LEFT JOIN products pe ON pe.tcgplayer_product_id = CAST(ui.tcg_product_id AS INTEGER) WHERE ui.graded_company IS NOT NULL AND TRIM(ui.graded_company) <> '' AND ui.graded_grade IS NOT NULL AND TRIM(ui.graded_grade) <> '') ORDER BY cg.name, pr.name`)
+    for (const r of rows) push(r, 'owned_slab')
+    console.error(`  sampled ${rows.length} products owned as graded slabs`)
   }
   return picked
 }
