@@ -115,6 +115,14 @@ async function runLoop(first) {
       console.error(`  ✗ ${WORKER_URL} has NO JustTCG key (503 justtcg_not_configured)${has('--prod') ? ' — as it must: the Free key is UAT-only.' : ' — set it: wrangler secret put JUSTTCG_API_KEY --env preview'}`)
       process.exit(has('--prod') ? 0 : 1)
     }
+    if (status === 404 && has('--prod')) {
+      console.error('  ✓ the prod worker has NO probe route (404) — the branch is not on Ingestion `main` yet. Expected before the Part B merge; after it, this command must answer 503 justtcg_not_configured.')
+      process.exit(0)
+    }
+    if (status === 401) {
+      console.error(`  ✗ ${WORKER_URL} refused the worker secret (401). Either INGESTION_WORKER_SECRET is not set on THAT worker (\`wrangler secret put INGESTION_WORKER_SECRET${has('--prod') ? '' : ' --env preview'}\`) or the value in .dev.vars / the environment differs from it.`)
+      process.exit(1)
+    }
     if (!data.ok) { console.error(`  ✗ probe failed (HTTP ${status}): ${data.error ?? 'unknown'}`); process.exit(1) }
     console.error(`  [${i}] calls ${data.calls.thisInvocation} (run ${data.calls.total}, day ${data.calls.dailyUsed}/${data.calls.dailyAllowed}) · queue ${data.queueRemaining}${data.stopped ? ` · STOPPED ${data.stopped}` : ''}${data.errors?.length ? ` · errors ${data.errors.length}` : ''}`)
     if (data.done) return data
