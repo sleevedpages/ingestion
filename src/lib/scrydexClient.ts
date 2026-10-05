@@ -12,7 +12,6 @@ import type { Env } from '../worker.js'
 
 const SCRYDEX_BASE             = 'https://api.scrydex.com'
 const DEFAULT_MONTHLY_LIMIT    = 5000
-const VISION_CREDITS           = 5   // Scrydex Vision is a premium endpoint — 5 credits/request
 
 export class ScrydexCreditLimitError extends Error {
   constructor() {
@@ -146,81 +145,11 @@ export async function scrydexFetch(
   return response
 }
 
-/**
- * Scrydex Vision — identify a card from an image (POST /vision/v1/cards/identify).
- *
- * A premium endpoint billed at VISION_CREDITS (5) credits/request, so it goes through
- * the SAME monthly credit guard + scrydex_api_log accounting as every other Scrydex
- * call (the documented single entry point). Sends multipart/form-data (image + optional
- * comma-separated `games` scope). Returns the raw Response so the caller can apply its
- * own 403/circuit-breaker handling and parse the body.
- *
- * @param env   Worker bindings (DB, SCRYDEX_API_KEY, SCRYDEX_TEAM_ID, SCRYDEX_MONTHLY_LIMIT?)
- * @param image The card image as a Blob/File
- * @param games Optional comma-separated TCG scope, e.g. 'pokemon' (improves speed/accuracy)
- * @throws ScrydexCreditLimitError when the monthly guard blocks the call
- */
-export async function scrydexVisionIdentify(
-  env:   Env,
-  image: Blob,
-  games?: string,
-): Promise<Response> {
-  const endpoint = '/vision/v1/cards/identify'
-  const jobName  = 'visionIdentify'
-
-  const monthlyLimit   = env.SCRYDEX_MONTHLY_LIMIT ? parseInt(env.SCRYDEX_MONTHLY_LIMIT, 10) : DEFAULT_MONTHLY_LIMIT
-  const guardThreshold = monthlyLimit - 500
-
-  // ── Monthly credit guard (Vision costs 5; guard on current usage) ───────────
-  let currentUsage = 0
-  try {
-    currentUsage = await getMonthlyCreditsUsed(env.DB)
-  } catch {
-    // DB read failure → allow the call; don't block on a monitoring error
-  }
-  if (currentUsage >= guardThreshold) {
-    try {
-      await logCall(env.DB, endpoint, jobName, 'blocked', null, 0, 'Monthly credit guard triggered')
-    } catch { /* non-blocking */ }
-    throw new ScrydexCreditLimitError()
-  }
-
-  // ── Build multipart body — do NOT set Content-Type; fetch sets the boundary ──
-  const form = new FormData()
-  form.append('image', image, 'card.jpg')
-  if (games) form.append('games', games)
-
-  let response: Response
-  try {
-    response = await fetch(`${SCRYDEX_BASE}${endpoint}`, {
-      method: 'POST',
-      headers: {
-        'X-Api-Key': env.SCRYDEX_API_KEY!,
-        'X-Team-ID': env.SCRYDEX_TEAM_ID!,
-        'Accept':    'application/json',
-      },
-      body: form,
-    })
-  } catch (err) {
-    try {
-      await logCall(env.DB, endpoint, jobName, 'error', null, 0, String(err))
-    } catch { /* non-blocking */ }
-    throw err
-  }
-
-  try {
-    // Same rule as scrydexFetch: only a served response is billable (5 credits for Vision).
-    await logCall(
-      env.DB, endpoint, jobName,
-      response.ok ? 'success' : 'error',
-      response.status,
-      response.ok ? VISION_CREDITS : 0,
-      response.ok ? null : `HTTP ${response.status}`,
-    )
-  } catch { /* non-blocking */ }
-
-  return response
-}
+// `scrydexVisionIdentify()` (POST /vision/v1/cards/identify, 5 credits/call) was REMOVED
+// 2026-10-05 — Part B of the JustTCG probe session. Its historical `scrydex_api_log` rows
+// (`endpoint LIKE '%/vision/%'`, `job_name='visionIdentify'`, credits_used 5) stay readable;
+// nothing writes new ones. Every remaining Scrydex call logs 1 credit per served response
+// (NOTE, recorded 2026-10-05: Scrydex bills `/price_history` at 3 — the log under-counts it).
 
 /**
  * Delete scrydex_api_log rows older than 90 days.

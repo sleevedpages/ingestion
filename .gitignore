@@ -138,3 +138,9 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+# JustTCG probe run outputs (raw provider payloads — never committed)
+justtcg-probe-*.json
+
+# wrangler local state (miniflare)
+.wrangler/
