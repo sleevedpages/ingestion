@@ -184,9 +184,15 @@ export function justtcgGradedEntry(v: JtV2Variant): JtGradedEntry {
   }
   const company = (g.company ?? '').toUpperCase()
   if (!company) return { ...base, skipReason: 'no_company' }
-  if (g.qualifier) return { ...base, skipReason: `qualifier:${g.qualifier}` }      // qualified slabs are priced separately — we hold no such bucket
+  // OBSERVED 2026-10-05 (owned-slabs run): the premium tier arrives in `qualifier`, not `grade_label`
+  // — `{ company:'CGC', grade:10, grade_label:null, qualifier:'Pristine', canonical:'CGC 10 Pristine' }`.
+  // Treat a Pristine / Black Label qualifier as the premium label; any OTHER qualifier (OC, …) is a
+  // separately-priced slab we hold no bucket for → skipped.
+  const qual = (g.qualifier ?? '').trim().toLowerCase()
+  const premiumQual = qual === 'pristine' || qual === 'black label'
+  if (qual && !premiumQual) return { ...base, skipReason: `qualifier:${g.qualifier}` }
   if (base.grade == null) return { ...base, skipReason: 'authentic_or_no_grade' }
-  const label = (g.grade_label ?? '').trim().toLowerCase()
+  const label = ((g.grade_label ?? '').trim() || (premiumQual ? g.qualifier! : '')).toLowerCase()
   if (label) {
     if (label === 'black label' && company === 'BGS') return { ...base, ourLabel: 'BGS Black Label 10' }
     if (label === 'pristine' && (company === 'CGC' || company === 'TAG' || company === 'BGS')) return { ...base, ourLabel: `${company} Pristine 10` }
@@ -195,14 +201,25 @@ export function justtcgGradedEntry(v: JtV2Variant): JtGradedEntry {
   return { ...base, ourLabel: `${company} ${fmtGrade(base.grade)}` }
 }
 
-function isEnglish(v: { language?: string | null }): boolean {
+/**
+ * The language a product's JustTCG variants should be read in: Japanese for the Pokémon Japan
+ * catalogue (JustTCG lists those cards as `language: "Japanese"`, printing "Holofoil - Japanese" —
+ * observed 2026-10-05; an English-only filter read every one of them as "no tiers"), English
+ * otherwise. Absent `language` means English on both v1 and v2.
+ */
+export function expectedLanguage(game: string | null | undefined): 'english' | 'japanese' {
+  return /japan/i.test(String(game ?? '')) ? 'japanese' : 'english'
+}
+
+function inLanguage(v: { language?: string | null }, want: 'english' | 'japanese'): boolean {
   const l = (v.language ?? '').trim().toLowerCase()
+  if (want === 'japanese') return l === 'japanese' || l === 'ja' || l === 'jp'
   return !l || l === 'english' || l === 'en'
 }
 
 /** Pick the JustTCG printing to compare: our ladder's finish by key → 'Normal' → the highest NM price. */
-export function pickPrinting(variants: JtV1Variant[], ourFinish: string | null): string | null {
-  const en = variants.filter(isEnglish)
+export function pickPrinting(variants: JtV1Variant[], ourFinish: string | null, lang: 'english' | 'japanese' = 'english'): string | null {
+  const en = variants.filter(v => inLanguage(v, lang))
   if (!en.length) return null
   const want = finishKey(ourFinish)
   const keys = new Map<string, string>()
@@ -214,11 +231,11 @@ export function pickPrinting(variants: JtV1Variant[], ourFinish: string | null):
   return best?.printing ? String(best.printing) : (en[0].printing ? String(en[0].printing) : null)
 }
 
-export function justtcgTiers(variants: JtV1Variant[], printing: string | null): TierMap {
+export function justtcgTiers(variants: JtV1Variant[], printing: string | null, lang: 'english' | 'japanese' = 'english'): TierMap {
   const out: TierMap = {}
   const want = finishKey(printing)
   for (const v of variants) {
-    if (!isEnglish(v)) continue
+    if (!inLanguage(v, lang)) continue
     if (want && finishKey(v.printing) !== want) continue
     const code = conditionCode(v.condition)
     const p = num(v.price)
@@ -267,20 +284,24 @@ export function compareProduct(
   const now = opts.nowSeconds ?? Math.floor(Date.now() / 1000)
   const ladder = resolveRawLadder(ours.rows)
   const variants = jtRaw?.variants ?? []
-  const english = variants.filter(isEnglish)
+  const lang = expectedLanguage(ours.game)
+  const english = variants.filter(v => inLanguage(v, lang))     // the product's own language (English; Japanese for Pokémon Japan)
   const languages = [...new Set(variants.map(v => (v.language ?? 'English') as string))]
 
   const ourFinishKeys = [...new Set(ours.rows.filter(r => r.is_graded === 0).map(r => finishKey(r.finish) ?? finishKey(r.variant)).filter((k): k is string => !!k))]
-  const jtPrintings = [...new Set(english.map(v => String(v.printing ?? '')).filter(Boolean))]
+  // JustTCG suffixes a non-English printing with " - <Language>" ("Holofoil - Japanese"); strip it before keying.
+  const printingName = (v: JtV1Variant) => String(v.printing ?? '').replace(/\s+-\s+[A-Za-z() ]+$/, '')
+  const jtPrintings = [...new Set(english.map(printingName).filter(Boolean))]
   const unmapped = jtPrintings.filter(p => { const k = finishKey(p); return !k || !ourFinishKeys.includes(k) })
-  const compared = jtRaw ? pickPrinting(variants, ladder.finish) : null
+  const stripped = variants.map(v => ({ ...v, printing: printingName(v) }))
+  const compared = jtRaw ? pickPrinting(stripped, ladder.finish, lang) : null
 
-  const jtTiers = jtRaw ? justtcgTiers(variants, compared) : {}
+  const jtTiers = jtRaw ? justtcgTiers(stripped, compared, lang) : {}
   const ourTiers = scrydexTiers(ours.rows)
   const deltaPct: Partial<Record<TierCode, number | null>> = {}
   for (const code of TIER_CODES) if (ourTiers[code] != null || jtTiers[code] != null) deltaPct[code] = pctDelta(ourTiers[code], jtTiers[code])
 
-  const nmVariant = english.find(v => conditionCode(v.condition) === 'NM' && (!compared || finishKey(v.printing) === finishKey(compared)) && num(v.price) != null) ?? null
+  const nmVariant = stripped.find(v => inLanguage(v, lang) && conditionCode(v.condition) === 'NM' && (!compared || finishKey(v.printing) === finishKey(compared)) && num(v.price) != null) ?? null
   const history = nmVariant?.priceHistory30d ?? nmVariant?.priceHistory ?? []
   const histT = history.map(h => h.t).filter(t => typeof t === 'number')
   const historyDays = histT.length ? Math.round(((Math.max(...histT) - Math.min(...histT)) / 86_400) * 10) / 10 : null

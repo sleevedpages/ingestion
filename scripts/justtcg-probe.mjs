@@ -159,7 +159,9 @@ async function runLoop(first) {
       console.error(`  ⏸ stopped on ${data.stopped} — state saved to ${STATE_FILE}; re-run with --resume ${STATE_FILE} after the cap resets (00:00 UTC)`)
       process.exit(2)
     }
-    body = { state: data.state }
+    // Carry includeRaw across invocations — the finished response comes from the LAST one, and the
+    // prod re-comparison needs the raw payloads (the 2026-10-05 owned-slabs run lost them this way).
+    body = { state: data.state, ...(first.includeRaw ? { includeRaw: true } : {}) }
     if (data.paused) { console.error('  … two per-minute 429s in a row — waiting 65 s before continuing'); await sleep(65_000) }
     else await sleep(3_000)   // the worker paces calls from a KV timestamp; this gap is only courtesy
   }
@@ -217,6 +219,40 @@ if (has('--diag')) {
     for (const l of r.lookups) console.error(`    ${l.lookup.padEnd(22)} HTTP ${l.status}  cards ${l.cards ?? '—'}  variants ${l.variants ?? '—'}  graded ${l.graded ?? '—'}  ${l.sample ?? ''}`)
   }
   console.error(`\n  ${data.calls} calls${data.stopped ? ` · STOPPED ${data.stopped}` : ''}`)
+  process.exit(0)
+}
+
+// --recompare <saved run json> — OFFLINE: re-run the pure comparison of a saved run (the script's
+// full response, or the R2 object `probes/justtcg/<date>/<runId>.json` fetched with
+// `wrangler r2 object get … --remote`) against PROD's read-only rows, resolving each product's
+// game / name / rows by its TCGplayer id. Zero JustTCG calls. Writes <file>.prod-compare.json.
+if (has('--recompare')) {
+  const file = arg('--recompare')
+  const data = JSON.parse(readFileSync(file, 'utf8'))
+  const raw = data.raw ?? { v1: {}, v2: {}, search: {} }
+  const ids = [...new Set((data.products ?? []).map(p => p.tcgplayerProductId).filter(n => n != null))]
+  if (!ids.length) { console.error('  ✗ no products with a TCGplayer id in that file'); process.exit(1) }
+  console.error(`  ${file}: run ${data.runId ?? '?'} · ${ids.length} TCGplayer ids · raw v1 ${Object.keys(raw.v1).length} · graded v2 ${Object.values(raw.v2).filter(Boolean).length}`)
+  const rows = []
+  for (let i = 0; i < ids.length; i += 90) rows.push(...prodSelect(`${PRODUCT_SELECT} WHERE pr.tcgplayer_product_id IN (${ids.slice(i, i + 90).join(',')})`))
+  const sampleFile = 'justtcg-probe-sample.json'
+  let poolById = new Map()
+  try { poolById = new Map(JSON.parse(readFileSync(sampleFile, 'utf8')).map(p => [p.id, p.pool])) } catch {}
+  const picked = rows.map(r => ({ ...r, pool: poolById.get(r.id) ?? 'unknown' }))
+  console.error(`  ${picked.length} products resolved on PROD (${picked.filter(p => p.pool !== 'unknown').length} with a pool from ${sampleFile})`)
+  const prod = await compareAgainstProd({ raw }, picked)
+  if (!prod) process.exit(1)
+  const out = file.replace(/\.json$/, '') + '.prod-compare.json'
+  writeFileSync(out, JSON.stringify(prod, null, 2), 'utf8')
+  console.error(`  → ${out}`)
+  printSummary(`summary vs PROD rows — ${file}`, prod.summary)
+  // Per-pool view (the graded columns read off the graded pools, the tier columns off the tier pools).
+  const byPool = {}
+  for (const c of prod.comparisons) (byPool[poolById.get(c.productId) ?? 'unknown'] ??= []).push(c)
+  for (const [pool, cs] of Object.entries(byPool)) {
+    const cmp = await import('../src/justtcgCompare.ts')
+    printSummary(`summary vs PROD rows — pool ${pool}`, cmp.summarise(cs))
+  }
   process.exit(0)
 }
 

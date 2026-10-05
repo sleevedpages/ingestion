@@ -113,6 +113,10 @@ describe('justtcgGradedEntry (the future writer\'s label / skip rules, pinned fr
     expect(justtcgGradedEntry(v({ company: 'CGC', grade: 10, grade_label: 'Pristine' })).ourLabel).toBe('CGC Pristine 10')
     expect(justtcgGradedEntry(v({ company: 'BGS', grade: 10, grade_label: 'Pristine' })).ourLabel).toBe('BGS Pristine 10')
   })
+  it('a Pristine / Black Label QUALIFIER is the premium tier (observed shape: grade_label null, canonical "CGC 10 Pristine")', () => {
+    expect(justtcgGradedEntry(v({ company: 'CGC', grade: 10, grade_label: null, qualifier: 'Pristine', canonical: 'CGC 10 Pristine' })).ourLabel).toBe('CGC Pristine 10')
+    expect(justtcgGradedEntry(v({ company: 'BGS', grade: 10, grade_label: null, qualifier: 'Black Label', canonical: 'BGS 10 Black Label' })).ourLabel).toBe('BGS Black Label 10')
+  })
   it('skips qualified, Authentic and unknown-label slabs with a stated reason', () => {
     expect(justtcgGradedEntry(v({ company: 'PSA', grade: 9, qualifier: 'OC' })).skipReason).toBe('qualifier:OC')
     expect(justtcgGradedEntry(v({ company: 'PSA', grade: null, canonical: 'PSA Authentic' })).skipReason).toBe('authentic_or_no_grade')
@@ -194,6 +198,22 @@ describe('compareProduct', () => {
     expect(c.freshness.justtcgRawAgeDays).toBe(1)
     expect(c.freshness.ourLadderAgeDays).toBe(0)
   })
+  it('a Pokémon Japan product reads its JAPANESE variants (observed: language "Japanese", printing "Holofoil - Japanese")', () => {
+    const pj = { ...ours, game: 'Pokemon Japan', rows: [row({ source: 'scrydex', condition: 'NM', finish: 'holofoil', value: 10 }), row({ source: 'scrydex', condition: 'LP', finish: 'holofoil', value: 8 })] }
+    const raw = { uuid: 'u2', name: 'Pikachu', tcgplayerId: '9', variants: [
+      { condition: 'Near Mint', printing: 'Holofoil', price: 99, language: 'English' },                  // an English listing — not this product's market
+      { condition: 'Near Mint', printing: 'Holofoil - Japanese', price: 11, language: 'Japanese', lastUpdated: 1_759_000_000 },
+      { condition: 'Lightly Played', printing: 'Holofoil - Japanese', price: 8.8, language: 'Japanese' },
+    ] }
+    const c = compareProduct(pj, raw, null, { nowSeconds: 1_759_000_000 })
+    expect(c.printings.compared).toBe('Holofoil')                 // the " - Japanese" suffix stripped before keying
+    expect(c.printings.unmapped).toEqual([])
+    expect(c.raw.justtcgNm).toBe(11)
+    expect(c.tiers.justtcg).toEqual({ NM: 11, LP: 8.8 })
+    expect(c.tiers.deltaPct).toEqual({ NM: 10, LP: 10 })
+    expect(c.justtcg.english).toBe(2)                              // "english" = the variants in the product's own language
+  })
+
   it('an unresolved product keeps our side and reports nothing from JustTCG', () => {
     const c = compareProduct(ours, null, null)
     expect(c.resolved).toBe(false)
