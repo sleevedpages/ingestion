@@ -192,6 +192,25 @@ function printSummary(title, s) {
 }
 
 // ── main ───────────────────────────────────────────────────────────────────────────────────────
+// --diag 628274,89716 — four paced v2 lookups per id (by tcgplayer_id and by the v1 UUID, graded
+// exclude/only) to settle what a 404 on the graded lookup means. ≈ 5 calls per id; the response IS
+// the record (paste it into the audit doc).
+if (has('--diag')) {
+  const ids = splitIds(arg('--diag'))
+  const { status, data } = await postProbe({ diag: { tcgplayerIds: ids } })
+  if (status === 503 && data.error === 'justtcg_not_configured') { console.error(`  ✗ ${WORKER_URL} has NO JustTCG key`); process.exit(1) }
+  if (status === 401) { console.error(`  ✗ ${WORKER_URL} refused the worker secret (401)`); process.exit(1) }
+  if (status === 404) { console.error(`  ✗ ${WORKER_URL} has no probe route (404) — not deployed with this branch`); process.exit(1) }
+  if (!data.ok) { console.error(`  ✗ diag failed (HTTP ${status}): ${data.error ?? 'unknown'}`); process.exit(1) }
+  console.log(JSON.stringify(data, null, 2))
+  for (const r of data.results) {
+    console.error(`\n  tcgplayer ${r.tcgplayerId} — v1 ${r.v1.found ? `found: ${r.v1.name} (${r.v1.game}) uuid ${r.v1.uuid}` : 'NOT found'}`)
+    for (const l of r.lookups) console.error(`    ${l.lookup.padEnd(22)} HTTP ${l.status}  cards ${l.cards ?? '—'}  variants ${l.variants ?? '—'}  graded ${l.graded ?? '—'}  ${l.sample ?? ''}`)
+  }
+  console.error(`\n  ${data.calls} calls${data.stopped ? ` · STOPPED ${data.stopped}` : ''}`)
+  process.exit(0)
+}
+
 let first
 let picked = null
 if (has('--resume')) {

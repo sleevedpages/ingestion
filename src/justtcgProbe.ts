@@ -25,7 +25,7 @@
 import type { Env } from './worker.js'
 import {
   justtcgConfigured, justtcgLimits, readDailyCounter, justtcgGames, justtcgBatchByTcgplayerIds,
-  justtcgGradedByTcgplayerId, justtcgSearch, JustTcgError,
+  justtcgGradedByTcgplayerId, justtcgSearch, justtcgV2ByTcgplayerId, justtcgV2ById, JustTcgError,
   type JtV1Card, type JtV2Card, type JtGame, type JustTcgUsage,
 } from './lib/justtcgClient.js'
 import { compareProduct, summarise, type OurPriceRow, type OurProduct, type ProductComparison } from './justtcgCompare.js'
@@ -436,4 +436,80 @@ export async function runJustTcgProbe(env: Env, body: ProbeBody): Promise<ProbeR
 /** The route's pre-flight: 503 when the key is absent (fail closed) — checked before any D1 read. */
 export function probeNotConfigured(env: Env): boolean {
   return !justtcgConfigured(env)
+}
+
+// ── The DIAG probe: what does a v2 lookup actually answer for ONE card? ─────────────────────────
+//
+// OBSERVED 2026-10-05 (Starter plan, run 00ce9815): 84 of 85 graded-only lookups by `tcgplayer_id`
+// answered 404 "Card with the specified identifier could not be found" — INCLUDING products that
+// hold PSA-10 rows on our side — while v1 resolved the same ids. Two readings remain: v2's
+// `tcgplayer_id` lookup does not find the card at all (then the graded call must use the card UUID
+// v1 already returned), or it finds it and 404s when the graded filter leaves nothing. Four paced
+// calls per id settle it: v2 by tcgplayer_id (exclude / only) and v2 by UUID (exclude / only).
+// No D1 read, no R2 write — the response IS the record (the audit doc pastes it).
+
+export interface DiagBody { diag: { tcgplayerIds: Array<number | string> } }
+
+export interface DiagLookup {
+  lookup:   'v2-tcgplayer-exclude' | 'v2-tcgplayer-only' | 'v2-uuid-exclude' | 'v2-uuid-only'
+  status:   number | null
+  cards:    number | null          // data[] length (list), or 1 for a direct hit
+  variants: number | null
+  graded:   number | null          // variants with type 'graded'
+  sample:   string | null          // first graded canonical + price, or the error text
+}
+export interface DiagResult {
+  ok:      boolean
+  calls:   number
+  results: Array<{ tcgplayerId: string; v1: { found: boolean; uuid: string | null; name: string | null; game: string | null }; lookups: DiagLookup[] }>
+  stopped: string | null
+}
+
+export async function runJustTcgDiag(env: Env, body: DiagBody): Promise<DiagResult> {
+  const ids = (body.diag?.tcgplayerIds ?? []).map(String).filter(Boolean).slice(0, 10)
+  const out: DiagResult = { ok: true, calls: 0, results: [], stopped: null }
+  const summarise = (lookup: DiagLookup['lookup'], status: number, cards: JtV2Card[]): DiagLookup => {
+    const variants = cards.flatMap(c => c.variants ?? [])
+    const graded = variants.filter(v => v.type === 'graded' || v.grading)
+    const g = graded[0]
+    return { lookup, status, cards: cards.length, variants: variants.length, graded: graded.length,
+      sample: g ? `${g.grading?.canonical ?? '?'} = ${g.markets?.[0]?.price ?? 'null'}` : (variants[0] ? `${variants[0].condition ?? ''} ${variants[0].printing ?? ''} = ${variants[0].markets?.[0]?.price ?? 'null'}`.trim() : null) }
+  }
+  const attempt = async (lookup: DiagLookup['lookup'], fn: () => Promise<{ status: number; body: unknown }>): Promise<DiagLookup> => {
+    try {
+      const res = await fn()
+      out.calls += 1
+      const b = res.body as { data?: JtV2Card | JtV2Card[] }
+      const cards = Array.isArray(b?.data) ? b.data : (b?.data ? [b.data] : [])
+      return summarise(lookup, res.status, cards)
+    } catch (err) {
+      const e = err as JustTcgError
+      if (e instanceof JustTcgError && (e.kind === 'cap' || e.kind === 'quota' || e.kind === 'abuse' || e.kind === 'auth' || e.kind === 'not_configured')) {
+        out.stopped = e.kind
+      } else {
+        out.calls += 1
+      }
+      return { lookup, status: (e as JustTcgError)?.status ?? null, cards: null, variants: null, graded: null, sample: String(e?.message ?? err) }
+    }
+  }
+  for (const id of ids) {
+    if (out.stopped) break
+    let v1: DiagResult['results'][number]['v1'] = { found: false, uuid: null, name: null, game: null }
+    try {
+      const res = await justtcgBatchByTcgplayerIds(env, [id], '7d')
+      out.calls += 1
+      const card = (res.body?.data ?? [])[0]
+      if (card) v1 = { found: true, uuid: card.uuid ?? null, name: card.name ?? null, game: card.game ?? null }
+    } catch (err) {
+      const e = err as JustTcgError
+      if (e instanceof JustTcgError && (e.kind === 'cap' || e.kind === 'quota' || e.kind === 'abuse' || e.kind === 'auth')) { out.stopped = e.kind; break }
+    }
+    const lookups: DiagLookup[] = []
+    lookups.push(await attempt('v2-tcgplayer-exclude', () => justtcgV2ByTcgplayerId(env, id, 'exclude')))
+    if (!out.stopped) lookups.push(await attempt('v2-tcgplayer-only', () => justtcgV2ByTcgplayerId(env, id, 'only')))
+    if (!out.stopped && v1.uuid) lookups.push(await attempt('v2-uuid-exclude', () => justtcgV2ById(env, v1.uuid!, 'exclude')))
+    if (!out.stopped && v1.uuid) lookups.push(await attempt('v2-uuid-only', () => justtcgV2ById(env, v1.uuid!, 'only')))
+    out.results.push({ tcgplayerId: id, v1, lookups })
+  }
+  return out
 }

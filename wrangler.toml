@@ -297,6 +297,14 @@ crons = ["0 6 * * *"]
 [env.preview.vars]
 TCGCSV_BASE_URL = "https://tcgcsv.com"
 LOG_LEVEL = "debug"
+# JustTCG probe knobs for the STARTER plan the operator moved the account to on 2026-10-05
+# (1,000/day · 50/min · 100 cards per batch — https://justtcg.com/docs/rate-limits). The in-code
+# defaults describe the Free plan; these override them on the UAT worker only. If the plan ever
+# lapses, JustTCG's own 429 quota codes still stop a run, and the ledger resyncs from their meter.
+JUSTTCG_DAILY_CAP = "1000"
+JUSTTCG_DAILY_RESERVE = "100"
+JUSTTCG_BATCH_SIZE = "100"
+JUSTTCG_MIN_INTERVAL_MS = "3000"
 # CONTENT_APP_URL — deliberately UNSET here. wrangler does NOT inherit top-level [vars] into a
 # named environment, so the UAT worker has no Content origin by default and the value-snapshot job
 # self-skips rather than guessing (a guess would be the PROD origin, i.e. UAT writing prod rows).

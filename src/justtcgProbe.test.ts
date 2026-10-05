@@ -476,6 +476,32 @@ describe('POST /admin/justtcg-probe', () => {
     expect(r.calls.total).toBe(1)                                                // only the games call counted as made
   })
 
+  it('{ diag } runs the four v2 lookups per id (by tcgplayer_id and by the v1 UUID, exclude/only) and records each status', async () => {
+    const seen: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: any) => {
+      seen.push(`${init?.method ?? 'GET'} ${url}`)
+      if (url.includes('/v1/cards?priceHistoryDuration')) return new Response(JSON.stringify({ data: [{ uuid: 'uuid-1', name: 'Pikachu', game: 'Pokemon', tcgplayerId: '11', variants: [] }] }))
+      if (url.includes('/v2/cards/uuid-1') && url.includes('graded=only')) return new Response(JSON.stringify({ data: { id: 'uuid-1', variants: [{ type: 'graded', grading: { company: 'PSA', grade: 10, canonical: 'PSA 10' }, markets: [{ price: 99.99 }] }] } }))
+      if (url.includes('/v2/cards/uuid-1')) return new Response(JSON.stringify({ data: { id: 'uuid-1', variants: [{ type: 'raw', condition: 'Near Mint', printing: 'Normal', markets: [{ price: 1.5 }] }] } }))
+      if (url.includes('/v2/cards?tcgplayer_id=11')) return new Response(JSON.stringify({ type: 'x', title: 'Resource not found', status: 404, detail: 'Card with the specified identifier could not be found.' }), { status: 404 })
+      return new Response('{}', { status: 500 })
+    }))
+    const env = routeEnv({ JUSTTCG_API_KEY: 'k', JUSTTCG_MIN_INTERVAL_MS: '0' })
+    const res = await post(env, { diag: { tcgplayerIds: [11] } })
+    const b = await res.json() as any
+    expect(res.status).toBe(200)
+    expect(b.ok).toBe(true)
+    expect(b.calls).toBe(5)
+    expect(b.results[0].v1).toEqual({ found: true, uuid: 'uuid-1', name: 'Pikachu', game: 'Pokemon' })
+    expect(b.results[0].lookups.map((l: any) => [l.lookup, l.status, l.graded])).toEqual([
+      ['v2-tcgplayer-exclude', 404, null], ['v2-tcgplayer-only', 404, null], ['v2-uuid-exclude', 200, 0], ['v2-uuid-only', 200, 1],
+    ])
+    expect(b.results[0].lookups[0].sample).toContain('Resource not found: Card with the specified identifier could not be found.')
+    expect(b.results[0].lookups[3].sample).toBe('PSA 10 = 99.99')
+    expect(seen.some(s => s.includes('graded=include'))).toBe(false)   // never the surcharged mode
+    expect(env.DB.sql).toHaveLength(0)                                   // no D1 read at all
+  })
+
   it('selectProducts falls back to the TCGplayer-raw pool when a game has no Scrydex tiers (UAT)', async () => {
     const db = probeDb({ tiered: false }) as any
     const products = await selectProducts(db, { sample: { perGame: 1, games: ['Pokemon'] } })

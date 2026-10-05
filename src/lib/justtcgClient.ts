@@ -323,6 +323,22 @@ export function justtcgGradedByTcgplayerId(env: Env, tcgplayerId: string | numbe
   })
 }
 
+/** GET /v2/cards?tcgplayer_id=… with an explicit `graded` mode — the DIAG probe's lookup (never `include`). */
+export function justtcgV2ByTcgplayerId(env: Env, tcgplayerId: string | number, graded: 'exclude' | 'only') {
+  return justtcgFetch<JtV2CardsResponse>(env, '/v2/cards', {
+    query: { tcgplayer_id: String(tcgplayerId), graded, include: 'periods.30d' },
+    jobName: `justtcg:v2-by-tcgplayer(${graded})`,
+  })
+}
+
+/** GET /v2/cards/{id} (card UUID or legacy slug) with an explicit `graded` mode — the DIAG probe's second lookup. */
+export function justtcgV2ById(env: Env, cardId: string, graded: 'exclude' | 'only') {
+  return justtcgFetch<{ data?: JtV2Card }>(env, `/v2/cards/${encodeURIComponent(cardId)}`, {
+    query: { graded, include: 'periods.30d' },
+    jobName: `justtcg:v2-by-id(${graded})`,
+  })
+}
+
 /** GET /v1/cards?q=…&game=…[&number=…] — name search for products with NO TCGplayer id. */
 export function justtcgSearch(env: Env, q: string, gameId?: string | null, number?: string | null, limit = 5) {
   return justtcgFetch<JtV1CardsResponse>(env, '/v1/cards', {

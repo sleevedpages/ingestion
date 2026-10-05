@@ -39,7 +39,7 @@ import { runPriceArchive } from './priceArchive.js';
 import { runPriceDailyCapture } from './priceDailyCapture.js';
 import { runEbayOrderSync } from './ebayOrderSync.js';
 import { runWatchAlerts } from './watchAlerts.js';
-import { runJustTcgProbe, probeNotConfigured, type ProbeBody } from './justtcgProbe.js';
+import { runJustTcgProbe, runJustTcgDiag, probeNotConfigured, type ProbeBody, type DiagBody } from './justtcgProbe.js';
 import {
   ADMIN_JOB_IDS,
   isAdminJobId,
@@ -835,8 +835,13 @@ export default {
       if (probeNotConfigured(env)) {
         return json({ ok: false, error: 'justtcg_not_configured' }, 503);
       }
-      const body = await request.json().catch(() => ({})) as ProbeBody;
+      const body = await request.json().catch(() => ({})) as ProbeBody & Partial<DiagBody>;
       try {
+        // { diag: { tcgplayerIds } } — the four-lookup DIAG for a handful of ids (see justtcgProbe.ts).
+        if (body.diag && Array.isArray(body.diag.tcgplayerIds)) {
+          const diag = await runJustTcgDiag(env, body as DiagBody);
+          return json(diag, 200);
+        }
         const result = await runJustTcgProbe(env, body);
         return json(result, result.ok ? 200 : 502);
       } catch (err) {
