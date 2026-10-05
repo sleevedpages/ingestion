@@ -74,6 +74,9 @@ export interface ProbeState {
   usage:      JustTcgUsage | null
   errors:     Array<{ item: string; kind: string; message: string }>
   stopped:    string | null                     // 'cap' | 'quota' | 'auth' | null
+  /** Graded-only lookups that answered 404 ("no graded variants" — observed 2026-10-05), counted, not errors. */
+  gradedNotFound404?:    number
+  gradedNotFoundDetail?: string | null          // the first 404's problem-body text, for the audit doc
 }
 
 export interface ProbeBody {
@@ -94,6 +97,8 @@ export interface ProbeResult {
   capHit:      boolean
   stopped:     string | null
   calls:       { thisInvocation: number; total: number; dailyUsed: number; dailyAllowed: number; dailyCap: number; justtcgReported: JustTcgUsage | null }
+  gradedNotFound404: number
+  gradedNotFoundDetail: string | null
   queueRemaining: number
   products:    number
   state?:      ProbeState
@@ -299,9 +304,25 @@ export async function runJustTcgProbe(env: Env, body: ProbeBody): Promise<ProbeR
         for (const card of res.body?.data ?? []) if (card?.tcgplayerId != null) state.raw[String(card.tcgplayerId)] = card
         state.usage = res.usage ?? state.usage
       } else if (item.kind === 'graded') {
-        const res = await justtcgGradedByTcgplayerId(env, item.tcgplayerId)
-        const card = (res.body?.data ?? [])[0] ?? null
-        state.graded[String(item.tcgplayerId)] = card
+        try {
+          const res = await justtcgGradedByTcgplayerId(env, item.tcgplayerId)
+          const card = (res.body?.data ?? [])[0] ?? null
+          state.graded[String(item.tcgplayerId)] = card
+        } catch (err) {
+          // OBSERVED 2026-10-05 (UAT smoke, 4/4 cheap commons): `graded=only` answers HTTP 404 with an
+          // RFC 7807 problem body for a card v1 resolves fine. Read as "no graded variants" — the card
+          // is recorded with `null` graded data and COUNTED (gradedNotFound404), not treated as a
+          // failed call; the raw/tier comparison for that product proceeds. The call still spent a
+          // request, so it is counted below like any other.
+          const e = err as JustTcgError
+          if (e instanceof JustTcgError && e.kind === 'http' && e.status === 404) {
+            state.graded[String(item.tcgplayerId)] = null
+            state.gradedNotFound404 = (state.gradedNotFound404 ?? 0) + 1
+            if (!state.gradedNotFoundDetail && e.message) state.gradedNotFoundDetail = e.message
+          } else {
+            throw err
+          }
+        }
       } else if (item.kind === 'search') {
         const p = state.products.find(x => x.productId === item.productId)
         if (!p) { state.queue.shift(); continue }
@@ -338,6 +359,7 @@ export async function runJustTcgProbe(env: Env, body: ProbeBody): Promise<ProbeR
   const base: ProbeResult = {
     ok: true, runId: state.runId, done: false, capHit, stopped: state.stopped,
     calls: { thisInvocation, total: state.calls, dailyUsed: counter.used, dailyAllowed: counter.allowed, dailyCap: counter.cap, justtcgReported: state.usage },
+    gradedNotFound404: state.gradedNotFound404 ?? 0, gradedNotFoundDetail: state.gradedNotFoundDetail ?? null,
     queueRemaining: state.queue.length, products: state.products.length, persisted: null, errors: state.errors,
   }
 

@@ -419,6 +419,24 @@ describe('POST /admin/justtcg-probe', () => {
     expect(b.queueRemaining).toBe(3)
   })
 
+  it('a graded-only 404 (problem+json) is "no graded variants": counted, graded null, raw still compared, not an error', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.endsWith('/v1/games')) return new Response(JSON.stringify({ data: [{ id: 'pokemon', name: 'Pokemon' }] }))
+      if (url.includes('/v1/cards?priceHistoryDuration')) return new Response(JSON.stringify({ data: [{ uuid: 'u', name: 'Pikachu', tcgplayerId: '11', variants: [{ condition: 'Near Mint', printing: 'Normal', price: 11 }] }] }))
+      if (url.includes('/v2/cards')) return new Response(JSON.stringify({ type: 'https://justtcg.com/docs/errors#not-found', title: 'Card not found', status: 404, detail: 'No graded variants' }), { status: 404, headers: { 'content-type': 'application/problem+json' } })
+      return new Response('{}', { status: 404 })
+    }))
+    const env = routeEnv({ JUSTTCG_API_KEY: 'k', JUSTTCG_MIN_INTERVAL_MS: '0' })
+    const r = await runJustTcgProbe(env, { canonicalProductIds: [1], maxCalls: 10 })
+    expect(r.done).toBe(true)
+    expect(r.errors).toEqual([])
+    expect(r.gradedNotFound404).toBe(1)
+    expect(r.gradedNotFoundDetail).toContain('Card not found: No graded variants')
+    expect(r.calls.total).toBe(3)                     // games + raw batch + the 404'd graded call (a spent request)
+    expect(r.comparisons?.[0]).toMatchObject({ resolved: true, raw: { justtcgNm: 11 } })
+    expect(r.comparisons?.[0].graded.justtcg).toEqual([])
+  })
+
   it('selectProducts falls back to the TCGplayer-raw pool when a game has no Scrydex tiers (UAT)', async () => {
     const db = probeDb({ tiered: false }) as any
     const products = await selectProducts(db, { sample: { perGame: 1, games: ['Pokemon'] } })

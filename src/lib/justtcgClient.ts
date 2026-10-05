@@ -166,7 +166,12 @@ export async function justtcgFetch<T = unknown>(env: Env, path: string, opts: Fe
   const text = await res.text()
   let body: unknown = null
   try { body = text ? JSON.parse(text) : null } catch { body = null }
-  const errBody = (body ?? {}) as { error?: string; code?: string }
+  // v1 errors are `{ error, code }`; v2 errors are RFC 7807 problem+json `{ type, title, status,
+  // detail, code }` (observed 2026-10-05: a v2 graded lookup answered 404 with a problem body) —
+  // fold both into one { error, code } view so the recorded message carries the reason.
+  const raw = (body ?? {}) as { error?: string; code?: string; title?: string; detail?: string }
+  const problemText = [raw.title, raw.detail].filter(Boolean).join(': ')
+  const errBody = { error: raw.error ?? (problemText || undefined), code: raw.code }
 
   if (res.status === 401 || res.status === 403) {
     throw new JustTcgError('auth', `${opts.jobName}: JustTCG ${res.status} ${errBody.code ?? ''} ${errBody.error ?? ''}`.trim(), res.status, errBody.code ?? null)

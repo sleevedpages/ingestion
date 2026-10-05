@@ -72,13 +72,24 @@ const TIER_EXISTS = `EXISTS (SELECT 1 FROM prices p WHERE p.product_id = pr.id A
 const TCG_RAW_EXISTS = `EXISTS (SELECT 1 FROM prices p WHERE p.product_id = pr.id AND p.source = 'tcgplayer' AND p.is_graded = 0 AND p.grade IS NULL)`
 const ANY_RAW_EXISTS = `EXISTS (SELECT 1 FROM prices p WHERE p.product_id = pr.id AND p.is_graded = 0 AND p.grade IS NULL)`
 
-function sampleFromProd(perGame, noTcg) {
+const GRADED_EXISTS = `EXISTS (SELECT 1 FROM prices p WHERE p.product_id = pr.id AND p.is_graded = 1 AND p.is_signed = 0 AND p.is_error = 0)`
+
+function sampleFromProd(perGame, noTcg, gradedPerGame = 0) {
   const picked = []
+  const seen = new Set()
+  const push = (r, pool) => { if (seen.has(r.id)) return; seen.add(r.id); picked.push({ ...r, pool }) }
   for (const g of PROD_GAMES) {
+    // The GRADED pool first (observed 2026-10-05: a random common has no graded market anywhere —
+    // JustTCG answers 404 — so the graded comparison needs products that HOLD a graded row of ours).
+    if (gradedPerGame) {
+      const rows = prodSelect(`${PRODUCT_SELECT} WHERE cg.name = '${g}' AND pr.product_kind = 'card' AND ${GRADED_EXISTS} ORDER BY RANDOM() LIMIT ${gradedPerGame}`)
+      for (const r of rows) push(r, 'our_graded')
+      console.error(`  sampled ${rows.length} ${g} (our_graded)`)
+    }
     let rows = prodSelect(`${PRODUCT_SELECT} WHERE cg.name = '${g}' AND pr.product_kind = 'card' AND ${TIER_EXISTS} ORDER BY RANDOM() LIMIT ${perGame}`)
     let pool = 'scrydex_tiers'
     if (!rows.length) { rows = prodSelect(`${PRODUCT_SELECT} WHERE cg.name = '${g}' AND pr.product_kind = 'card' AND ${TCG_RAW_EXISTS} ORDER BY RANDOM() LIMIT ${perGame}`); pool = 'tcgplayer_raw' }
-    for (const r of rows) picked.push({ ...r, pool })
+    for (const r of rows) push(r, pool)
     console.error(`  sampled ${rows.length} ${g} (${pool})`)
   }
   if (noTcg) {
@@ -178,7 +189,7 @@ if (has('--resume')) {
   first = { state: JSON.parse(readFileSync(arg('--resume', STATE_FILE), 'utf8')) }
 } else if (arg('--sample-from') === 'prod') {
   console.error('  sampling on PROD (read-only SELECTs)…')
-  picked = sampleFromProd(Number(arg('--per-game', 10)), Number(arg('--no-tcgplayer', 0)))
+  picked = sampleFromProd(Number(arg('--per-game', 10)), Number(arg('--no-tcgplayer', 0)), Number(arg('--graded-per-game', 0)))
   const tcgIds = picked.map(p => p.tcgplayer_product_id).filter(n => n != null)
   writeFileSync('justtcg-probe-sample.json', JSON.stringify(picked, null, 2), 'utf8')
   console.error(`  ${picked.length} products picked (${tcgIds.length} with a TCGplayer id) → justtcg-probe-sample.json`)
@@ -196,6 +207,7 @@ const data = await runLoop(first)
 writeFileSync(OUT, JSON.stringify(data, null, 2), 'utf8')
 console.error(`  ✓ done — run ${data.runId}, ${data.calls.total} calls, JustTCG reports ${JSON.stringify(data.calls.justtcgReported ?? {})}`)
 console.error(`    full response → ${OUT}${data.persisted ? ` · R2 ${data.persisted.key} (${data.persisted.bytes} B)` : ` · NOT persisted (${data.persistNote ?? 'no R2'})`}`)
+if (data.gradedNotFound404) console.error(`    graded lookups answering 404 (read as "no graded variants"): ${data.gradedNotFound404}${data.gradedNotFoundDetail ? ` — first body: ${data.gradedNotFoundDetail}` : ''}`)
 if (data.errors?.length) console.error(`    errors: ${data.errors.map(e => `${e.kind}: ${e.message}`).join(' | ')}`)
 if (has('--json')) { console.log(JSON.stringify(data, null, 2)); process.exit(0) }
 
