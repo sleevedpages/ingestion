@@ -1147,6 +1147,85 @@ cron and looping to finish tripped the limit. Now:
     foreign price daily. Corrective sweep (operator-gated, dry-run default, **never run,
     never crontab'd**): `scripts/audit-pc-language-mismatch.mjs` — clears the stamps and
     deletes the stale `source='pricecharting'` rows, both of which regenerate.
+  - **⚠️ ONE PRICE PER PRODUCT — twin rows yield at the WRITE (2026-10-06c, `fix/pricecharting-twin-rows`).**
+    PriceCharting splits a printing TCGplayer keeps as ONE product into several rows sharing one tcg-id
+    (`Flareon #13` + `Flareon [Reverse Holo] #13`; plain + `[1st Edition]`; `[Holo]` + `[Reverse Holo]`;
+    Magic plain + `[Foil]`, `[Extended Art]` + `[Extended Art Foil]`). The writer has no finish/edition
+    dimension, so every twin upserted the SAME price keys and the file's LAST row won — the tagged one,
+    since `[` sorts after `#` — for loose AND every graded bucket. Measured on the cached files (our R2,
+    no download): twin tcg-ids Pokémon 13,456 · Magic 33,687 · Yu-Gi-Oh 9,476 · One Piece 109. Prod
+    stored Flareon/Magikarp/Gyarados (tcgplayer 101437/101440/101441) at their Reverse Holo 4.69/3.31/5.36
+    instead of 1.43/1.90/1.99, and their Reverse Holo PSA 10 in the graded matrix. The same collision came
+    from map STAMPS made before the 2026-07-30 console scoping: KFC / Topps / Burger King / Oreo /
+    Japanese / Chinese "Pikachu #25" rows all stamped onto the English SV 151 Pikachu (2,318 Pokémon
+    products; the Oreo $12.00 was its price instead of $0.38).
+    - **The rule:** each product's price comes from ONE row — the lowest `twinRank()` among the rows of
+      the WHOLE FILE that the exact rungs (stamp, validated tcg-id — the shared `resolveExact()`)
+      resolve to it. Rank components, each outweighing everything after it: console LANGUAGE disagrees
+      with the product's set (+4000, `textLanguage`) · console does not corroborate the set (+2000,
+      `consoleCorroboratesSet`) · the PC `#number` disagrees with `products.number` (+1000) · the count
+      of words inside bracket tags (untagged 0 < `[Holo]` 1 < `[Reverse Holo]` 2; `[Shadowless]` beats
+      `[1st Edition]`; `[Prize Pack]` beats `[Prize Pack Cosmos Holo]`). A worse-ranked row still gets
+      its MAP upsert (the stamp stays — it IS a printing of that product, not a catalogue gap) but
+      writes NO price rows; counted `yieldedToTwin`. Rows that TIE all write and the file's last row
+      wins, exactly as before (≈116 Pokémon products, all bad-stamp-only groups — no row's console
+      matches the set; `scripts/audit-pc-language-mismatch.mjs` owns those).
+    - **Why at the write, not in the tcg-id rung (the Japanese branch's shape):** every prod twin is
+      already STAMPED, so rung 0 resolves it and the matcher never runs — measured: the whole
+      2026-10-06 Pokémon PROCESS has `matchedTcgId: 0`. A matcher-only yield would have changed
+      nothing in prod.
+    - **Why the whole file:** `processWindowFromBody` now loads the index + map BEFORE streaming and
+      reads the cached R2 object to EOF on every window — rows outside the window are only parsed and
+      fed to `noteTwinClaim()`, never written. So which row owns a product never depends on where a
+      window boundary falls. `reachedEof` is now "no data row past `windowEnd`" (the stream no longer
+      stops early). Cost: one R2 GET per window as before, plus the parse of the rest of the file.
+    - **Fuzzy / number-less** resolutions are bounded per window and cannot be pre-computed, so they do
+      not stake claims; a row they resolve still YIELDS to a better-ranked exact-rung owner. (In the
+      sims they never collided: tag words must appear in the candidate's name, so a tagged twin cannot
+      fuzzy-match the plain product.)
+    - **Measured (real code, cached CSVs + prod catalogue + prod stamps, read-only):** rows that yield /
+      loose values corrected / graded values corrected — Pokémon 16,900 / 12,473 / 73,103 · Magic
+      34,423 / 28,352 / 1,693 · Yu-Gi-Oh 8,577 / 7,626 / 39,640 · One Piece 288 / 108 / 422. Match counts
+      unchanged in every category.
+    - **Cleanup — the next PROCESS of each category self-corrects every key the owner writes** (the
+      owner now writes alone, over the stamp, so the stored twin value is overwritten). **What remains
+      stale:** a key ONLY a yielding twin carried (the owner's column is blank — e.g. the plain row has
+      no BGS 10 but the Reverse Holo did). Measured: Pokémon 4,284 keys / 3,098 products (8 loose) ·
+      Magic 10,864 / 5,588 (78 loose) · Yu-Gi-Oh 2,350 / 1,189 (0 loose) · One Piece 110 / 45. Their
+      `fetched_at` freezes. Operator-gated sweep, run per category only AFTER that category's first
+      post-deploy PROCESS has wrapped (dry-run the COUNT first; the 12 h margin is safe because one
+      product's keys are written in one sub-batch, seconds apart):
+      ```sql
+      -- swap COUNT(*) for DELETE once the count looks right; ? = 'pokemon-cards' | 'magic-cards' | …
+      SELECT COUNT(*) FROM prices
+      WHERE source = 'pricecharting'
+        AND product_id IN (SELECT canonical_product_id FROM pricecharting_products
+                           WHERE game_category = ? AND canonical_product_id IS NOT NULL
+                           GROUP BY canonical_product_id HAVING COUNT(*) > 1)
+        AND fetched_at < (SELECT MAX(p2.fetched_at) FROM prices p2
+                          WHERE p2.product_id = prices.product_id AND p2.source = 'pricecharting') - 43200;
+      ```
+    - ⚠️ **Yu-Gi-Oh `[1st Edition]`:** untagged = Unlimited, so a YGO product now carries its UNLIMITED
+      PriceCharting price where it used to carry the 1st Edition one (8,866 pairs). Consistent with the
+      rule (the base printing owns) — but for modern YGO the 1st Edition is the common printing. A per-
+      game preference (or Option B: the tag written as `finish` for loose rows) is the follow-up if the
+      operator wants 1st Edition. Option B was NOT taken because Content's raw ladder reads PriceCharting
+      loose as `MAX(value)` across finishes (`RAW_PARTS_COLUMNS_SQL` `pc`) and as the newest row in
+      `partsFromRawRows` — a Reverse Holo row with `finish='reverseHolofoil'` would still win the
+      headline until Content gained a PriceCharting finish rung.
+    - **With the Pokémon Japan rung (`6042412`, merged to `main` first — PR #5):** the merge kept that
+      rung EXACTLY as deployed. It still sits in `matchRows` right after `resolveExact()` (stamp →
+      English tcg-id), still fires only for an id the English index does not hold, and keeps its
+      in-window `foreignYieldedToPlain` yield (a tagged foreign twin with an untagged sibling in the
+      window stays UNMATCHED — not stamped). The twin rule layers on top through the stamps: once a
+      foreign row is stamped it resolves through rung 0, stakes a claim (rank = tag words only — the
+      foreign products are not in `byId`, so the number/console terms are skipped), and a tagged twin
+      the in-window yield missed (a pair split by a window boundary, or stamped before) writes no
+      prices (`yieldedToTwin`). An unstamped foreign row does not stake a claim, so on the very first
+      pass a split pair can still fall back to the file's last row; the next PROCESS settles it.
+      Test: "a Japanese pair the in-window yield misses …".
+    - Tests: the `twin rows — one price per product` + `twinRank (pure)` describes in
+      `src/pricechartingIngest.test.ts`.
   - **Persisted mapping** → `pricecharting_products` (pc_id ↔ canonical product id). Re-runs re-match
     in memory (cheap + deterministic) and re-upsert prices on the same conflict keys (= the daily
     refresh, no dupes). **Unmatched rows are RECORDED** (`canonical_product_id IS NULL`), never silently
