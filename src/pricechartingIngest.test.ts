@@ -258,6 +258,105 @@ describe('processPriceChartingWindow', () => {
     expect(db._pcMap.get('pcB')?.canonical_product_id).toBe(8)
   })
 
+  // ── 2026-10-06b: Pokémon Japanese rows through the foreign sibling catalogue (category 85) ──
+  describe('Japanese rows → Pokémon Japan (tcg-id only, language-gated)', () => {
+    const JP_PRODUCTS: Product[] = [
+      ...PRODUCTS,
+      { id: 501, tcgplayer_product_id: 613779, name: "Alto Mare's Latias", number: '', category: 85, setName: '10th Movie Commemoration Promo' },
+      { id: 502, tcgplayer_product_id: 700021, name: 'Blastoise EX - 021/087', number: '021/087', category: 85, setName: '20th Anniversary' },
+      { id: 503, tcgplayer_product_id: 700014, name: 'Cosmog (Mirror Holofoil)', number: '', category: 85, setName: '25th Anniversary Collection' },
+      // a Japanese product whose name + number collide with an English fuzzy candidate's
+      { id: 504, tcgplayer_product_id: 700058, name: 'Pikachu - 058/197', number: '058/197', category: 85, setName: 'Japanese set' },
+      // the SAME tcg-id as an English product — the English index owns it
+      { id: 505, tcgplayer_product_id: 12345, name: 'Charizard ex', number: '125/197', category: 85, setName: 'Shadow' },
+      // one TCGplayer product, two PriceCharting rows (unlimited + 1st Edition)
+      { id: 506, tcgplayer_product_id: 700006, name: 'Charizard - 006/087', number: '006/087', category: 85, setName: 'Rocket Gang' },
+    ]
+    const jpCsv = () => [
+      HEADER,
+      // J1 — Japanese console + id in cat 85 + names agree → matched, raw + graded written
+      row({ id: 'pcJ1', 'console-name': 'Pokemon Japanese 10th Movie Commemoration Promo', 'product-name': "Alto Mare's Latias [Holo]",
+            'loose-price': '$95.00', 'graded-price': '$164.00', 'manual-only-price': '$540.00', genre: 'Pokemon Card', 'tcg-id': '613779' }),
+      // J2 — the " - 021/087" name: matched only because the suffix is stripped
+      row({ id: 'pcJ2', 'console-name': 'Pokemon Japanese 20th Anniversary', 'product-name': 'Blastoise EX [1st Edition] #21',
+            'loose-price': '$40.00', genre: 'Pokemon Card', 'tcg-id': '700021' }),
+      // J3 — finish disagrees (Reverse Holo vs Mirror Holofoil) → rejected, stays unmatched
+      row({ id: 'pcJ3', 'console-name': 'Pokemon Japanese 25th Anniversary Collection', 'product-name': 'Cosmog [Reverse Holo] #14',
+            'loose-price': '$3.00', genre: 'Pokemon Card', 'tcg-id': '700014' }),
+      // J4 — a CHINESE console carrying a cat-85 id → language gate rejects
+      row({ id: 'pcJ4', 'console-name': 'Pokemon Chinese Gem Pack', 'product-name': "Alto Mare's Latias #5",
+            'loose-price': '$7.00', genre: 'Pokemon Card', 'tcg-id': '613779' }),
+      // J5 — an ENGLISH console carrying a cat-85 id → language gate rejects
+      row({ id: 'pcJ5', 'console-name': 'Pokemon Promo', 'product-name': "Alto Mare's Latias",
+            'loose-price': '$8.00', genre: 'Pokemon Card', 'tcg-id': '613779' }),
+      // J6 — Japanese row WITHOUT a tcg-id → never reaches the Japanese catalogue (fuzzy is English-only)
+      row({ id: 'pcJ6', 'console-name': 'Pokemon Japanese Obsidian Flames', 'product-name': 'Pikachu #58',
+            'loose-price': '$9.00', genre: 'Pokemon Card', 'tcg-id': '' }),
+      // J7 — Japanese row whose id belongs to an ENGLISH product → the English rung's behaviour, unchanged
+      row({ id: 'pcJ7', 'console-name': 'Pokemon Japanese Promo', 'product-name': 'Charizard ex #125',
+            'loose-price': '$11.00', genre: 'Pokemon Card', 'tcg-id': '12345' }),
+      // J8 + J9 — the unlimited row and its [1st Edition] twin share one tcg-id; the tagged one sorts LAST
+      row({ id: 'pcJ8', 'console-name': 'Pokemon Japanese Rocket Gang', 'product-name': 'Charizard #6',
+            'loose-price': '$50.00', 'manual-only-price': '$400.00', genre: 'Pokemon Card', 'tcg-id': '700006' }),
+      row({ id: 'pcJ9', 'console-name': 'Pokemon Japanese Rocket Gang', 'product-name': 'Charizard [1st Edition] #6',
+            'loose-price': '$90.00', 'manual-only-price': '$900.00', genre: 'Pokemon Card', 'tcg-id': '700006' }),
+    ].join('\n')
+
+    async function runJp() {
+      const r2 = makeR2(); const key = rawKeyFor('pokemon-cards', today())
+      r2._store.set(key, jpCsv())
+      const db = makeFakeDb(JP_PRODUCTS)
+      const c = await processPriceChartingWindow({ DB: db, IMAGES_BUCKET: r2 } as any, procMsg(key))
+      return { c, db }
+    }
+
+    it('matches a Japanese row to its Pokémon Japan product by tcg-id, labelled tcg-id-foreign, raw + graded', async () => {
+      const { c, db } = await runJp()
+      expect(c.matchedTcgIdForeign).toBe(3)                        // J1 + J2 + J8
+      expect(db._pcMap.get('pcJ1')).toMatchObject({ canonical_product_id: 501, match_method: 'tcg-id-foreign' })
+      expect(db._pcMap.get('pcJ2')).toMatchObject({ canonical_product_id: 502, match_method: 'tcg-id-foreign' })
+      expect(db._prices.get('501|')).toBe(95)
+      expect(db._prices.get('501|Grade 9')).toBe(164)
+      expect(db._prices.get('501|PSA 10')).toBe(540)
+      expect(db._prices.get('502|')).toBe(40)
+    })
+
+    it('rejects a finish mismatch, a Chinese or English console on a Japanese id, and never fuzzes into Japan', async () => {
+      const { c, db } = await runJp()
+      for (const id of ['pcJ3', 'pcJ4', 'pcJ5']) expect(db._pcMap.get(id)?.canonical_product_id).toBeNull()
+      // J6 (no tcg-id, Japanese console) is NOT priced onto the Japanese Pikachu 504, and the
+      // English fuzzy pool's language gate keeps it off the English Pikachu 8 too.
+      expect(db._pcMap.get('pcJ6')?.canonical_product_id).toBeNull()
+      expect([...db._prices.keys()].some((k) => k.startsWith('504|'))).toBe(false)
+      expect(db._prices.has('503|')).toBe(false)
+      expect(c.unmatched).toBe(5)                                   // J3 J4 J5 J6 + J9 (yielded)
+    })
+
+    it('one price per product: a [1st Edition] twin yields to the untagged row, even sorted last', async () => {
+      const { c, db } = await runJp()
+      expect(c.foreignYieldedToPlain).toBe(1)                       // J9
+      expect(db._prices.get('506|')).toBe(50)                       // the unlimited price, not $90
+      expect(db._prices.get('506|PSA 10')).toBe(400)
+      expect(db._pcMap.get('pcJ8')).toMatchObject({ canonical_product_id: 506, match_method: 'tcg-id-foreign' })
+      expect(db._pcMap.get('pcJ9')?.canonical_product_id).toBeNull()
+      // …while a 1st-Edition-only card (J2: no untagged twin) still matches
+      expect(db._pcMap.get('pcJ2')?.canonical_product_id).toBe(502)
+    })
+
+    it('an id the English catalogue owns stays with the English product (the Japanese twin never shadows it)', async () => {
+      const { c, db } = await runJp()
+      expect(c.matchedTcgId).toBe(1)                                // J7 → English product 7, as before
+      expect(db._pcMap.get('pcJ7')).toMatchObject({ canonical_product_id: 7, match_method: 'tcg-id' })
+      expect([...db._prices.keys()].some((k) => k.startsWith('505|'))).toBe(false)
+    })
+
+    it('an English-only catalogue (no category-85 products) behaves exactly as before', async () => {
+      const { r2, key } = seedR2(); const db = makeFakeDb(PRODUCTS)
+      const c = await processPriceChartingWindow({ DB: db, IMAGES_BUCKET: r2 } as any, procMsg(key))
+      expect(c).toMatchObject({ matchedTcgId: 2, matchedTcgIdForeign: 0, matchedFuzzy: 1, unmatched: 1 })
+    })
+  })
+
   it('windows across invocations via the message offset — advances, then wraps at EOF', async () => {
     const { r2, key } = seedR2(); const db = makeFakeDb(PRODUCTS)
     const env = { DB: db, IMAGES_BUCKET: r2, PC_INGEST_MAX_ROWS: '2' } as any  // 2 of 4 rows per window

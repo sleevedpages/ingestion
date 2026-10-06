@@ -20,7 +20,49 @@ import {
   buildDownloadUrl,
   normalizeUpc,
   pcCategoryForTcgplayerCategoryId,
+  stripCollectorNumberSuffix,
+  CATEGORY_FOREIGN_TCGPLAYER_IDS,
+  CATEGORY_TCGPLAYER_IDS,
 } from './lib/pricechartingCsv.js'
+
+// ── Pokémon Japanese rows via the foreign sibling catalogue (2026-10-06b) ──────────
+describe('stripCollectorNumberSuffix (TCGplayer Pokémon Japan names)', () => {
+  it.each([
+    ['Blastoise EX - 021/087', 'Blastoise EX'],
+    ['Mew - 002/028 (Mirror Holofoil)', 'Mew (Mirror Holofoil)'],
+    ['Pikachu V-UNION - 025/028 (Top Left)', 'Pikachu V-UNION (Top Left)'],
+    ['Charizard ex - SV-P 101', 'Charizard ex - SV-P 101'],          // not a "<n>/<n>"-style tail
+    ['Pikachu - 001', 'Pikachu'],
+    ['Booster Box', 'Booster Box'],
+    ['Expansion Pack 20th Anniversary - Booster Box (1st Edition)', 'Expansion Pack 20th Anniversary - Booster Box (1st Edition)'],
+    ['', ''],
+  ])('%s → %s', (input, out) => {
+    expect(stripCollectorNumberSuffix(input)).toBe(out)
+  })
+
+  it('turns a real rejected tcg-id match into an accepted one (the measured failure shape)', () => {
+    const row = { 'product-name': 'Blastoise EX [1st Edition] #21', 'console-name': 'Pokemon Japanese 20th Anniversary' }
+    expect(validateTcgIdMatch(row, { name: 'Blastoise EX - 021/087' })).toBe(false)
+    expect(validateTcgIdMatch(row, { name: stripCollectorNumberSuffix('Blastoise EX - 021/087') })).toBe(true)
+  })
+
+  it('keeps the qualifier check: a different finish still rejects', () => {
+    const row = { 'product-name': 'Cosmog [Reverse Holo] #14', 'console-name': 'Pokemon Japanese 25th Anniversary Collection' }
+    expect(validateTcgIdMatch(row, { name: stripCollectorNumberSuffix('Cosmog (Mirror Holofoil)') })).toBe(false)
+  })
+})
+
+describe('CATEGORY_FOREIGN_TCGPLAYER_IDS', () => {
+  it('maps the Pokémon Cards CSV to Pokémon Japan (85) as Japanese, and nothing else', () => {
+    expect(CATEGORY_FOREIGN_TCGPLAYER_IDS).toEqual({ 'pokemon-cards': { 85: 'japanese' } })
+    expect(textLanguage(norm('Pokemon Japanese Scarlet & Violet 151'))).toBe('japanese')
+  })
+
+  it('leaves the fuzzy pool and the UPC reverse map English-only (85 is NOT a primary category)', () => {
+    expect(CATEGORY_TCGPLAYER_IDS['pokemon-cards']).toEqual([3])
+    expect(pcCategoryForTcgplayerCategoryId(85)).toBeNull()
+  })
+})
 
 // ── Dollar parsing → cents ─────────────────────────────────────────────────────
 describe('parseDollarsToCents', () => {
