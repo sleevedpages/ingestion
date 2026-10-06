@@ -716,6 +716,11 @@ Scrydex expansion id (e.g. `OP09`, `GD04`), which is what `q=expansion.id:` matc
 > 'scrydex_drain_disabled'` in the run-log counts; the WATCHED scope still hands back EVERY watched expansion so Card Watch
 > alerts keep evaluating against the current ladder headline (an unmoved card compares equal and never fires). The drain
 > code stays dormant one release; the Scrydex plan cancellation is the operator's step, last — code never touches it.
+> **➕ SUPERSEDED 2026-10-06 (operator): Scrydex is KEPT on its LOWEST plan, never cancelled** — the only graded source for
+> Lorcana / Gundam / Riftbound (no PriceCharting CSV, no JustTCG graded) and the last ladder rung for every game. Leave
+> `scrydex_drain_enabled = '1'` (the drain writes raw AND graded rows); the switch remains as an emergency stop only. On the
+> downgrade, `SCRYDEX_MONTHLY_LIMIT` = the new plan's TRUE cap in BOTH repos BEFORE it takes effect (30-day use 1,777 credits,
+> ~1,530 of them the Pokémon drain; the guard blocks at cap − 500).
 - Scrydex sends webhooks to Content app at `/api/webhooks/scrydex`; the handler is instant —
   only logs to `scrydex_webhook_log` (status `'pending'`).
 - **The worker drains pending rows ONCE DAILY (`0 4 * * *`)** via `processPendingWebhooks()` — moved
