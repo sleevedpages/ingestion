@@ -13,6 +13,7 @@
 //   0 10 * * *   value-snapshots   → runValueSnapshots()             (valueSnapshots.ts)
 //   0 9  * * *   trade-talk-image-reap → runTradeTalkImageReap()     (tradeTalkImageReap.ts)
 //   0 9  * * *   child-consent-reap    → runChildConsentReap()       (childConsentReap.ts — same slot, own promise)
+//   0 7  * * *   justtcg-refresh       → runJustTcgRefresh()         (justtcgIngest.ts — the news-poll slot, own promise)
 //
 // PriceCharting is FETCH/PROCESS-split (pricechartingIngest.ts): the daily cron FETCHes one
 // rotated category's CSV → R2 (the only download; arms the 10-min cooldown) then the dedicated
@@ -45,6 +46,7 @@ export type AdminJobId =
   | 'trade-talk-image-reap'    // POST Content's /api/internal/trade-talk-images/reap — delete EXPIRED trade-talk photos (Content mig 0137). HOUSEKEEPING, not the privacy control: Content's read path already 404s an expired photo
   | 'child-consent-reap'       // POST Content's /api/internal/child-consents/reap — delete child accounts whose parental consent was never confirmed within 7 days (Content child-accounts S2). HOUSEKEEPING: Content refuses an expired consent at read time
   | 'price-archive-capture'    // LOOP Content's /api/internal/price-archive/run until done — archive the whole prices table into the private R2 bucket, one partition per local day (Price Index Capture Phase 1). This worker prices/archives nothing
+  | 'justtcg-refresh'          // the nightly JustTCG tier lane (the switch session, 2026-10-06) — JustTCG raw batches → prices source='justtcg'; self-gates on app_config justtcg_ingest_enabled
   | 'price-daily-capture';     // LOOP Content's /api/internal/price-daily/run until done — project our own R2 daily captures into price_daily in the dedicated price DB (Price Index Capture Phase 2, capture_method='daily_capture'). This worker projects nothing
 
 export const ADMIN_JOB_IDS: AdminJobId[] = [
@@ -62,6 +64,7 @@ export const ADMIN_JOB_IDS: AdminJobId[] = [
   'child-consent-reap',
   'price-archive-capture',
   'price-daily-capture',
+  'justtcg-refresh',
 ];
 
 export function isAdminJobId(value: unknown): value is AdminJobId {
@@ -141,6 +144,7 @@ const JOB_LOCK_TTL_SECONDS: Record<AdminJobId, number> = {
   'trade-talk-image-reap': 300,  // one HTTP POST to Content (capped at 60s); short backstop
   'child-consent-reap': 300,     // one HTTP POST to Content (capped at 60s); short backstop
   'price-archive-capture': 1800, // a LOOP of bounded Content batches (~1.33M rows/day); generous backstop
+  'justtcg-refresh': 600,        // ~10 JustTCG batch calls for the owned/watched population; short backstop
   'price-daily-capture': 1800,   // a LOOP of bounded Content batches (~69 parts/day; the catch-up spans days); generous backstop
 };
 

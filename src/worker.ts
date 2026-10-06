@@ -1,6 +1,6 @@
 import { runIngestion, processGroupMessage, type IngestionConfig, type SyncGroupMessage } from './ingestion/index.js';
 import { runMirrorJob, getPendingCards, uploadCardImage } from './image-mirror.js';
-import { processPendingWebhooks, refreshCardPrices } from './scrydexProcessor.js';
+import { refreshCardPrices } from './scrydexProcessor.js';
 import { enrichCard, type EnrichClass } from './scrydexEnrich.js';
 import { syncSingleSet } from './scrydexSyncSet.js';
 import { syncScrydexSetMappings } from './scrydexSetMapping.js';
@@ -40,6 +40,9 @@ import { runPriceDailyCapture } from './priceDailyCapture.js';
 import { runEbayOrderSync } from './ebayOrderSync.js';
 import { runWatchAlerts } from './watchAlerts.js';
 import { runJustTcgProbe, runJustTcgDiag, probeNotConfigured, type ProbeBody, type DiagBody } from './justtcgProbe.js';
+import { runJustTcgRefresh, enrichJustTcgCard, justtcgIngestEnabled } from './justtcgIngest.js';
+import { justtcgConfigured } from './lib/justtcgClient.js';
+import { runScrydexDrainGated } from './scrydexDrainGate.js';
 import {
   ADMIN_JOB_IDS,
   isAdminJobId,
@@ -125,15 +128,19 @@ export interface Env {
   // stay < the lane's cron interval (WATCH_LANE_INTERVAL_HOURS) or watched prices freeze. See
   // scrydexProcessor.ts watchFreshnessSafeForLane.
   SCRYDEX_WATCH_FRESHNESS_HOURS?: string;  // default 4
-  // JustTCG EVALUATION PROBE (2026-10-05) — `POST /admin/justtcg-probe` only. The key is UAT-ONLY
-  // while the account is on the Free tier (non-commercial by its terms): `wrangler secret put
-  // JUSTTCG_API_KEY --env preview`. NEVER on prod, never in the Content app, never logged or
-  // returned; absent → 503 `justtcg_not_configured`. Nothing else reads it. See lib/justtcgClient.ts.
+  // JustTCG — the probe (2026-10-05, `POST /admin/justtcg-probe`) and, since the switch session
+  // (2026-10-06), the `prices` writer: the `justtcg-refresh` lane + `POST /justtcg/enrich-card`
+  // (src/justtcgIngest.ts). The account is on the STARTER plan (commercial use allowed), so the key
+  // now lives on BOTH workers — the prod one put BEFORE the worker deploy that reads it (secret
+  // before code). Never in the Content app, never logged, never returned; absent → 503
+  // `justtcg_not_configured` and the lane self-skips. Read by lib/justtcgClient.ts only.
   JUSTTCG_API_KEY?: string;
-  JUSTTCG_DAILY_CAP?: string;        // default 100 (Free) — the plan's daily request cap
-  JUSTTCG_DAILY_RESERVE?: string;    // default 10 — the KV counter refuses at cap − reserve
-  JUSTTCG_BATCH_SIZE?: string;       // default 20 (Free) — cards per POST /v1/cards request
-  JUSTTCG_MIN_INTERVAL_MS?: string;  // default 6500 — pacing under the 10/min Free limit
+  JUSTTCG_DAILY_CAP?: string;        // in-code default 100 (Free); [vars] set the Starter 1,000
+  JUSTTCG_DAILY_RESERVE?: string;    // in-code default 10 — the KV counter refuses at cap − reserve
+  JUSTTCG_BATCH_SIZE?: string;       // in-code default 20 (Free); [vars] set the Starter 100
+  JUSTTCG_MIN_INTERVAL_MS?: string;  // in-code default 12000 (Free-key caution); [vars] set the Starter pacing
+  JUSTTCG_LANE_ONVIEW_RESERVE?: string; // default 200 — calls the nightly lane leaves for on-view enrich
+  JUSTTCG_LANE_MAX_CALLS?: string;      // default 30 — raw batches per lane run (waitUntil safety)
   // The PRIVATE price-archive bucket (the Content app's PRICE_ARCHIVE: prod
   // `sleeved-pages-price-archive`, preview `…-uat`), bound here ONLY so the JustTCG probe can
   // persist its raw payloads under `probes/justtcg/…`. Deliberately NOT IMAGES_BUCKET, which is
@@ -486,7 +493,7 @@ export default {
 
       if (pathname === '/scrydex/process') {
         ctx.waitUntil(
-          runStage(env.DB, 'scrydex-drain', 'drain', () => processPendingWebhooks(env)).catch((err) =>
+          runStage(env.DB, 'scrydex-drain', 'drain', () => runScrydexDrainGated(env, 'daily')).catch((err) =>
             logger.error('Manual Scrydex process failed', { error: String(err) })
           )
         );
@@ -562,10 +569,18 @@ export default {
           return json({ ok: false, error: 'canonicalProductId (canonical products.id) is required' }, 400);
         }
         const allowed: EnrichClass[] = ['core', 'comps', 'history'];
-        const classes = (Array.isArray(body.classes) ? body.classes : [])
+        let classes = (Array.isArray(body.classes) ? body.classes : [])
           .filter((c): c is EnrichClass => (allowed as string[]).includes(c));
         if (classes.length === 0) {
           return json({ ok: false, error: 'classes must include at least one of core|comps|history' }, 400);
+        }
+        // The JustTCG switch (2026-10-06): with `justtcg_ingest_enabled = '1'` the condition tiers
+        // come from JustTCG, so the Scrydex `core` class NO-OPs here (Content already routes an
+        // on-view `core` to /justtcg/enrich-card; this also covers the admin bulk-enrich burn).
+        // `comps` / `history` are untouched by this switch.
+        if (classes.includes('core') && await justtcgIngestEnabled(env.DB)) {
+          classes = classes.filter(c => c !== 'core');
+          if (!classes.length) return json({ ok: true, skipped: 'core_retired', canonicalProductId });
         }
         const result = await enrichCard(env, { canonicalProductId, classes });
         return json(result, result.ok ? 200 : 502);
@@ -818,6 +833,40 @@ export default {
       }
     }
 
+    // POST /justtcg/enrich-card — the ON-VIEW JustTCG tier refresh (the switch session, 2026-10-06).
+    // Body { canonicalProductId }. Content's POST /api/cards/enrich (class `core`) proxies HERE —
+    // instead of the Scrydex core enrich — when `app_config.justtcg_ingest_enabled = '1'`, after
+    // its own 24 h freshness read. ONE raw JustTCG call for ONE product → `prices` source='justtcg'
+    // (tiers + the NM rung) + the `justtcg_tiers` freshness mark. BLOCKING (returns the counts).
+    // Order of refusals: the secret (401) → the key (503 justtcg_not_configured) → the ingest
+    // switch (409 justtcg_ingest_disabled — never writes while the operator has it off). See
+    // src/justtcgIngest.ts.
+    if (pathname === '/justtcg/enrich-card' && request.method === 'POST') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      if (!justtcgConfigured(env)) {
+        return json({ ok: false, error: 'justtcg_not_configured' }, 503);
+      }
+      if (!(await justtcgIngestEnabled(env.DB))) {
+        return json({ ok: false, error: 'justtcg_ingest_disabled' }, 409);
+      }
+      const body = await request.json().catch(() => ({})) as { canonicalProductId?: number | string };
+      const canonicalProductId = Number(body.canonicalProductId);
+      if (!Number.isInteger(canonicalProductId) || canonicalProductId < 1) {
+        return json({ ok: false, error: 'canonicalProductId (canonical products.id) is required' }, 400);
+      }
+      try {
+        const result = await enrichJustTcgCard(env, canonicalProductId);
+        return json(result, 200);
+      } catch (err) {
+        // A refused plan / a busy minute / a transient failure — the caller serves the rows it has.
+        logger.warn('justtcg enrich-card failed', { canonicalProductId, error: String(err) });
+        return json({ ok: false, error: String((err as Error)?.message ?? err).slice(0, 300), kind: (err as { kind?: string })?.kind ?? null }, 502);
+      }
+    }
+
     // POST /admin/justtcg-probe — the JustTCG EVALUATION PROBE (2026-10-05; UAT only while the
     // key is a Free-tier key). Measures JustTCG against the rows this database already holds:
     // ONE raw batch per 20 products (POST /v1/cards) + ONE graded-only call per product
@@ -929,6 +978,9 @@ export default {
       if (job === 'pricecharting-download' && !env.PRICECHARTING_TOKEN) {
         return json({ ok: false, error: 'PRICECHARTING_TOKEN not configured' }, 503);
       }
+      if (job === 'justtcg-refresh' && !justtcgConfigured(env)) {
+        return json({ ok: false, error: 'justtcg_not_configured' }, 503);
+      }
       // value-snapshots is the one job that calls OUT to Content, and there is deliberately no
       // fallback origin (a default would make the UAT worker write into the prod DB). Surface the
       // misconfiguration as a 503 here rather than letting the fire-and-forget run self-skip into
@@ -978,7 +1030,9 @@ export default {
                 await runWeeklyImagePipeline(env);
                 break;
               case 'scrydex-drain':
-                await runStage(env.DB, 'scrydex-drain', 'drain', () => processPendingWebhooks(env));
+                // Through the `scrydex_drain_enabled` gate (2026-10-06): switched off → a no-op
+                // whose run-log row says `skipped: 'scrydex_drain_disabled'`.
+                await runStage(env.DB, 'scrydex-drain', 'drain', () => runScrydexDrainGated(env, 'daily'));
                 break;
               case 'card-watch-drain': {
                 // Card Watch priority lane — the intraday watched-scope drain (Card Watch Session 1).
@@ -986,7 +1040,7 @@ export default {
                 // demand from the admin Ingestion Jobs panel or to seed/verify UAT (no cron in UAT).
                 // Session 3: fire the alert hook after the drain, exactly like the cron lane (the
                 // hook self-skips when CONTENT_APP_URL is unset — e.g. the UAT worker).
-                const res = await runStage(env.DB, 'card-watch-drain', 'drain', () => processPendingWebhooks(env, { scope: 'watched' }));
+                const res = await runStage(env.DB, 'card-watch-drain', 'drain', () => runScrydexDrainGated(env, 'watched'));
                 const refreshed = res?.refreshedExpansions ?? [];
                 if (refreshed.length) {
                   await runWatchAlerts(env, refreshed).catch((err) =>
@@ -995,6 +1049,12 @@ export default {
                 }
                 break;
               }
+              case 'justtcg-refresh':
+                // The nightly JustTCG tier lane on demand (the switch session, 2026-10-06). Same
+                // function as the 07:00 cron promise. Self-gates on app_config
+                // `justtcg_ingest_enabled` (off → a run-log row with skipped:'switch_off').
+                await runStage(env.DB, 'justtcg-refresh', 'refresh', () => runJustTcgRefresh(env));
+                break;
               case 'pricecharting-csv':
                 // PROCESS cached R2 file — NO download
                 await runStage(env.DB, 'pricecharting-csv', 'process', () => runPriceChartingProcess(env, category!));
@@ -1144,9 +1204,10 @@ export default {
   // Cron handler (each job can also be run on demand via POST /admin/run-job — see adminJobs.ts):
   //   "0 6 * * *"    — daily TCG (CSV) data sync                 → runIngestion (default case)
   //   "0 3 * * SUN"  — weekly image-mirror pipeline               → runWeeklyImagePipeline
-  //   "0 4 * * *"    — daily Scrydex webhook drain                → processPendingWebhooks
+  //   "0 4 * * *"    — daily Scrydex webhook drain                → runScrydexDrainGated (scrydex_drain_enabled)
   //   "0 5 * * *"    — daily PriceCharting FETCH (day-rotated cat) → runPriceChartingFetch (→ queue PROCESS)
   //   "0 7 * * *"    — daily News poll (DotGG RSS → news_items)    → runNewsPoll (PROD triggers only)
+  //                   + the JustTCG tier lane, same slot, own promise → runJustTcgRefresh (2026-10-06)
   async scheduled(
     event: ScheduledEvent,
     env: Env,
@@ -1171,7 +1232,7 @@ export default {
         // distinct expansion. Freshness (20h) < this 24h interval, so prices still advance.
         if (env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID) {
           ctx.waitUntil(
-            runStage(env.DB, 'scrydex-drain', 'drain', () => processPendingWebhooks(env)).catch((err) =>
+            runStage(env.DB, 'scrydex-drain', 'drain', () => runScrydexDrainGated(env, 'daily')).catch((err) =>
               logger.error('Scrydex webhook processing failed', { error: String(err) })
             )
           );
@@ -1198,7 +1259,10 @@ export default {
             (async () => {
               let refreshed: { gameSlug: string; expansion: string }[] = [];
               try {
-                const res = await runStage(env.DB, 'card-watch-drain', 'drain', () => processPendingWebhooks(env, { scope: 'watched' }));
+                // Through the `scrydex_drain_enabled` gate (2026-10-06): switched off, the drain makes
+                // no Scrydex call and hands back EVERY watched expansion so the alerts still evaluate
+                // off the current (TCGplayer-first) headline — see src/scrydexDrainGate.ts.
+                const res = await runStage(env.DB, 'card-watch-drain', 'drain', () => runScrydexDrainGated(env, 'watched'));
                 refreshed = res?.refreshedExpansions ?? [];
               } catch (err) {
                 logger.error('Card-watch drain failed', { error: String(err) });
@@ -1403,6 +1467,17 @@ export default {
         ctx.waitUntil(
           runStage(env.DB, 'news-poll', 'poll', () => runNewsPoll(env)).catch((err) =>
             logger.error('News poll failed', { error: String(err) })
+          )
+        );
+        // Same slot, SEPARATE promise (the 09:00 precedent — 07:00 was taken, so the JustTCG lane
+        // joins it rather than adding a 14th trigger): the nightly JustTCG tier refresh (the switch
+        // session, 2026-10-06). 07:00 sits after the 06:00 TCGCSV fan-out and before the 08:00
+        // anomaly scan. Self-gates on app_config `justtcg_ingest_enabled` (off → a run-log row with
+        // skipped:'switch_off'); no key → skipped:'not_configured'. A failure here never touches the
+        // news poll above. PROD ONLY (not in [env.preview.triggers]; UAT runs it via the admin job).
+        ctx.waitUntil(
+          runStage(env.DB, 'justtcg-refresh', 'refresh', () => runJustTcgRefresh(env)).catch((err) =>
+            logger.error('JustTCG refresh failed', { error: String(err) })
           )
         );
         break;
