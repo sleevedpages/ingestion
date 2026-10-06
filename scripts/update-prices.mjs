@@ -87,7 +87,8 @@ async function main() {
       console.log(
         `window [${data.windowStart}..${data.windowStart + data.rowsProcessed}) of ${data.key}${data.stale ? ' (STALE)' : ''}: ` +
         `tcg-id ${data.matchedTcgId} · fuzzy ${data.matchedFuzzy} · numberless ${data.matchedNumberless} · ` +
-        `pre-stamped ${data.matchedExisting} · unmatched ${data.unmatched} · prices ${data.pricesUpserted}` +
+        `pre-stamped ${data.matchedExisting} · yielded to twin ${data.yieldedToTwin ?? 0} · ` +
+        `unmatched ${data.unmatched} · prices ${data.pricesUpserted}` +
         (data.wrapped ? ' · EOF' : ` · cursorNext ${data.cursorNext} (run without --sync to finish via the queue)`),
       )
     } else {

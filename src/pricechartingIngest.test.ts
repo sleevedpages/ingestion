@@ -5,6 +5,7 @@ import {
   startPriceChartingProcessing,
   resolveProcessKey,
   rawKeyFor,
+  twinRank,
   R2_RAW_PREFIX,
   type PcProcessMessage,
 } from './pricechartingIngest.js'
@@ -258,6 +259,131 @@ describe('processPriceChartingWindow', () => {
     expect(db._pcMap.get('pcB')?.canonical_product_id).toBe(8)
   })
 
+  // ── 2026-10-06b: Pokémon Japanese rows through the foreign sibling catalogue (category 85) ──
+  describe('Japanese rows → Pokémon Japan (tcg-id only, language-gated)', () => {
+    const JP_PRODUCTS: Product[] = [
+      ...PRODUCTS,
+      { id: 501, tcgplayer_product_id: 613779, name: "Alto Mare's Latias", number: '', category: 85, setName: '10th Movie Commemoration Promo' },
+      { id: 502, tcgplayer_product_id: 700021, name: 'Blastoise EX - 021/087', number: '021/087', category: 85, setName: '20th Anniversary' },
+      { id: 503, tcgplayer_product_id: 700014, name: 'Cosmog (Mirror Holofoil)', number: '', category: 85, setName: '25th Anniversary Collection' },
+      // a Japanese product whose name + number collide with an English fuzzy candidate's
+      { id: 504, tcgplayer_product_id: 700058, name: 'Pikachu - 058/197', number: '058/197', category: 85, setName: 'Japanese set' },
+      // the SAME tcg-id as an English product — the English index owns it
+      { id: 505, tcgplayer_product_id: 12345, name: 'Charizard ex', number: '125/197', category: 85, setName: 'Shadow' },
+      // one TCGplayer product, two PriceCharting rows (unlimited + 1st Edition)
+      { id: 506, tcgplayer_product_id: 700006, name: 'Charizard - 006/087', number: '006/087', category: 85, setName: 'Rocket Gang' },
+    ]
+    const jpCsv = () => [
+      HEADER,
+      // J1 — Japanese console + id in cat 85 + names agree → matched, raw + graded written
+      row({ id: 'pcJ1', 'console-name': 'Pokemon Japanese 10th Movie Commemoration Promo', 'product-name': "Alto Mare's Latias [Holo]",
+            'loose-price': '$95.00', 'graded-price': '$164.00', 'manual-only-price': '$540.00', genre: 'Pokemon Card', 'tcg-id': '613779' }),
+      // J2 — the " - 021/087" name: matched only because the suffix is stripped
+      row({ id: 'pcJ2', 'console-name': 'Pokemon Japanese 20th Anniversary', 'product-name': 'Blastoise EX [1st Edition] #21',
+            'loose-price': '$40.00', genre: 'Pokemon Card', 'tcg-id': '700021' }),
+      // J3 — finish disagrees (Reverse Holo vs Mirror Holofoil) → rejected, stays unmatched
+      row({ id: 'pcJ3', 'console-name': 'Pokemon Japanese 25th Anniversary Collection', 'product-name': 'Cosmog [Reverse Holo] #14',
+            'loose-price': '$3.00', genre: 'Pokemon Card', 'tcg-id': '700014' }),
+      // J4 — a CHINESE console carrying a cat-85 id → language gate rejects
+      row({ id: 'pcJ4', 'console-name': 'Pokemon Chinese Gem Pack', 'product-name': "Alto Mare's Latias #5",
+            'loose-price': '$7.00', genre: 'Pokemon Card', 'tcg-id': '613779' }),
+      // J5 — an ENGLISH console carrying a cat-85 id → language gate rejects
+      row({ id: 'pcJ5', 'console-name': 'Pokemon Promo', 'product-name': "Alto Mare's Latias",
+            'loose-price': '$8.00', genre: 'Pokemon Card', 'tcg-id': '613779' }),
+      // J6 — Japanese row WITHOUT a tcg-id → never reaches the Japanese catalogue (fuzzy is English-only)
+      row({ id: 'pcJ6', 'console-name': 'Pokemon Japanese Obsidian Flames', 'product-name': 'Pikachu #58',
+            'loose-price': '$9.00', genre: 'Pokemon Card', 'tcg-id': '' }),
+      // J7 — Japanese row whose id belongs to an ENGLISH product → the English rung's behaviour, unchanged
+      row({ id: 'pcJ7', 'console-name': 'Pokemon Japanese Promo', 'product-name': 'Charizard ex #125',
+            'loose-price': '$11.00', genre: 'Pokemon Card', 'tcg-id': '12345' }),
+      // J8 + J9 — the unlimited row and its [1st Edition] twin share one tcg-id; the tagged one sorts LAST
+      row({ id: 'pcJ8', 'console-name': 'Pokemon Japanese Rocket Gang', 'product-name': 'Charizard #6',
+            'loose-price': '$50.00', 'manual-only-price': '$400.00', genre: 'Pokemon Card', 'tcg-id': '700006' }),
+      row({ id: 'pcJ9', 'console-name': 'Pokemon Japanese Rocket Gang', 'product-name': 'Charizard [1st Edition] #6',
+            'loose-price': '$90.00', 'manual-only-price': '$900.00', genre: 'Pokemon Card', 'tcg-id': '700006' }),
+    ].join('\n')
+
+    async function runJp() {
+      const r2 = makeR2(); const key = rawKeyFor('pokemon-cards', today())
+      r2._store.set(key, jpCsv())
+      const db = makeFakeDb(JP_PRODUCTS)
+      const c = await processPriceChartingWindow({ DB: db, IMAGES_BUCKET: r2 } as any, procMsg(key))
+      return { c, db }
+    }
+
+    it('matches a Japanese row to its Pokémon Japan product by tcg-id, labelled tcg-id-foreign, raw + graded', async () => {
+      const { c, db } = await runJp()
+      expect(c.matchedTcgIdForeign).toBe(3)                        // J1 + J2 + J8
+      expect(db._pcMap.get('pcJ1')).toMatchObject({ canonical_product_id: 501, match_method: 'tcg-id-foreign' })
+      expect(db._pcMap.get('pcJ2')).toMatchObject({ canonical_product_id: 502, match_method: 'tcg-id-foreign' })
+      expect(db._prices.get('501|')).toBe(95)
+      expect(db._prices.get('501|Grade 9')).toBe(164)
+      expect(db._prices.get('501|PSA 10')).toBe(540)
+      expect(db._prices.get('502|')).toBe(40)
+    })
+
+    it('rejects a finish mismatch, a Chinese or English console on a Japanese id, and never fuzzes into Japan', async () => {
+      const { c, db } = await runJp()
+      for (const id of ['pcJ3', 'pcJ4', 'pcJ5']) expect(db._pcMap.get(id)?.canonical_product_id).toBeNull()
+      // J6 (no tcg-id, Japanese console) is NOT priced onto the Japanese Pikachu 504, and the
+      // English fuzzy pool's language gate keeps it off the English Pikachu 8 too.
+      expect(db._pcMap.get('pcJ6')?.canonical_product_id).toBeNull()
+      expect([...db._prices.keys()].some((k) => k.startsWith('504|'))).toBe(false)
+      expect(db._prices.has('503|')).toBe(false)
+      expect(c.unmatched).toBe(5)                                   // J3 J4 J5 J6 + J9 (yielded)
+    })
+
+    it('one price per product: a [1st Edition] twin yields to the untagged row, even sorted last', async () => {
+      const { c, db } = await runJp()
+      expect(c.foreignYieldedToPlain).toBe(1)                       // J9
+      expect(db._prices.get('506|')).toBe(50)                       // the unlimited price, not $90
+      expect(db._prices.get('506|PSA 10')).toBe(400)
+      expect(db._pcMap.get('pcJ8')).toMatchObject({ canonical_product_id: 506, match_method: 'tcg-id-foreign' })
+      expect(db._pcMap.get('pcJ9')?.canonical_product_id).toBeNull()
+      // …while a 1st-Edition-only card (J2: no untagged twin) still matches
+      expect(db._pcMap.get('pcJ2')?.canonical_product_id).toBe(502)
+    })
+
+    it('a Japanese pair the in-window yield misses (split by a window boundary, or already stamped) settles at the write', async () => {
+      // Window boundary between J8 (row 7) and J9 (row 8): J9's window holds no untagged sibling,
+      // so the matcher's in-window yield cannot fire — J8's stamp from the previous window makes it
+      // the product's owner, and the write-time twin rule holds J9's prices back.
+      const r2 = makeR2(); const key = rawKeyFor('pokemon-cards', today()); r2._store.set(key, jpCsv())
+      const db = makeFakeDb(JP_PRODUCTS)
+      const env = { DB: db, IMAGES_BUCKET: r2, PC_INGEST_MAX_ROWS: '8' } as any
+      const w1 = await processPriceChartingWindow(env, procMsg(key, 0))
+      const w2 = await processPriceChartingWindow(env, procMsg(key, w1.cursorNext))
+      expect(w2.wrapped).toBe(true)
+      expect(w2.foreignYieldedToPlain).toBe(0)
+      expect(w2.yieldedToTwin).toBe(1)                              // J9
+      expect(db._prices.get('506|')).toBe(50)
+      expect(db._prices.get('506|PSA 10')).toBe(400)
+
+      // Both rows already stamped (what a split leaves behind): rung 0 resolves both, and the
+      // write-time rule keeps the unlimited price.
+      const db2 = makeFakeDb(JP_PRODUCTS)
+      db2._pcMap.set('pcJ8', { canonical_product_id: 506, match_method: 'tcg-id-foreign', upc: null })
+      db2._pcMap.set('pcJ9', { canonical_product_id: 506, match_method: 'tcg-id-foreign', upc: null })
+      const c = await processPriceChartingWindow({ DB: db2, IMAGES_BUCKET: r2 } as any, procMsg(key))
+      expect(c.yieldedToTwin).toBe(1)
+      expect(db2._prices.get('506|')).toBe(50)
+      expect(db2._prices.get('506|PSA 10')).toBe(400)
+    })
+
+    it('an id the English catalogue owns stays with the English product (the Japanese twin never shadows it)', async () => {
+      const { c, db } = await runJp()
+      expect(c.matchedTcgId).toBe(1)                                // J7 → English product 7, as before
+      expect(db._pcMap.get('pcJ7')).toMatchObject({ canonical_product_id: 7, match_method: 'tcg-id' })
+      expect([...db._prices.keys()].some((k) => k.startsWith('505|'))).toBe(false)
+    })
+
+    it('an English-only catalogue (no category-85 products) behaves exactly as before', async () => {
+      const { r2, key } = seedR2(); const db = makeFakeDb(PRODUCTS)
+      const c = await processPriceChartingWindow({ DB: db, IMAGES_BUCKET: r2 } as any, procMsg(key))
+      expect(c).toMatchObject({ matchedTcgId: 2, matchedTcgIdForeign: 0, matchedFuzzy: 1, unmatched: 1 })
+    })
+  })
+
   it('windows across invocations via the message offset — advances, then wraps at EOF', async () => {
     const { r2, key } = seedR2(); const db = makeFakeDb(PRODUCTS)
     const env = { DB: db, IMAGES_BUCKET: r2, PC_INGEST_MAX_ROWS: '2' } as any  // 2 of 4 rows per window
@@ -464,6 +590,154 @@ describe('number-less set-corroborated matching (One Piece DON!!s)', () => {
     expect(db._pcMap.get('pcMINT')).toEqual({ canonical_product_id: 500, match_method: 'minted', upc: null })
     expect(db._prices.get('500|')).toBe(12)
     expect(db._prices.get('500|PSA 10')).toBe(99)
+  })
+})
+
+// ── One price per product: PriceCharting twin rows (2026-10-06c) ────────────────
+describe('twin rows — one price per product', () => {
+  // Real prod case (tcgplayer_product_id 101437): PC splits the printing TCGplayer keeps as ONE
+  // product into "Flareon #13" + "Flareon [Reverse Holo] #13", both carrying tcg-id 101437. Before
+  // the fix the tagged row (later in the file) overwrote every key: prod stored 4.69 (Reverse Holo)
+  // instead of 1.43, and the Reverse Holo PSA 10 in the graded matrix.
+  const FLAREON: Product = { id: 16632, tcgplayer_product_id: 101437, name: 'Flareon', number: '13/98',
+    category: 3, setName: 'XY - Ancient Origins' }
+  const plain = row({ id: '959032', 'console-name': 'Pokemon Ancient Origins', 'product-name': 'Flareon #13',
+    'loose-price': '$1.43', 'manual-only-price': '$41.14', genre: 'Pokemon Card', 'tcg-id': '101437' })
+  const reverse = row({ id: '959129', 'console-name': 'Pokemon Ancient Origins', 'product-name': 'Flareon [Reverse Holo] #13',
+    'loose-price': '$4.69', 'manual-only-price': '$451.76', 'bgs-10-price': '$587.00', genre: 'Pokemon Card', 'tcg-id': '101437' })
+
+  async function run(lines: string[], products: Product[], env: Record<string, string> = {}, seed?: (db: ReturnType<typeof makeFakeDb>) => void) {
+    const r2 = makeR2(); const key = rawKeyFor('pokemon-cards', today()); r2._store.set(key, [HEADER, ...lines].join('\n'))
+    const db = makeFakeDb(products); seed?.(db)
+    const counts: Awaited<ReturnType<typeof processPriceChartingWindow>>[] = []
+    for (let offset = 0; ;) {
+      const c = await processPriceChartingWindow({ DB: db, IMAGES_BUCKET: r2, ...env } as any, procMsg(key, offset))
+      counts.push(c)
+      if (c.wrapped) break
+      offset = c.cursorNext
+    }
+    return { db, counts, yielded: counts.reduce((s, c) => s + c.yieldedToTwin, 0) }
+  }
+
+  it('the untagged row owns the product: loose AND graded come from it; the tagged twin writes nothing', async () => {
+    const { db, yielded } = await run([plain, reverse], [FLAREON])
+    expect(yielded).toBe(1)
+    expect(db._prices.get('16632|')).toBe(1.43)
+    expect(db._prices.get('16632|PSA 10')).toBe(41.14)
+    expect(db._prices.has('16632|BGS 10')).toBe(false)   // only the twin priced it → never written
+    // The twin keeps its map stamp — it IS a printing of the product, not a catalogue gap.
+    expect(db._pcMap.get('959129')).toEqual({ canonical_product_id: 16632, match_method: 'tcg-id', upc: null })
+  })
+
+  it('already-STAMPED twins (rung 0, the prod state) self-correct on the next PROCESS', async () => {
+    // Every prod twin is already stamped, so the matcher never runs for it — the yield must sit at
+    // the write, not in the tcg-id rung. Seed the prod's wrong value too: the fix overwrites it.
+    const { db, counts } = await run([plain, reverse], [FLAREON], {}, (d) => {
+      d._pcMap.set('959032', { canonical_product_id: 16632, match_method: 'tcg-id', upc: null })
+      d._pcMap.set('959129', { canonical_product_id: 16632, match_method: 'tcg-id', upc: null })
+      d._prices.set('16632|', 4.69); d._prices.set('16632|PSA 10', 451.76)
+    })
+    expect(counts[0].matchedExisting).toBe(2)
+    expect(counts[0].matchedTcgId).toBe(0)
+    expect(counts[0].yieldedToTwin).toBe(1)
+    expect(db._prices.get('16632|')).toBe(1.43)
+    expect(db._prices.get('16632|PSA 10')).toBe(41.14)
+  })
+
+  it('ownership is decided over the WHOLE file — window boundaries never matter, in either order', async () => {
+    for (const lines of [[plain, reverse], [reverse, plain]]) {
+      const { db, counts, yielded } = await run(lines, [FLAREON], { PC_INGEST_MAX_ROWS: '1' })
+      expect(counts).toHaveLength(2)                    // one row per window
+      expect(counts[0].wrapped).toBe(false)
+      expect(yielded).toBe(1)
+      expect(db._prices.get('16632|')).toBe(1.43)
+      expect(db._prices.has('16632|BGS 10')).toBe(false)
+    }
+  })
+
+  it('with no untagged row, the row with fewer tag words owns ([Holo] over [Reverse Holo], [Shadowless] over [1st Edition])', async () => {
+    const products: Product[] = [
+      { id: 1, tcgplayer_product_id: 501, name: 'Kleavor', number: '086/189', category: 3, setName: 'SWSH10: Astral Radiance' },
+      { id: 2, tcgplayer_product_id: 502, name: 'Charizard', number: '4/102', category: 3, setName: 'Base Set (Shadowless)' },
+    ]
+    const { db, yielded } = await run([
+      row({ id: 'k1', 'console-name': 'Pokemon Astral Radiance', 'product-name': 'Kleavor [Holo] #86', 'loose-price': '$0.45', 'tcg-id': '501' }),
+      row({ id: 'k2', 'console-name': 'Pokemon Astral Radiance', 'product-name': 'Kleavor [Reverse Holo] #86', 'loose-price': '$0.99', 'tcg-id': '501' }),
+      row({ id: 'c1', 'console-name': 'Pokemon Base Set', 'product-name': 'Charizard [1st Edition] #4', 'loose-price': '$9000.00', 'tcg-id': '502' }),
+      row({ id: 'c2', 'console-name': 'Pokemon Base Set', 'product-name': 'Charizard [Shadowless] #4', 'loose-price': '$1500.00', 'tcg-id': '502' }),
+    ], products)
+    expect(yielded).toBe(2)
+    expect(db._prices.get('1|')).toBe(0.45)
+    expect(db._prices.get('2|')).toBe(1500)
+  })
+
+  it('a row whose #number disagrees with the product yields ("Alomomola #38" vs "#39" on one tcg-id)', async () => {
+    const { db, yielded } = await run([
+      row({ id: 'a38', 'console-name': 'Pokemon Black & White', 'product-name': 'Alomomola #38', 'loose-price': '$1.06', 'tcg-id': '600' }),
+      row({ id: 'a39', 'console-name': 'Pokemon Black & White', 'product-name': 'Alomomola #39', 'loose-price': '$1.12', 'tcg-id': '600' }),
+      row({ id: 'a38r', 'console-name': 'Pokemon Black & White', 'product-name': 'Alomomola [Reverse Holo] #38', 'loose-price': '$1.49', 'tcg-id': '600' }),
+    ], [{ id: 3, tcgplayer_product_id: 600, name: 'Alomomola', number: '39/114', category: 3, setName: 'Black and White' }])
+    expect(yielded).toBe(2)
+    expect(db._prices.get('3|')).toBe(1.12)
+  })
+
+  it('old cross-console STAMPS yield to the row whose console matches the product set (KFC / Oreo / Japanese vs SV 151)', async () => {
+    // Pre-2026-07-30 fuzzy stamps put every "Pikachu #25" from every console onto the English
+    // SV 151 Pikachu; the file's last one ("Pokemon x Oreo", $12.00) was its price instead of $0.38.
+    const pika: Product = { id: 5204, tcgplayer_product_id: 517045, name: 'Pikachu - 025/165', number: '025/165',
+      category: 3, setName: 'SV: Scarlet & Violet 151' }
+    const lines = [
+      row({ id: 'p1', 'console-name': 'Pokemon 1998 KFC', 'product-name': 'Pikachu #25', 'loose-price': '$54.00' }),
+      row({ id: 'p2', 'console-name': 'Pokemon Japanese Scarlet & Violet 151', 'product-name': 'Pikachu #25', 'loose-price': '$1.76' }),
+      row({ id: 'p3', 'console-name': 'Pokemon Scarlet & Violet 151', 'product-name': 'Pikachu #25', 'loose-price': '$0.38' }),
+      row({ id: 'p4', 'console-name': 'Pokemon x Oreo', 'product-name': 'Pikachu #25', 'loose-price': '$12.00' }),
+    ]
+    const { db, yielded } = await run(lines, [pika], {}, (d) => {
+      for (const id of ['p1', 'p2', 'p3', 'p4']) d._pcMap.set(id, { canonical_product_id: 5204, match_method: 'fuzzy', upc: null })
+    })
+    expect(yielded).toBe(3)
+    expect(db._prices.get('5204|')).toBe(0.38)
+  })
+
+  it('a lone row, and rows on different products, are untouched; rows that TIE still write (last wins, as before)', async () => {
+    const { db, yielded } = await run([
+      plain,
+      row({ id: 'm1', 'console-name': 'Pokemon Ancient Origins', 'product-name': 'Magikarp #19', 'loose-price': '$1.90', 'tcg-id': '101440' }),
+      row({ id: 't1', 'console-name': 'Pokemon Ancient Origins', 'product-name': 'Gyarados [Burger King] #20', 'loose-price': '$9.00', 'tcg-id': '101441' }),
+      row({ id: 't2', 'console-name': 'Pokemon Ancient Origins', 'product-name': 'Gyarados [Reverse Holo] #20', 'loose-price': '$5.36', 'tcg-id': '101441' }),
+    ], [
+      FLAREON,
+      { id: 16635, tcgplayer_product_id: 101440, name: 'Magikarp', number: '19/98', category: 3, setName: 'XY - Ancient Origins' },
+      { id: 16636, tcgplayer_product_id: 101441, name: 'Gyarados', number: '20/98', category: 3, setName: 'XY - Ancient Origins' },
+    ])
+    expect(yielded).toBe(0)
+    expect(db._prices.get('16632|')).toBe(1.43)
+    expect(db._prices.get('16635|')).toBe(1.9)
+    expect(db._prices.get('16636|')).toBe(5.36)   // a 2-word tie → the file's last row, unchanged behaviour
+  })
+})
+
+describe('twinRank (pure)', () => {
+  const prod = { number: '13/98', setName: 'XY - Ancient Origins' }
+  const r = (name: string, console_ = 'Pokemon Ancient Origins') => ({ 'product-name': name, 'console-name': console_ })
+  it('counts bracket-tag words; untagged is 0', () => {
+    expect(twinRank(r('Flareon #13'), prod)).toBe(0)
+    expect(twinRank(r('Flareon [Holo] #13'), prod)).toBe(1)
+    expect(twinRank(r('Flareon [Reverse Holo] #13'), prod)).toBe(2)
+    expect(twinRank(r('Flareon [Prize Pack Cosmos Holo] #13'), prod)).toBe(4)
+  })
+  it('a disagreeing #number outweighs any tags; a missing number on either side never counts against', () => {
+    expect(twinRank(r('Flareon #14'), prod)).toBe(1000)
+    expect(twinRank(r('Flareon [Reverse Holo] #013'), prod)).toBe(2)   // leading zeros normalised
+    expect(twinRank(r('Flareon'), prod)).toBe(0)
+    expect(twinRank(r('Flareon #14'), { number: null, setName: prod.setName })).toBe(0)
+  })
+  it('console gates: an uncorroborated set (+2000) and a disagreeing language (+4000), skipped without a set name', () => {
+    expect(twinRank(r('Flareon #13', 'Pokemon Burger King'), prod)).toBe(2000)
+    expect(twinRank(r('Flareon #13', 'Pokemon Japanese Ancient Origins'), prod)).toBe(4000)
+    expect(twinRank(r('Flareon #13', 'Pokemon Japanese Promo'), prod)).toBe(6000)
+    expect(twinRank(r('Flareon #13', 'Pokemon Burger King'), { number: '13/98', setName: null })).toBe(0)
+    expect(twinRank(r('Flareon #13'), undefined)).toBe(0)
   })
 })
 
