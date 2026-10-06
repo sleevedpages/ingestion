@@ -177,6 +177,14 @@ export const emptyMapCounts = (): MapCounts => ({
  * suffix stripped) mapped to the product's canonical token by `finishKey`, else JustTCG's own
  * spelling (counted as `unmappedFinish` — the compare endpoint lists these). One row per
  * (condition, printing key): a duplicate keeps the most recently updated listing.
+ *
+ * ⚠️ An unmapped printing is NEVER folded into the product's only stored printing (decided
+ * 2026-10-06, the fix-ups session). The case: One Piece "Charlotte Daifuku (Pandaman Art)"
+ * (TCGplayer 712655) — our printings `['normal']`, JustTCG sends `Foil`. JustTCG lists that card
+ * with BOTH `Normal` (NM 5.09) and `Foil` (NM 6.29), and TCGCSV's One Piece vocabulary carries
+ * `Foil` as a real printing (3,400 products; 108 carry Normal AND Foil, prod read-only), so folding
+ * `Foil` onto `normal` would overwrite a real Normal tier with a foil price. Kept unmapped — the
+ * row is stored as `Foil`, never adds a printing to the selector, and the compare tab lists it.
  */
 export function mapJustTcgCard(
   card: JtV1Card,
@@ -281,11 +289,38 @@ export interface UpsertCounts extends MapCounts {
   productsWritten: number
   rowsWritten: number
   calls: number
+  /** Returned by JustTCG, but every listing was skipped → no row (2026-10-06 fix-ups). */
+  resolvedNothingWritten: number
 }
 
 export const emptyUpsertCounts = (): UpsertCounts => ({
   ...emptyMapCounts(), requested: 0, resolved: 0, notReturned: 0, productsWritten: 0, rowsWritten: 0, calls: 0,
+  resolvedNothingWritten: 0,
 })
+
+// ── "Resolved, nothing written" (the JustTCG switch fix-ups, 2026-10-06) ───────────────────────
+// The first prod lane run resolved 951 products and wrote rows for 876; the run log carried only
+// the AGGREGATE skip counts, so the 75 could not be found — and every asked product is marked fresh
+// for 24 h, so the on-view enrich will not retry them. Each such product is now counted and (up to
+// 20 per run) named with the skip reason that dominated it. The freshness rule is unchanged on
+// purpose: a product JustTCG has nothing writable for must not be refetched on every view.
+
+export type NothingWrittenReason = 'condition' | 'language' | 'no_price' | 'no_printing' | 'no_variants'
+export interface NothingWrittenExample { productId: number; tcgplayerId: number; reason: NothingWrittenReason; variants: number }
+export const NOTHING_WRITTEN_EXAMPLES_MAX = 20
+
+/** The skip that accounts for most of a product's listings (ties: the order below). PURE. */
+export function dominantSkipReason(c: MapCounts): NothingWrittenReason {
+  if (!c.variants) return 'no_variants'
+  const ranked: Array<[NothingWrittenReason, number]> = [
+    ['condition', c.skippedCondition], ['language', c.skippedLanguage],
+    ['no_price', c.skippedNoPrice], ['no_printing', c.skippedNoPrinting],
+  ]
+  return ranked.reduce((best, x) => (x[1] > best[1] ? x : best))[0]
+}
+
+/** One batch's counts plus the products it resolved but wrote nothing for (≤ 20). */
+export interface UpsertResult extends UpsertCounts { resolvedNothingWrittenExamples: NothingWrittenExample[] }
 
 function addMapCounts(into: MapCounts, c: MapCounts) {
   for (const k of Object.keys(c) as Array<keyof MapCounts>) into[k] += c[k]
@@ -296,8 +331,8 @@ function addMapCounts(into: MapCounts, c: MapCounts) {
  * atomic group, then marks EVERY requested product fresh (a product JustTCG does not list is asked
  * again tomorrow, not every run). A JustTcgError propagates — the caller decides stop vs continue.
  */
-export async function upsertJustTcgBatch(env: Env, products: LaneProduct[], nowSec: number = Math.floor(Date.now() / 1000)): Promise<UpsertCounts> {
-  const counts = emptyUpsertCounts()
+export async function upsertJustTcgBatch(env: Env, products: LaneProduct[], nowSec: number = Math.floor(Date.now() / 1000)): Promise<UpsertResult> {
+  const counts: UpsertResult = { ...emptyUpsertCounts(), resolvedNothingWrittenExamples: [] }
   counts.requested = products.length
   if (!products.length) return counts
   const db = env.DB
@@ -322,6 +357,12 @@ export async function upsertJustTcgBatch(env: Env, products: LaneProduct[], nowS
     for (const r of rows) group.push(db.prepare(JUSTTCG_PRICE_UPSERT_SQL).bind(p.id, r.condition, r.finish, r.value, r.fetchedAt))
     groups.push(group)
     if (rows.length) { counts.productsWritten++; counts.rowsWritten += rows.length }
+    else {
+      counts.resolvedNothingWritten++
+      if (counts.resolvedNothingWrittenExamples.length < NOTHING_WRITTEN_EXAMPLES_MAX) {
+        counts.resolvedNothingWrittenExamples.push({ productId: p.id, tcgplayerId: p.tcgplayerId, reason: dominantSkipReason(mc), variants: mc.variants })
+      }
+    }
   }
   // Freshness for EVERY requested product, in the same batches as the rows (a killed invocation
   // leaves the product stale → it is redone next run, never silently skipped).
@@ -370,6 +411,8 @@ export interface LaneResult extends UpsertCounts {
   dailyUsedAfter: number | null
   laneAllowed: number | null
   errors: string[]
+  /** Up to 20 products the run resolved but wrote nothing for, each with its dominant skip reason. */
+  resolvedNothingWrittenExamples: NothingWrittenExample[]
 }
 
 /**
@@ -382,6 +425,7 @@ export async function runJustTcgRefresh(env: Env, opts: { nowSec?: number; maxCa
   const out: LaneResult = {
     ok: true, ...emptyUpsertCounts(), population: 0, stale: 0, batchesRun: 0, batchesFailed: 0,
     stoppedReason: null, dailyUsedBefore: null, dailyUsedAfter: null, laneAllowed: null, errors: [],
+    resolvedNothingWrittenExamples: [],
   }
   if (!(await justtcgIngestEnabled(env.DB))) return { ...out, skipped: 'switch_off' }
   if (!justtcgConfigured(env)) return { ...out, skipped: 'not_configured' }
@@ -417,7 +461,12 @@ export async function runJustTcgRefresh(env: Env, opts: { nowSec?: number; maxCa
     out.batchesRun++
     try {
       const c = await upsertJustTcgBatch(env, slice, nowSec)
-      for (const k of Object.keys(c) as Array<keyof UpsertCounts>) out[k] += c[k]
+      // Sum the NUMERIC counts only (the batch result also carries the examples list).
+      for (const k of Object.keys(emptyUpsertCounts()) as Array<keyof UpsertCounts>) out[k] += c[k]
+      for (const e of c.resolvedNothingWrittenExamples) {
+        if (out.resolvedNothingWrittenExamples.length >= NOTHING_WRITTEN_EXAMPLES_MAX) break
+        out.resolvedNothingWrittenExamples.push(e)
+      }
     } catch (err) {
       out.batchesFailed++
       const e = err as JustTcgError
