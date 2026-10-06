@@ -44,6 +44,9 @@ import {
   pickBestCanonicalMatch,
   pickNumberlessCanonicalMatch,
   cleanNumber,
+  norm,
+  textLanguage,
+  consoleCorroboratesSet,
   normalizeUpc,
   PRICECHARTING_CATEGORIES,
   CATEGORY_TCGPLAYER_IDS,
@@ -85,6 +88,8 @@ export interface PcWindowCounts {
   matchedNumberless: number // NEW rung (2026-07-15): number-less set-corroborated matches (DON!!s)
   matchedExisting:   number // rows whose canonical_product_id was already stamped in the map
                             // (mint stamp / prior run) — matcher skipped, stored id reused
+  yieldedToTwin:  number    // 2026-10-06c: matched rows that wrote NO prices because a better-ranked
+                            // twin row in the file resolves to the same product (see twinRank)
   unmatched:      number
   sealedRows:     number
   sealedMatched:  number
@@ -206,6 +211,7 @@ interface Prod {
 }
 export interface ProductIndex {
   byTcgId:  Map<number, Prod>
+  byId:     Map<number, Prod>     // products.id → row (2026-10-06c — the twin rank reads its number)
   byNumber: Map<string, Prod[]>   // keyed on cleanNumber(p.number)
   // Secondary pool (2026-07-15): number-less CARD rows (number NULL/empty, product_kind='card')
   // with their set name, for the set-corroborated number-less rung (DON!!s). Small by
@@ -224,10 +230,11 @@ export interface ProductIndex {
 async function loadProductIndex(env: Env, category: string): Promise<ProductIndex> {
   const cats = CATEGORY_TCGPLAYER_IDS[category] ?? []
   const byTcgId = new Map<number, Prod>()
+  const byId = new Map<number, Prod>()
   const byNumber = new Map<string, Prod[]>()
   const numberless: NumberlessCandidate[] = []
   let count = 0
-  if (cats.length === 0) return { byTcgId, byNumber, numberless, count }
+  if (cats.length === 0) return { byTcgId, byId, byNumber, numberless, count }
 
   const ph = cats.map(() => '?').join(',')
   const PAGE = 5000
@@ -243,6 +250,7 @@ async function loadProductIndex(env: Env, category: string): Promise<ProductInde
     const rows = results ?? []
     for (const p of rows) {
       count++
+      byId.set(Number(p.id), p)
       if (p.tcgId != null) byTcgId.set(Number(p.tcgId), p)
       const num = cleanNumber(p.number)
       if (num) {
@@ -270,7 +278,7 @@ async function loadProductIndex(env: Env, category: string): Promise<ProductInde
     numberless.push(...rows)
     if (rows.length < PAGE) break
   }
-  return { byTcgId, byNumber, numberless, count }
+  return { byTcgId, byId, byNumber, numberless, count }
 }
 
 /**
@@ -301,6 +309,86 @@ async function loadExistingMatches(env: Env, category: string): Promise<Map<stri
 }
 
 /**
+ * The two EXACT rungs, in matcher order: a pre-stamped map entry (method null — the MAP upsert's
+ * COALESCE keeps the stored method), else a name-validated tcg-id hit. PURE. Shared by `matchRows`
+ * and the twin-owner pre-pass so both resolve a row to the SAME product.
+ */
+function resolveExact(
+  pcId: string,
+  row: PcCsvRow,
+  index: ProductIndex,
+  existing?: Map<string, number>,
+): { productId: number; method: 'tcg-id' | null } | null {
+  const stamped = existing?.get(pcId)
+  if (stamped != null) return { productId: stamped, method: null }
+  const t = Number((row['tcg-id'] ?? '').trim())
+  if (Number.isInteger(t) && t > 0) {
+    const prod = index.byTcgId.get(t)
+    if (prod && validateTcgIdMatch(row, { name: prod.name })) return { productId: prod.id, method: 'tcg-id' }
+  }
+  return null
+}
+
+/**
+ * ONE PRICE PER PRODUCT (2026-10-06c). PriceCharting splits a printing TCGplayer keeps as ONE
+ * product into several rows sharing one tcg-id ("Flareon #13" + "Flareon [Reverse Holo] #13",
+ * plain + "[1st Edition]", "[Holo]" + "[Reverse Holo]"). The writer has no finish/edition
+ * dimension, so every twin upserts the same price keys and the file's LAST row used to win — the
+ * tagged one, since '[' sorts after '#'. 13,456 English Pokémon tcg-ids carried twins in the
+ * 2026-10-06 file. The same collision comes from map STAMPS made before the 2026-07-30 console
+ * scoping: KFC / Topps / Burger King / Japanese / Chinese rows "Pikachu #25" all stamped onto the
+ * English SV 151 Pikachu (2,318 Pokémon products). Ranks a row against the product it resolves
+ * to; LOWER owns the product's price — each component outweighs everything after it:
+ *   1. its console's LANGUAGE disagrees with the product's set (+4000) — `textLanguage`, the
+ *      fuzzy rung's own gate;
+ *   2. its console does not corroborate the product's set (+2000) — `consoleCorroboratesSet`,
+ *      likewise (both skipped when the product has no set name);
+ *   3. its "#number" disagrees with the product's number (+1000) — PC sometimes puts one tcg-id on
+ *      two different cards ("Alomomola #38" and "#39");
+ *   4. then the count of words inside its bracket tags — untagged (0) beats "[Holo]" (1) beats
+ *      "[Reverse Holo]" (2); "[Shadowless]" beats "[1st Edition]"; "[Prize Pack]" beats
+ *      "[Prize Pack Cosmos Holo]".
+ * Twins from one console score the same on 1–2, so for them the rank is number, then tags.
+ * Rows that tie all write, and the file's last row still wins (e.g. "[Burger King]" vs
+ * "[Reverse Holo]") — no worse than before. PURE.
+ */
+export function twinRank(
+  row: PcCsvRow,
+  product: { number?: string | null; setName?: string | null } | undefined,
+): number {
+  const name = row['product-name'] ?? ''
+  const tagWords = norm((name.match(/\[[^\]]*\]/g) ?? []).join(' ')).split(' ').filter(Boolean).length
+  const pcNumber = cleanNumber(name.replace(/\[[^\]]*\]/g, ' ').match(/#\s*([a-z0-9-]+)/i)?.[1] ?? '')
+  const productNumber = cleanNumber(product?.number)
+  const numberDisagrees = pcNumber !== '' && productNumber !== '' && pcNumber !== productNumber
+  const pcConsole = norm(row['console-name'])
+  const setNorm = norm(product?.setName)
+  const languageDisagrees = setNorm !== '' && textLanguage(pcConsole) !== textLanguage(setNorm)
+  const setUncorroborated = setNorm !== '' && !consoleCorroboratesSet(pcConsole, setNorm)
+  return (languageDisagrees ? 4000 : 0) + (setUncorroborated ? 2000 : 0) + (numberDisagrees ? 1000 : 0) + tagWords
+}
+
+/**
+ * Record a row's claim on its product: the best (lowest) `twinRank` seen per product id. Fed by
+ * EVERY row of the file (not only the window), so ownership never depends on where a window
+ * boundary falls. Only the exact rungs are consulted — fuzzy / number-less matches are bounded per
+ * window and cannot be pre-computed; a row they resolve still YIELDS to a better exact-rung owner.
+ */
+function noteTwinClaim(
+  owners: Map<number, number>,
+  pcId: string,
+  row: PcCsvRow,
+  index: ProductIndex,
+  existing: Map<string, number>,
+): void {
+  const exact = resolveExact(pcId, row, index, existing)
+  if (!exact) return
+  const rank = twinRank(row, index.byId.get(exact.productId))
+  const best = owners.get(exact.productId)
+  if (best == null || rank < best) owners.set(exact.productId, rank)
+}
+
+/**
  * Match a sub-batch of rows against the in-memory index. PURE (no IO). Rung order:
  * pre-stamped map entry (skip matching entirely) → tcg-id primary (validated) → bounded
  * validated numeric fuzzy → bounded number-less set-corroborated rung (rows with NO digit
@@ -327,21 +415,12 @@ function matchRows(
     // ── already stamped (mint job / prior run): reuse the stored id, never re-match ──
     // method:null so the MAP upsert's COALESCE preserves the stored match_method/matched_at;
     // productId non-null means the price writes still fire (how minted rows get prices).
-    const stamped = existing?.get(r.pcId)
-    if (stamped != null) {
-      resolutions.push({ pcId: r.pcId, productId: stamped, method: null, row: r.row, sealed: r.sealed })
-      matchedExisting++
+    // ── else tcg-id primary (in-memory map lookup + name validation) ──────────────
+    const exact = resolveExact(r.pcId, r.row, index, existing)
+    if (exact) {
+      resolutions.push({ pcId: r.pcId, productId: exact.productId, method: exact.method, row: r.row, sealed: r.sealed })
+      if (exact.method === 'tcg-id') matchedTcgId++; else matchedExisting++
       continue
-    }
-    // ── tcg-id primary (in-memory map lookup + name validation) ────────────────
-    const t = Number((r.row['tcg-id'] ?? '').trim())
-    if (Number.isInteger(t) && t > 0) {
-      const prod = index.byTcgId.get(t)
-      if (prod && validateTcgIdMatch(r.row, { name: prod.name })) {
-        resolutions.push({ pcId: r.pcId, productId: prod.id, method: 'tcg-id', row: r.row, sealed: r.sealed })
-        matchedTcgId++
-        continue
-      }
     }
     const numToken = ((r.row['product-name'] ?? '').match(/[a-z]*\d[\w-]*/i)?.[0]) ?? ''
     const num = cleanNumber(numToken)
@@ -503,32 +582,40 @@ async function processWindowFromBody(
   const t0 = Date.now()
   const windowEnd = windowStart + opts.maxRows
 
-  // ── Stream the cached CSV; collect only the rows inside [windowStart, windowEnd) ──
+  // Load the game's canonical products into memory ONCE per window, so matching is pure CPU.
+  // The persisted already-matched map (incl. mint stamps) loads alongside — stamped rows skip
+  // the matcher and reuse their stored canonical id. Loaded BEFORE the stream (2026-10-06c) so
+  // every row of the file can stake its twin claim as it streams past.
+  const index = await loadProductIndex(env, category)
+  const existing = await loadExistingMatches(env, category)
+
+  // ── Stream the WHOLE cached CSV: collect the rows inside [windowStart, windowEnd), and feed
+  // every row (before, inside and after the window) to the twin-owner pre-pass, so which row owns
+  // a product's price never depends on where a window boundary falls. Reading past the window is
+  // only parsing — the R2 object is one GET either way.
   let headerIdx: Record<string, number> = {}
   const window: Array<{ pcId: string; row: PcCsvRow; sealed: boolean }> = []
-  const { reachedEof } = await streamCsv(
+  const owners = new Map<number, number>()   // productId → best twinRank across the file
+  let rowsBeyondWindow = false
+  await streamCsv(
     body,
     (h) => { headerIdx = buildHeaderIndex(h) },
     (fields, i) => {
-      if (i < windowStart) return true
-      if (i >= windowEnd) return false            // window full → stop reading the tail
+      if (i >= windowEnd) rowsBeyondWindow = true
       const row = rowFromFields(fields, headerIdx)
       const pcId = (row['id'] ?? '').trim()
-      if (pcId) window.push({ pcId, row, sealed: isSealedRow(row) })
+      if (!pcId) return true
+      noteTwinClaim(owners, pcId, row, index, existing)
+      if (i >= windowStart && i < windowEnd) window.push({ pcId, row, sealed: isSealedRow(row) })
       return true
     },
   )
-
-  // Load the game's canonical products into memory ONCE per window, so matching is pure CPU.
-  // The persisted already-matched map (incl. mint stamps) loads alongside — stamped rows skip
-  // the matcher and reuse their stored canonical id.
-  const index = await loadProductIndex(env, category)
-  const existing = await loadExistingMatches(env, category)
+  const reachedEof = !rowsBeyondWindow   // no data row past the window → this window holds the tail
 
   const now = Math.floor(Date.now() / 1000)
   let processed = 0
   let matchedTcgId = 0, matchedFuzzy = 0, fuzzyAttempts = 0
-  let matchedNumberless = 0, numberlessAttempts = 0, matchedExisting = 0
+  let matchedNumberless = 0, numberlessAttempts = 0, matchedExisting = 0, yieldedToTwin = 0
   let unmatched = 0, sealedMatched = 0, sealedRows = 0, pricesUpserted = 0
   let budgetHit = false, batchHit = false, batchesIssued = 0
 
@@ -561,6 +648,13 @@ async function processWindowFromBody(
       )
       if (res2.productId == null) { unmatched++; continue }
       if (res2.sealed) sealedMatched++
+      // ONE PRICE PER PRODUCT: a twin that ranks worse than the product's owner writes no prices —
+      // neither loose nor graded — but keeps its map stamp (it IS a printing of that product).
+      const ownerRank = owners.get(res2.productId)
+      if (ownerRank != null && twinRank(res2.row, index.byId.get(res2.productId)) > ownerRank) {
+        yieldedToTwin++
+        continue
+      }
       for (const pr of csvRowToPriceRows(res2.row, { isSealed: res2.sealed })) {
         // ungraded → (condition NULL, finish 'normal', grade NULL) + retail buy/sell spread;
         // graded → (NULL, NULL, label) value-only (retail buy/sell null).
@@ -592,7 +686,7 @@ async function processWindowFromBody(
     category, key, stale, windowStart,
     rowsCollected: window.length,
     rowsProcessed: processed,
-    matchedTcgId, matchedFuzzy, matchedNumberless, matchedExisting,
+    matchedTcgId, matchedFuzzy, matchedNumberless, matchedExisting, yieldedToTwin,
     unmatched, sealedRows, sealedMatched, pricesUpserted, fuzzyAttempts, numberlessAttempts,
     cursorNext, wrapped, budgetHit, batchHit,
     durationMs: Date.now() - t0,
@@ -613,7 +707,7 @@ export async function processPriceChartingWindow(env: Env, msg: PcProcessMessage
     return {
       category: msg.category, key: msg.key, stale: !!msg.stale, windowStart: msg.offset,
       rowsCollected: 0, rowsProcessed: 0, matchedTcgId: 0, matchedFuzzy: 0,
-      matchedNumberless: 0, matchedExisting: 0, unmatched: 0,
+      matchedNumberless: 0, matchedExisting: 0, yieldedToTwin: 0, unmatched: 0,
       sealedRows: 0, sealedMatched: 0, pricesUpserted: 0, fuzzyAttempts: 0, numberlessAttempts: 0,
       cursorNext: 0, wrapped: true, budgetHit: false, batchHit: false, durationMs: 0,
     }
