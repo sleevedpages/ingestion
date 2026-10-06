@@ -79,10 +79,11 @@ function makeFakeDb(products: Product[]) {
         upc:                  upc ?? prev?.upc ?? null,
       })
     } else if (sql.includes('INTO prices')) {
-      // binds: productId, condition, finish, grade, is_graded, value, retail_buy, retail_sell
+      // binds: productId, condition, finish, grade, company, is_perfect, is_graded, value, retail_buy, retail_sell
+      // (company / is_perfect since 2026-10-06 — NULL / 0 on every row but the CSV-only premium buckets)
       const grade = args[3] ?? null
-      if ((grade == null ? 0 : 1) !== args[4]) throw new Error('is_graded bind out of step with grade label')
-      prices.set(`${args[0]}|${grade ?? ''}`, args[5])
+      if ((grade == null ? 0 : 1) !== args[6]) throw new Error('is_graded bind out of step with grade label')
+      prices.set(`${args[0]}|${grade ?? ''}${args[4] ? '|' + args[4] + (args[5] ? '*' : '') : ''}`, args[7])
     } else throw new Error('unhandled write SQL: ' + sql.slice(0, 60))
   }
   const db = {
