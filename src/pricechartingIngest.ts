@@ -381,8 +381,8 @@ function matchRows(
 // is_graded (Content mig 0099): positive write-time classification — 1 for every graded bucket
 // row ('PSA 10' … 'Grade 7 / 7.5'), 0 for the loose/ungraded row. Never inferred at read time.
 const PRICE_UPSERT_SQL = `
-  INSERT INTO prices (product_id, source, condition, finish, grade, is_graded, value, retail_buy, retail_sell, fetched_at)
-  VALUES (?, 'pricecharting', ?, ?, ?, ?, ?, ?, ?, unixepoch())
+  INSERT INTO prices (product_id, source, condition, finish, grade, company, is_perfect, is_graded, value, retail_buy, retail_sell, fetched_at)
+  VALUES (?, 'pricecharting', ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
   ON CONFLICT (product_id, source, COALESCE(condition,''), COALESCE(finish,''), COALESCE(grade,''),
                COALESCE(variant,''), COALESCE(company,''), is_signed, is_error, is_perfect)
   DO UPDATE SET value = excluded.value, is_graded = excluded.is_graded, retail_buy = excluded.retail_buy,
@@ -563,10 +563,13 @@ async function processWindowFromBody(
       if (res2.sealed) sealedMatched++
       for (const pr of csvRowToPriceRows(res2.row, { isSealed: res2.sealed })) {
         // ungraded → (condition NULL, finish 'normal', grade NULL) + retail buy/sell spread;
-        // graded → (NULL, NULL, label) value-only (retail buy/sell null).
+        // graded → (NULL, NULL, label) value-only (retail buy/sell null). company / is_perfect are
+        // set ONLY by the CSV-only premium / extra-company buckets (2026-10-06, Phase 2) — every
+        // other row binds NULL / 0, i.e. exactly the identity it always had.
         const finish = pr.grade == null ? 'normal' : null
         priceStmts.push(env.DB.prepare(PRICE_UPSERT_SQL).bind(
-          res2.productId, null, finish, pr.grade, pr.grade == null ? 0 : 1, pr.valueDollars,
+          res2.productId, null, finish, pr.grade, pr.company ?? null, pr.isPerfect ? 1 : 0,
+          pr.grade == null ? 0 : 1, pr.valueDollars,
           pr.retailBuyDollars ?? null, pr.retailSellDollars ?? null,
         ))
       }
