@@ -721,6 +721,18 @@ Scrydex expansion id (e.g. `OP09`, `GD04`), which is what `q=expansion.id:` matc
 > `scrydex_drain_enabled = '1'` (the drain writes raw AND graded rows); the switch remains as an emergency stop only. On the
 > downgrade, `SCRYDEX_MONTHLY_LIMIT` = the new plan's TRUE cap in BOTH repos BEFORE it takes effect (30-day use 1,777 credits,
 > ~1,530 of them the Pokémon drain; the guard blocks at cap − 500).
+> **➕➕ REVERSED 2026-10-06 (operator, same day): Scrydex is DROPPED COMPLETELY — the plan is cancelled, as first planned.**
+> Measured first (prod, read-only): Scrydex holds **NO graded rows at all** for Lorcana / Gundam / Riftbound (nor One Piece /
+> Magic) — graded exists only for Pokémon (17,316 products) and Pokémon Japan (8,248), which PriceCharting covers
+> (Pokémon Japan via `feat/pricecharting-japanese`). So the keep-for-three-games reason did not hold. Steps are back to:
+> `scrydex_drain_enabled = '0'` → one week → the operator cancels → then deletes `SCRYDEX_API_KEY` / `SCRYDEX_TEAM_ID`.
+> **Missing keys are now SAFE (2026-10-06):** `runScrydexDrainGated` treats no keys exactly like the switch OFF
+> (`skipped: 'scrydex_not_configured'`, every watched expansion handed back), the 10/16/22 Card Watch lane no longer has its
+> own key guard, and `/admin/run-job card-watch-drain` no longer 503s without keys — so deleting the secrets cannot
+> silence Card Watch alerts (before this fix, it would have: the lane and its alert hook were skipped without keys).
+> Every other Scrydex path already self-skips or 503s without keys (the weekly image pipeline's set-mapping / MTG
+> attribute fill / image-sync steps, `/scrydex/*` routes, the 04:00 drain, run-job `scrydex-drain`). **Deploy this branch
+> BEFORE deleting the secrets.**
 - Scrydex sends webhooks to Content app at `/api/webhooks/scrydex`; the handler is instant —
   only logs to `scrydex_webhook_log` (status `'pending'`).
 - **The worker drains pending rows ONCE DAILY (`0 4 * * *`)** via `processPendingWebhooks()` — moved

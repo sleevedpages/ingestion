@@ -972,7 +972,9 @@ export default {
       // (the Scrydex sub-steps self-skip inside runWeeklyImagePipeline); scrydex-drain requires
       // them. pricecharting-download (the ONLY path that downloads) requires the PriceCharting
       // token; pricecharting-csv (PROCESS from the cached R2 file) needs NO token.
-      if ((job === 'scrydex-drain' || job === 'card-watch-drain') && !(env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID)) {
+      // card-watch-drain needs NO keys since 2026-10-06 (the gate hands back every watched expansion
+      // without them, so the admin trigger still runs the alert hook).
+      if (job === 'scrydex-drain' && !(env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID)) {
         return json({ ok: false, error: 'SCRYDEX_API_KEY / SCRYDEX_TEAM_ID not configured' }, 503);
       }
       if (job === 'pricecharting-download' && !env.PRICECHARTING_TOKEN) {
@@ -1254,7 +1256,10 @@ export default {
         // watch's baseline and push. The hook fires inside the SAME waitUntil but only once the drain
         // has resolved, and its failure is caught + logged — the drain's writes must never depend on
         // alerting (Content owns the diff + FCM send; this worker just forwards the list).
-        if (env.SCRYDEX_API_KEY && env.SCRYDEX_TEAM_ID) {
+        // 2026-10-06: NO key guard here any more — the gate treats missing Scrydex keys like the
+        // drain switch OFF (no Scrydex call, every watched expansion handed back), so deleting the
+        // Scrydex secrets after the plan is cancelled can never silence Card Watch alerts.
+        {
           ctx.waitUntil(
             (async () => {
               let refreshed: { gameSlug: string; expansion: string }[] = [];

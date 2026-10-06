@@ -371,18 +371,38 @@ describe('the Scrydex retirement switches', () => {
     expect(enrichCard).toHaveBeenLastCalledWith(expect.anything(), { canonicalProductId: 5, classes: ['core'] })
   })
 
+  const KEYS = { SCRYDEX_API_KEY: 'k', SCRYDEX_TEAM_ID: 't' }
+
   it('scrydex_drain_enabled ON (default) = exactly the calls that shipped', async () => {
-    await runScrydexDrainGated({ DB: fakeDb() } as any, 'daily')
+    await runScrydexDrainGated({ DB: fakeDb(), ...KEYS } as any, 'daily')
     expect(processPendingWebhooks).toHaveBeenLastCalledWith(expect.anything())
     expect(vi.mocked(processPendingWebhooks).mock.calls.at(-1)).toHaveLength(1)
-    await runScrydexDrainGated({ DB: fakeDb() } as any, 'watched')
+    await runScrydexDrainGated({ DB: fakeDb(), ...KEYS } as any, 'watched')
     expect(processPendingWebhooks).toHaveBeenLastCalledWith(expect.anything(), { scope: 'watched' })
+  })
+
+  it('NO Scrydex keys behaves like OFF even with the switch ON (Scrydex dropped, secrets deleted)', async () => {
+    const db = fakeDb()                                         // switch at its default '1'
+    expect(await runScrydexDrainGated({ DB: db } as any, 'daily')).toEqual({ scope: 'daily', expansionsFetched: 0, refreshedExpansions: [], skipped: 'scrydex_not_configured' })
+    const w = await runScrydexDrainGated({ DB: db } as any, 'watched')
+    expect(w.skipped).toBe('scrydex_not_configured')
+    expect(w.refreshedExpansions).toEqual([{ gameSlug: 'pokemon', expansion: 'sv08' }, { gameSlug: 'onepiece', expansion: 'OP09' }])
+    expect(processPendingWebhooks).not.toHaveBeenCalled()
+  })
+
+  it('the 10/16/22 lane with NO Scrydex keys still fires the alert hook with every watched expansion', async () => {
+    const waits: Promise<unknown>[] = []
+    await worker.scheduled({ cron: '0 10,16,22 * * *' } as any, { DB: fakeDb(), CONTENT_APP_URL: 'https://x' } as any, { waitUntil: (p: Promise<unknown>) => waits.push(p) } as any)
+    expect(waits).toHaveLength(1)                               // the lane is no longer skipped without keys
+    await Promise.all(waits)
+    expect(processPendingWebhooks).not.toHaveBeenCalled()
+    expect(runWatchAlerts).toHaveBeenCalledWith(expect.anything(), [{ gameSlug: 'pokemon', expansion: 'sv08' }, { gameSlug: 'onepiece', expansion: 'OP09' }])
   })
 
   it('OFF → no Scrydex call; the daily drain reports the no-op; the watch lane hands back EVERY watched expansion', async () => {
     const db = fakeDb({ config: { scrydex_drain_enabled: '0' } })
-    expect(await runScrydexDrainGated({ DB: db } as any, 'daily')).toEqual({ scope: 'daily', expansionsFetched: 0, refreshedExpansions: [], skipped: 'scrydex_drain_disabled' })
-    const w = await runScrydexDrainGated({ DB: db } as any, 'watched')
+    expect(await runScrydexDrainGated({ DB: db, ...KEYS } as any, 'daily')).toEqual({ scope: 'daily', expansionsFetched: 0, refreshedExpansions: [], skipped: 'scrydex_drain_disabled' })
+    const w = await runScrydexDrainGated({ DB: db, ...KEYS } as any, 'watched')
     expect(w.skipped).toBe('scrydex_drain_disabled')
     expect(w.refreshedExpansions).toEqual([{ gameSlug: 'pokemon', expansion: 'sv08' }, { gameSlug: 'onepiece', expansion: 'OP09' }])
     expect(processPendingWebhooks).not.toHaveBeenCalled()
