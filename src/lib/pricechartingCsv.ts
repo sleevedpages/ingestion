@@ -65,6 +65,33 @@ export const CATEGORY_TCGPLAYER_IDS: Record<string, number[]> = {
   'one-piece-cards': [68],
 }
 
+/** Foreign-language SIBLING catalogues of a PriceCharting category (2026-10-06b): TCGplayer
+ * category id → the language (a `textLanguage()` value) a row's console must resolve to.
+ * The Pokémon Cards CSV carries ~35k "Pokemon Japanese …" rows, 81 % with a tcg-id that points
+ * into TCGplayer's Pokémon Japan catalogue (category 85) — rows the English-only index could
+ * never match, so the language gate rightly rejected them in the fuzzy rung.
+ * Consumed ONLY by the tcg-id rung (exact id + console language + name check). The fuzzy and
+ * number-less pools stay English-only, so a foreign row can never be priced onto an English
+ * product nor an English row onto a Japanese one. Deliberately NOT part of
+ * CATEGORY_TCGPLAYER_IDS: that map scopes the fuzzy pool and reverses into game_category for
+ * the UPC path, neither of which changes. */
+export const CATEGORY_FOREIGN_TCGPLAYER_IDS: Record<string, Record<number, string>> = {
+  'pokemon-cards': { 85: 'japanese' },
+}
+
+/** TCGplayer's Pokémon Japan names carry the collector number ("Blastoise EX - 021/087",
+ * "Mew - 002/028 (Mirror Holofoil)"), which PriceCharting writes as "#21" — so the number
+ * tokens '021' / '087' never appear in the PC row and `validateTcgIdMatch` rejected a third of
+ * correct id matches (measured 2026-10-06b on the cached CSV: 18,994 → 25,790 accepted of
+ * 28,196 in-catalogue rows). Strips ONE " - <number>[/<number>]" sitting at the end of the name
+ * or just before its trailing "(…)" qualifiers; the qualifiers themselves still validate. */
+export function stripCollectorNumberSuffix(name: string): string {
+  return String(name ?? '').replace(
+    /\s+-\s+[A-Za-z]*\d+[A-Za-z]*(?:\/[A-Za-z]*\d+[A-Za-z]*)?(?=\s*(?:\([^)]*\)\s*)*$)/,
+    '',
+  )
+}
+
 /** Reverse of CATEGORY_TCGPLAYER_IDS: the PriceCharting category a canonical product's
  * tcgplayer_category_id belongs to, or null when the game is outside the 4 ingested
  * categories (the caller must then skip the map write — game_category is NOT NULL). */

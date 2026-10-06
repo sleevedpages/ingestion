@@ -1067,6 +1067,22 @@ cron and looping to finish tripped the limit. Now:
   'normal', grade NULL); `cib`→'Grade 7 / 7.5'; `new`→'Grade 8 / 8.5'; `graded-price`→'Grade 9';
   `box-only`→'Grade 9.5'; `manual-only`→'PSA 10'; `bgs-10`→'BGS 10'; `condition-17`→'CGC 10';
   `condition-18`→'SGC 10'. (No TAG/ACE; sub-10 grades are company-agnostic — same caveats as the API.)
+- **➕ 2026-10-06b — Pokémon JAPANESE rows → Pokémon Japan products (branch `feat/pricecharting-japanese`).** The
+  `pokemon-cards` CSV carries 34,912 "Pokemon Japanese …" rows (400 consoles; 81 % with a `tcg-id` into TCGplayer's
+  Pokémon Japan catalogue, category **85**). The primary index only loads category 3, so they all fell to the fuzzy rung
+  where the language gate (rightly) rejected them. Now `CATEGORY_FOREIGN_TCGPLAYER_IDS` (`{'pokemon-cards': {85:'japanese'}}`)
+  adds a **tcg-id-ONLY** sibling index (`byTcgIdForeign`; ids the English index owns are never shadowed). A row matches it
+  only with ALL of: the exact id · its console resolving to `'japanese'` · `validateTcgIdMatch` against the name with
+  TCGplayer's `" - 021/087"` stripped (`stripCollectorNumberSuffix`) · and, if the row is bracket-tagged (`[1st Edition]`,
+  `[Holo]`…), NO untagged row with the same id in the window (**one price per product** — the writer has no edition
+  dimension, and the tagged twin sorts LAST so it would otherwise win; `foreignYieldedToPlain` counts these). Map rows are
+  labelled `match_method = 'tcg-id-foreign'` (un-stamp as a group if ever needed). The fuzzy + number-less pools,
+  `CATEGORY_TCGPLAYER_IDS` and the UPC reverse map stay English-only. **Measured on the cached 2026-10-06 file** (read from
+  our R2 — no download): 21,681 rows → **21,621 Pokémon Japan products**, 14,020 rows with graded prices; 26 of the 27
+  owned Pokémon Japan products, 17 of 18 owned-graded. The first Pokémon PROCESS after deploy writes ≈ 100k extra price
+  upserts (more queue windows, same chain). ⚠️ The SAME twin collision exists for ENGLISH rows today (plain + `[Reverse Holo]`,
+  11,710 pairs — prod stores the Reverse Holo price as `finish='normal'` for e.g. Flareon/Magikarp/Gyarados); NOT changed
+  here — filed separately.
 - **Matching is IN-MEMORY (`src/pricechartingIngest.ts`)** — `loadProductIndex()` pulls the game's
   canonical products ONCE per PROCESS window (paginated, a few round trips) into `byTcgId` + `byNumber` maps;
   `matchRows()` is then pure CPU (no per-row D1 query). **WHY (fixed 2026-06-17):** the per-row fuzzy
