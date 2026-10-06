@@ -43,7 +43,7 @@ vi.mock('./scrydexEnrich.js', async (importOriginal) => {
 import {
   justtcgConditionCode, finishKey, productLanguage, stripLanguageSuffix, canonicalPrintingTokens,
   mapJustTcgCard, upsertJustTcgBatch, runJustTcgRefresh, readSwitch, JUSTTCG_PRICE_UPSERT_SQL,
-  JUSTTCG_FRESHNESS_CLASS,
+  JUSTTCG_FRESHNESS_CLASS, dominantSkipReason,
 } from './justtcgIngest.js'
 import { runScrydexDrainGated } from './scrydexDrainGate.js'
 import { scrydexCreditsFor } from './lib/scrydexClient.js'
@@ -194,6 +194,27 @@ describe('the pure mapping', () => {
     expect(rows).toEqual([{ condition: 'NM', finish: 'Holofoil', value: 20, fetchedAt: 1_759_000_000 }])
     expect(counts.skippedLanguage).toBe(1)
   })
+  // The fix-ups session (2026-10-06): the first prod run's one unmappedFinish. JustTCG lists the
+  // card with BOTH printings, so folding `Foil` onto the only stored printing would overwrite the
+  // real Normal tier — it stays unmapped, in JustTCG's spelling.
+  it('a JustTCG Foil on a normal-only product stays unmapped (One Piece 712655) — never folded onto Normal', () => {
+    const { rows, counts } = mapJustTcgCard(card('712655', [
+      v('Near Mint', 'Normal', 5.09), v('Lightly Played', 'Normal', 4.84), v('Near Mint', 'Foil', 6.29),
+    ]), { game: 'One Piece Card Game', printings: new Map([['normal', 'Normal']]) })
+    expect(rows).toEqual([
+      { condition: 'NM', finish: 'Normal', value: 5.09, fetchedAt: 1_759_000_000 },
+      { condition: 'LP', finish: 'Normal', value: 4.84, fetchedAt: 1_759_000_000 },
+      { condition: 'NM', finish: 'Foil', value: 6.29, fetchedAt: 1_759_000_000 },
+    ])
+    expect(counts).toMatchObject({ written: 3, unmappedFinish: 1, duplicates: 0 })
+  })
+  it('dominantSkipReason names what skipped most of a product\'s listings', () => {
+    const base = { variants: 0, written: 0, skippedLanguage: 0, skippedCondition: 0, skippedNoPrice: 0, skippedNoPrinting: 0, duplicates: 0, unmappedFinish: 0 }
+    expect(dominantSkipReason(base)).toBe('no_variants')
+    expect(dominantSkipReason({ ...base, variants: 1, skippedCondition: 1 })).toBe('condition')
+    expect(dominantSkipReason({ ...base, variants: 9, skippedLanguage: 6, skippedNoPrice: 3 })).toBe('language')
+    expect(dominantSkipReason({ ...base, variants: 4, skippedNoPrice: 2, skippedNoPrinting: 2 })).toBe('no_price')   // tie → the listed order
+  })
 })
 
 // ── 2. The writer ────────────────────────────────────────────────────────────────────────────
@@ -231,6 +252,24 @@ describe('upsertJustTcgBatch', () => {
     expect(db.fresh.get(1)).toBe(1_760_000_000)
     expect(db.fresh.get(2)).toBe(1_760_000_000)
     expect(db.prices.find(p => p.source === 'tcgplayer')).toBeTruthy()      // other sources are never touched
+    expect(c).toMatchObject({ resolvedNothingWritten: 0, resolvedNothingWrittenExamples: [] })
+  })
+
+  it('a returned product with nothing writable is counted + named (resolvedNothingWritten) and still marked fresh', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ data: [
+      card('31', [v('Sealed', 'Normal', 120)]),                                               // a sealed product: no tier condition
+      card('32', [v('Near Mint', 'Holofoil - Japanese', 9, { language: 'Japanese' }), v('Sealed', 'Normal', 1)]),
+      card('33', [v('Near Mint', 'Normal', 2)]),
+    ], _metadata: {} }))))
+    const db = fakeDb({ products: [31, 32, 33].map(id => ({ id, tcgplayer_product_id: id, game: 'Pokemon' })) })
+    const env = { DB: db, SLEEVEDPAGES_KV: fakeKV(), JUSTTCG_API_KEY: 'k', JUSTTCG_MIN_INTERVAL_MS: '0' } as any
+    const c = await upsertJustTcgBatch(env, [31, 32, 33].map(id => ({ id, tcgplayerId: id, game: 'Pokemon' })), 1_760_000_000)
+    expect(c).toMatchObject({ resolved: 3, productsWritten: 1, resolvedNothingWritten: 2 })
+    expect(c.resolvedNothingWrittenExamples).toEqual([
+      { productId: 31, tcgplayerId: 31, reason: 'condition', variants: 1 },
+      { productId: 32, tcgplayerId: 32, reason: 'condition', variants: 2 },     // 1 language + 1 condition → tie → condition
+    ])
+    expect([...db.fresh.keys()].sort()).toEqual([31, 32, 33])                  // the freshness rule is unchanged
   })
 })
 
@@ -280,6 +319,21 @@ describe('runJustTcgRefresh (the nightly lane)', () => {
     const env2 = { DB: fakeDb({ config: { justtcg_ingest_enabled: '1' }, products, inventory: [1, 2, 3] }), SLEEVEDPAGES_KV: fakeKV(), JUSTTCG_API_KEY: 'k', JUSTTCG_MIN_INTERVAL_MS: '0', JUSTTCG_BATCH_SIZE: '1', JUSTTCG_DAILY_CAP: '1000' } as any
     const r2 = await runJustTcgRefresh(env2, { maxCalls: 2 })
     expect(r2).toMatchObject({ batchesRun: 2, stoppedReason: 'max_calls' })
+  })
+
+  it('the run log counts every resolved-nothing-written product and names at most 20, across batches', async () => {
+    const many = Array.from({ length: 25 }, (_, i) => ({ id: i + 1, tcgplayer_product_id: 500 + i + 1, game: 'Pokemon' }))
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: any) => {
+      const ids: string[] = JSON.parse(init.body).map((x: any) => x.tcgplayerId)
+      // every 5th product has a tier; the rest are sealed-only
+      return new Response(JSON.stringify({ data: ids.map(id => card(id, Number(id) % 5 === 0 ? [v('Near Mint', 'Normal', 2)] : [v('Sealed', 'Normal', 50)])), _metadata: {} }))
+    }))
+    const env = { DB: fakeDb({ config: { justtcg_ingest_enabled: '1' }, products: many, inventory: many.map(p => p.id) }), SLEEVEDPAGES_KV: fakeKV(), JUSTTCG_API_KEY: 'k', JUSTTCG_MIN_INTERVAL_MS: '0', JUSTTCG_BATCH_SIZE: '10', JUSTTCG_DAILY_CAP: '1000' } as any
+    const r = await runJustTcgRefresh(env)
+    expect(r).toMatchObject({ batchesRun: 3, requested: 25, resolved: 25, productsWritten: 5, resolvedNothingWritten: 20, skippedCondition: 20 })
+    expect(r.resolvedNothingWrittenExamples).toHaveLength(20)
+    expect(r.resolvedNothingWrittenExamples.every(e => e.reason === 'condition')).toBe(true)
+    expect(typeof r.requested).toBe('number')                                 // numeric sums never concatenate the examples list
   })
 
   it('a plan refusal (401) STOPS the run and reports a failure; nothing is marked fresh', async () => {
