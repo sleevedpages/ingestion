@@ -64,6 +64,17 @@ async function logCall(
 }
 
 /**
+ * Credits Scrydex BILLS for one SERVED call to `endpoint`. Scrydex's pricing page bills
+ * `/price_history` at 3 credits and every other read we make at 1 (Vision, 5, was removed
+ * 2026-10-05). Until 2026-10-06 the log booked 1 for EVERY endpoint, so a history-heavy month
+ * under-counted the guard by 2 per call (filed 2026-10-05b, fixed in the JustTCG switch session).
+ * A failed call still books 0 — see the note at the log write in scrydexFetch.
+ */
+export function scrydexCreditsFor(endpoint: string): number {
+  return /\/price_history(?:$|[/?])/.test(endpoint) ? 3 : 1
+}
+
+/**
  * Make an authenticated Scrydex API request, enforcing the monthly credit guard
  * and logging every call to scrydex_api_log.
  *
@@ -137,7 +148,7 @@ export async function scrydexFetch(
   const logStatus = response.ok ? 'success' : 'error'
   const logNotes  = response.ok ? null : `HTTP ${response.status}`
   try {
-    await logCall(env.DB, endpoint, jobName, logStatus, response.status, response.ok ? 1 : 0, logNotes)
+    await logCall(env.DB, endpoint, jobName, logStatus, response.status, response.ok ? scrydexCreditsFor(endpoint) : 0, logNotes)
   } catch {
     // non-blocking — a logging failure must never prevent the response from returning
   }
@@ -148,8 +159,8 @@ export async function scrydexFetch(
 // `scrydexVisionIdentify()` (POST /vision/v1/cards/identify, 5 credits/call) was REMOVED
 // 2026-10-05 — Part B of the JustTCG probe session. Its historical `scrydex_api_log` rows
 // (`endpoint LIKE '%/vision/%'`, `job_name='visionIdentify'`, credits_used 5) stay readable;
-// nothing writes new ones. Every remaining Scrydex call logs 1 credit per served response
-// (NOTE, recorded 2026-10-05: Scrydex bills `/price_history` at 3 — the log under-counts it).
+// nothing writes new ones. Every remaining Scrydex call logs what Scrydex BILLS per served response:
+// 3 for `/price_history`, 1 for everything else (`scrydexCreditsFor`, fixed 2026-10-06).
 
 /**
  * Delete scrydex_api_log rows older than 90 days.

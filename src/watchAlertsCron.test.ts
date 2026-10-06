@@ -16,7 +16,12 @@ const DRAIN_RESULT = {
 
 vi.mock('./scrydexProcessor.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./scrydexProcessor.js')>()
-  return { ...actual, processPendingWebhooks: vi.fn(async () => DRAIN_RESULT) }
+  return {
+    ...actual,
+    processPendingWebhooks: vi.fn(async () => DRAIN_RESULT),
+    // The keyless / switched-off lane hands back EVERY watched expansion (scrydexDrainGate.ts).
+    watchedExpansionKeys: vi.fn(async () => ({ keys: new Set(['pokemon|sv08', 'onepiece|OP09']), total: 2 })),
+  }
 })
 
 vi.mock('./watchAlerts.js', async (importOriginal) => {
@@ -68,12 +73,16 @@ describe('cron "0 10,16,22 * * *" — the priority lane + alert hook', () => {
     expect(runWatchAlerts).toHaveBeenCalledWith(expect.anything(), DRAIN_RESULT.refreshedExpansions)
   })
 
-  it('does NOT run the lane (or the hook) without Scrydex keys', async () => {
+  // 2026-10-06 (Scrydex dropped): without Scrydex keys the lane makes NO Scrydex call but STILL
+  // fires the alert hook with every watched expansion — deleting the secrets must never silence
+  // Card Watch. (Before: the lane, and so the alerts, were skipped entirely without keys.)
+  it('without Scrydex keys: no Scrydex call, but the hook still fires with EVERY watched expansion', async () => {
     const { ctx, scheduled } = collectingCtx()
     await worker.scheduled({ cron: '0 10,16,22 * * *' } as any, makeEnv({ SCRYDEX_API_KEY: undefined }), ctx)
     await Promise.all(scheduled)
     expect(processPendingWebhooks).not.toHaveBeenCalled()
-    expect(runWatchAlerts).not.toHaveBeenCalled()
+    expect(runWatchAlerts).toHaveBeenCalledWith(expect.anything(),
+      [{ gameSlug: 'pokemon', expansion: 'sv08' }, { gameSlug: 'onepiece', expansion: 'OP09' }])
   })
 
   it('a drain FAILURE fires no hook and never rejects the invocation', async () => {
@@ -134,10 +143,24 @@ describe('POST /admin/run-job { job: "card-watch-drain" } — the manual lane al
     expect(runWatchAlerts).toHaveBeenCalledWith(expect.anything(), DRAIN_RESULT.refreshedExpansions)
   })
 
-  it('503s without Scrydex keys (the hook never runs)', async () => {
-    const res = await runJob(makeEnv({ SCRYDEX_API_KEY: undefined }), { job: 'card-watch-drain' })
-    expect(res.status).toBe(503)
-    expect(runWatchAlerts).not.toHaveBeenCalled()
+  it('runs without Scrydex keys (2026-10-06): no Scrydex call, the hook still fires; the DAILY drain job still 503s', async () => {
+    const { ctx, scheduled } = collectingCtx()
+    const res = await worker.fetch(
+      new Request('https://worker.test/admin/run-job', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-worker-secret': SECRET },
+        body: JSON.stringify({ job: 'card-watch-drain' }),
+      }),
+      makeEnv({ SCRYDEX_API_KEY: undefined }),
+      ctx,
+    )
+    expect(res.status).toBe(200)
+    await Promise.all(scheduled)
+    expect(processPendingWebhooks).not.toHaveBeenCalled()
+    expect(runWatchAlerts).toHaveBeenCalledWith(expect.anything(),
+      [{ gameSlug: 'pokemon', expansion: 'sv08' }, { gameSlug: 'onepiece', expansion: 'OP09' }])
+    const daily = await runJob(makeEnv({ SCRYDEX_API_KEY: undefined }), { job: 'scrydex-drain' })
+    expect(daily.status).toBe(503)
   })
 
   it('a hook failure on the manual run never rejects the invocation', async () => {

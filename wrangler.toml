@@ -66,13 +66,15 @@ id      = "d8b69df87a0143b699e8dc75d286cdcb"
 #       OUTBOUND on the daily value-snapshot POST into the Content app (same secret, same
 #       x-worker-secret header, opposite direction). See src/valueSnapshots.ts.
 #   SCRYDEX_API_KEY / SCRYDEX_TEAM_ID — Scrydex price/image (Vision REMOVED 2026-10-05)
-#   JUSTTCG_API_KEY — the JustTCG EVALUATION PROBE's key (POST /admin/justtcg-probe, 2026-10-05).
-#       ⚠️ UAT ONLY while it is a Free-tier key (non-commercial by JustTCG's terms):
-#       `wrangler secret put JUSTTCG_API_KEY --env preview`. NEVER on prod, never in the
-#       Content app, never logged or returned; absent → 503 justtcg_not_configured. Optional
-#       knobs JUSTTCG_DAILY_CAP (100) / JUSTTCG_DAILY_RESERVE (10) / JUSTTCG_BATCH_SIZE (20) /
-#       JUSTTCG_MIN_INTERVAL_MS (12000 — never lower on a Free key; 6.5 s drew the abuse 429)
-#       default to the Free plan. See src/lib/justtcgClient.ts.
+#   JUSTTCG_API_KEY — JustTCG (the probe 2026-10-05; the prices WRITER since the switch session
+#       2026-10-06: the justtcg-refresh lane + POST /justtcg/enrich-card). The account is on the
+#       STARTER plan (commercial use allowed), so the key lives on BOTH workers — prod gets the
+#       STARTER key (never the Free one) via the plain `secret put` (no env flag), UAT via
+#       `--env preview`. Put it BEFORE the worker deploy that reads it (secret before code).
+#       Never in the Content app, never logged or returned; absent → 503 justtcg_not_configured
+#       and the lane self-skips. The plan knobs JUSTTCG_DAILY_CAP / _RESERVE / _BATCH_SIZE /
+#       _MIN_INTERVAL_MS are set per environment in [vars] / [env.preview.vars] below (the in-code
+#       defaults describe the Free plan). See src/lib/justtcgClient.ts + src/justtcgIngest.ts.
 #   PRICECHARTING_TOKEN — PriceCharting on-demand graded + daily CSV bulk-ingest
 #   TCGGO_RAPIDAPI_KEY — STILL REQUIRED: powers the Artist→Binder-Template tool
 #       (/tcggo/artists, /tcggo/artists/:id/cards). Its graded eBay-sold role was
@@ -207,6 +209,15 @@ LOG_LEVEL = "debug"
 # daily value-snapshot trigger). There is deliberately NO in-code default: a fallback would make a
 # UAT worker write snapshots into the PRODUCTION database. Absent → the job self-skips.
 CONTENT_APP_URL = "https://sleevedpages.com"
+# JustTCG STARTER plan knobs for the PROD worker (the switch session, 2026-10-06; JustTCG's own meter
+# read apiPlan "Starter Plan" · 10,000/mo · 1,000/day · 50/min on 2026-10-06 — Phase 0 #4). The KV
+# counter refuses at cap − reserve; the nightly lane additionally leaves JUSTTCG_LANE_ONVIEW_RESERVE
+# (default 200) calls for on-view enrich. 1.5 s pacing = 40/min, under the 50/min limit. The lane
+# population (owned ∪ vendor ∪ watched, 953 products on 2026-10-06) is ~10 batch calls/day.
+JUSTTCG_DAILY_CAP = "1000"
+JUSTTCG_DAILY_RESERVE = "20"
+JUSTTCG_BATCH_SIZE = "100"
+JUSTTCG_MIN_INTERVAL_MS = "1500"
 # DRY_RUN = "false"
 # BACKFILL_LIMIT = "50"  # Removed — full sync is ~2,000-2,500 requests, within the 10K limit
 # FORCE_SYNC = "true"      # Keep true until all sets are ingested, then remove
