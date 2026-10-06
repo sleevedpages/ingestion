@@ -1113,6 +1113,14 @@ cron and looping to finish tripped the limit. Now:
   upserts (more queue windows, same chain). ⚠️ The SAME twin collision exists for ENGLISH rows today (plain + `[Reverse Holo]`,
   11,710 pairs — prod stores the Reverse Holo price as `finish='normal'` for e.g. Flareon/Magikarp/Gyarados); NOT changed
   here — filed separately.
+- **➕ 2026-10-06b — the CSV-only premium / extra-company buckets (`PC_CSV_EXTRA_COLUMNS`, the JustTCG switch Phase 2;
+  branch `feat/pricecharting-buckets` — HELD for PriceCharting's licence reply).** `condition-19` → 'CGC 10' company CGC
+  **`is_perfect = 1`** (Content's relabel serves it as "CGC Pristine 10"); `condition-20` → 'BGS 10' company BGS **`is_perfect = 1`**
+  ("BGS Black Label 10"); `condition-21` → 'TAG 10' company TAG; `condition-22` → 'ACE 10' company ACE. `PRICE_UPSERT_SQL` binds
+  `company` + `is_perfect` (both NULL/0 for every other column — byte-identical rows for the existing buckets).
+  **Column-presence driven:** a header without these columns writes nothing new — and our export carries NONE of the four
+  today (verified 2026-10-06b), so the code is inert until PriceCharting adds them. The API decoder
+  (`GRADE_KEY_LABEL` / `decodeGradedKey`) is deliberately UNCHANGED — it still has no pristine bucket.
 - **Matching is IN-MEMORY (`src/pricechartingIngest.ts`)** — `loadProductIndex()` pulls the game's
   canonical products ONCE per PROCESS window (paginated, a few round trips) into `byTcgId` + `byNumber` maps;
   `matchRows()` is then pure CPU (no per-row D1 query). **WHY (fixed 2026-06-17):** the per-row fuzzy
