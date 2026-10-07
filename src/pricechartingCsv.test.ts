@@ -198,8 +198,9 @@ describe('PC_PRICE_COLUMNS decode map', () => {
   })
   it('graded columns exclude the ungraded loose row', () => {
     expect(PC_GRADED_COLUMNS.find((c) => c.col === 'loose-price')).toBeUndefined()
-    // 8 shared (API-decoder) buckets + the 4 CSV-only premium / extra-company buckets (2026-10-06).
-    expect(PC_GRADED_COLUMNS).toHaveLength(12)
+    // 8 shared (API-decoder) buckets + the 4 premium / extra-company buckets (2026-10-06) + the 6
+    // low grades Grade 1 … 6 (2026-10-07, API-documented condition-9/10/13/14/15/16).
+    expect(PC_GRADED_COLUMNS).toHaveLength(18)
   })
   // DELIBERATE REVERSAL (the JustTCG switch session, 2026-10-06, Phase 2): the note "PriceCharting
   // has NO pristine bucket — do not add one" described the on-demand API decoder, which stays as it

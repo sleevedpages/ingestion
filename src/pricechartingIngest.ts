@@ -543,7 +543,7 @@ function matchRows(
 
 // is_graded (Content mig 0099): positive write-time classification — 1 for every graded bucket
 // row ('PSA 10' … 'Grade 7 / 7.5'), 0 for the loose/ungraded row. Never inferred at read time.
-const PRICE_UPSERT_SQL = `
+export const PRICE_UPSERT_SQL = `
   INSERT INTO prices (product_id, source, condition, finish, grade, company, is_perfect, is_graded, value, retail_buy, retail_sell, fetched_at)
   VALUES (?, 'pricecharting', ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
   ON CONFLICT (product_id, source, COALESCE(condition,''), COALESCE(finish,''), COALESCE(grade,''),

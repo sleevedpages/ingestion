@@ -218,6 +218,15 @@ JUSTTCG_DAILY_CAP = "1000"
 JUSTTCG_DAILY_RESERVE = "20"
 JUSTTCG_BATCH_SIZE = "100"
 JUSTTCG_MIN_INTERVAL_MS = "1500"
+# The ON-VIEW PriceCharting refresh (2026-10-07, POST /pricecharting/enrich-card). PriceCharting allows
+# 1 call/second and REVOKES accounts for sustained excess: ONE serialized caller, ≥ 1.1 s apart across
+# invocations (the code floors the interval at 1,100), a 12-slot queue, then drop-and-log. The cap assumes
+# ~950 owned products (a cold start of every owned card ≈ 950 product calls + ≤ 274 searches ≈ 23 min
+# serialized) plus tens of new views a day in beta; the reserve is head-room for the admin on-demand path.
+# Gated by app_config.pricecharting_onview_enabled (default '0').
+PC_ONVIEW_DAILY_CAP = "2000"
+PC_ONVIEW_MIN_INTERVAL_MS = "1100"
+PC_ONVIEW_RESERVE = "100"
 # DRY_RUN = "false"
 # BACKFILL_LIMIT = "50"  # Removed — full sync is ~2,000-2,500 requests, within the 10K limit
 # FORCE_SYNC = "true"      # Keep true until all sets are ingested, then remove
@@ -316,6 +325,10 @@ JUSTTCG_DAILY_CAP = "1000"
 JUSTTCG_DAILY_RESERVE = "100"
 JUSTTCG_BATCH_SIZE = "100"
 JUSTTCG_MIN_INTERVAL_MS = "3000"
+# The on-view PriceCharting refresh — the same knobs as prod (named envs do not inherit [vars]).
+PC_ONVIEW_DAILY_CAP = "2000"
+PC_ONVIEW_MIN_INTERVAL_MS = "1100"
+PC_ONVIEW_RESERVE = "100"
 # CONTENT_APP_URL — deliberately UNSET here. wrangler does NOT inherit top-level [vars] into a
 # named environment, so the UAT worker has no Content origin by default and the value-snapshot job
 # self-skips rather than guessing (a guess would be the PROD origin, i.e. UAT writing prod rows).

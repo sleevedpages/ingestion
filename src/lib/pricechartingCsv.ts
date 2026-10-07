@@ -39,6 +39,10 @@
  * this shipped (the cached one-piece-cards CSV of 2026-10-05 ends at condition-18-price), so
  * today they write nothing; a file that carries them writes them with no code change. They are
  * deliberately NOT in GRADE_KEY_LABEL: the on-demand API decoder (decodeGradedKey) is unchanged.
+ * ➕ 2026-10-07: PriceCharting confirmed these four are API-ONLY (never in the CSV); the on-view
+ * refresh (src/lib/pricechartingOnView.ts) writes them from `GET /api/product` through THIS map
+ * (`csvRowToPriceRows` over the penny fields rendered as dollars), so both paths stay one decoder.
+ * Same for PC_LOW_GRADE_COLUMNS ('Grade 1' … 'Grade 6').
  */
 
 import { GRADE_KEY_LABEL, LOOSE_KEY } from './pricechartingClient.js'
@@ -147,10 +151,29 @@ export const PC_CSV_EXTRA_COLUMNS: PcPriceColumn[] = [
   { col: 'condition-22-price', grade: 'ACE 10', company: 'ACE', isPerfect: false },
 ]
 
+/**
+ * The company-agnostic LOW grades (2026-10-07, the on-view PriceCharting refresh). PriceCharting's
+ * API documentation (read 2026-10-07, https://www.pricecharting.com/api-documentation) lists
+ * `condition-9/10/13/14/15/16-price` = "Graded 1 … 6 by a grading company" (there is no 11 / 12).
+ * Labelled like the other sub-10 buckets ('Grade N'), so Content's `matchGradedEntry` values an
+ * owned PSA 6 off 'Grade 6' with no read-side change. Column-presence driven exactly like
+ * PC_CSV_EXTRA_COLUMNS: our CSV export carries none of them (verified 2026-07-15), so the CSV
+ * PROCESS writes nothing new; the API product response carries them when PriceCharting has a value.
+ */
+export const PC_LOW_GRADE_COLUMNS: PcPriceColumn[] = [
+  { col: 'condition-9-price',  grade: 'Grade 1' },
+  { col: 'condition-10-price', grade: 'Grade 2' },
+  { col: 'condition-13-price', grade: 'Grade 3' },
+  { col: 'condition-14-price', grade: 'Grade 4' },
+  { col: 'condition-15-price', grade: 'Grade 5' },
+  { col: 'condition-16-price', grade: 'Grade 6' },
+]
+
 export const PC_PRICE_COLUMNS: PcPriceColumn[] = [
   { col: LOOSE_KEY, grade: null }, // ungraded / market
   ...Object.entries(GRADE_KEY_LABEL).map(([col, grade]) => ({ col, grade })),
   ...PC_CSV_EXTRA_COLUMNS,
+  ...PC_LOW_GRADE_COLUMNS,
 ]
 /** Just the graded columns (sealed product skips these — it has no graded tiers). */
 export const PC_GRADED_COLUMNS = PC_PRICE_COLUMNS.filter((c) => c.grade !== null)
