@@ -16,6 +16,7 @@ import {
   DEFAULT_PC_LANGUAGE,
   PC_PRICE_COLUMNS,
   PC_GRADED_COLUMNS,
+  PC_CSV_EXTRA_COLUMNS,
   PRICECHARTING_CATEGORIES,
   buildDownloadUrl,
   normalizeUpc,
@@ -24,6 +25,7 @@ import {
   CATEGORY_FOREIGN_TCGPLAYER_IDS,
   CATEGORY_TCGPLAYER_IDS,
 } from './lib/pricechartingCsv.js'
+import { GRADE_KEY_LABEL } from './lib/pricechartingClient.js'
 
 // ── Pokémon Japanese rows via the foreign sibling catalogue (2026-10-06b) ──────────
 describe('stripCollectorNumberSuffix (TCGplayer Pokémon Japan names)', () => {
@@ -196,7 +198,21 @@ describe('PC_PRICE_COLUMNS decode map', () => {
   })
   it('graded columns exclude the ungraded loose row', () => {
     expect(PC_GRADED_COLUMNS.find((c) => c.col === 'loose-price')).toBeUndefined()
-    expect(PC_GRADED_COLUMNS).toHaveLength(8)
+    // 8 shared (API-decoder) buckets + the 4 premium / extra-company buckets (2026-10-06) + the 6
+    // low grades Grade 1 … 6 (2026-10-07, API-documented condition-9/10/13/14/15/16).
+    expect(PC_GRADED_COLUMNS).toHaveLength(18)
+  })
+  // DELIBERATE REVERSAL (the JustTCG switch session, 2026-10-06, Phase 2): the note "PriceCharting
+  // has NO pristine bucket — do not add one" described the on-demand API decoder, which stays as it
+  // was (decodeGradedKey + GRADE_KEY_LABEL untouched — pinned below). The CSV WRITER gains the
+  // condition-19..22 buckets, column-presence driven, each carrying its company.
+  it('the CSV-only buckets carry company + is_perfect, and are NOT in the API decoder map', () => {
+    const extra = Object.fromEntries(PC_CSV_EXTRA_COLUMNS.map((c) => [c.col, c]))
+    expect(extra['condition-19-price']).toEqual({ col: 'condition-19-price', grade: 'CGC 10', company: 'CGC', isPerfect: true })
+    expect(extra['condition-20-price']).toEqual({ col: 'condition-20-price', grade: 'BGS 10', company: 'BGS', isPerfect: true })
+    expect(extra['condition-21-price']).toEqual({ col: 'condition-21-price', grade: 'TAG 10', company: 'TAG', isPerfect: false })
+    expect(extra['condition-22-price']).toEqual({ col: 'condition-22-price', grade: 'ACE 10', company: 'ACE', isPerfect: false })
+    for (const col of Object.keys(extra)) expect(GRADE_KEY_LABEL[col]).toBeUndefined()
   })
 })
 
@@ -214,6 +230,16 @@ describe('csvRowToPriceRows', () => {
     expect(byGrade['Grade 9']).toBe(88)
     expect(byGrade['Grade 8 / 8.5']).toBeUndefined()  // blank
     expect(byGrade['BGS 10']).toBeUndefined()         // $0.00 skipped
+  })
+  it('a premium bucket decodes WITH its company (column present); absent columns write nothing', () => {
+    const rows = csvRowToPriceRows({ 'loose-price': '$5.00', 'condition-19-price': '$900.00', 'condition-21-price': '$70.00' })
+    expect(rows).toEqual([
+      { grade: null, valueDollars: 5 },
+      { grade: 'CGC 10', valueDollars: 900, company: 'CGC', isPerfect: true },
+      { grade: 'TAG 10', valueDollars: 70, company: 'TAG', isPerfect: false },
+    ])
+    // Today's export carries none of the four columns → the same rows as before the change.
+    expect(csvRowToPriceRows(row).every(r => r.company === undefined)).toBe(true)
   })
   it('sealed rows emit ONLY the ungraded/market row (no graded tiers)', () => {
     const rows = csvRowToPriceRows(row, { isSealed: true })

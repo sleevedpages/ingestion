@@ -42,6 +42,7 @@ import { runWatchAlerts } from './watchAlerts.js';
 import { runJustTcgProbe, runJustTcgDiag, probeNotConfigured, type ProbeBody, type DiagBody } from './justtcgProbe.js';
 import { runJustTcgRefresh, enrichJustTcgCard, justtcgIngestEnabled } from './justtcgIngest.js';
 import { justtcgConfigured } from './lib/justtcgClient.js';
+import { enrichPcCard, pcOnViewEnabled } from './lib/pricechartingOnView.js';
 import { runScrydexDrainGated } from './scrydexDrainGate.js';
 import {
   ADMIN_JOB_IDS,
@@ -116,6 +117,13 @@ export interface Env {
   PC_INGEST_FUZZY_MAX?: string;  // bounded fuzzy lookups per window; default 400
   PC_INGEST_BUDGET_MS?: string;  // wall-time budget per PROCESS window before stopping + enqueuing the next; default 20000
   PC_PROCESS_MAX_BATCHES?: string; // D1 DB.batch() cap per PROCESS window (sub-request safety); default 300
+  // The ON-VIEW PriceCharting refresh (2026-10-07, POST /pricecharting/enrich-card — src/lib/pricechartingOnView.ts).
+  // Budget knobs in [vars]; in-code defaults in brackets. PriceCharting allows 1 call/second and revokes for
+  // sustained excess — the interval can never go below 1,100 ms whatever this says.
+  PC_ONVIEW_DAILY_CAP?: string;       // [2000] on-view calls per UTC day (KV pc_onview_calls:<day>)
+  PC_ONVIEW_RESERVE?: string;         // [100]  head-room left under the cap (the admin on-demand path)
+  PC_ONVIEW_MIN_INTERVAL_MS?: string; // [1100] ms between on-view calls, cross-invocation (KV slot)
+  PC_ONVIEW_MAX_QUEUE?: string;       // [12]   slots a caller may queue behind; beyond → capacity (dropped, logged)
   // Shared KV namespace (the Content app's SLEEVEDPAGES_KV) — caches resolved
   // PriceCharting ids (pc_id:*) and raw product responses (pc_product:*).
   SLEEVEDPAGES_KV?: KVNamespace;
@@ -864,6 +872,40 @@ export default {
         // A refused plan / a busy minute / a transient failure — the caller serves the rows it has.
         logger.warn('justtcg enrich-card failed', { canonicalProductId, error: String(err) });
         return json({ ok: false, error: String((err as Error)?.message ?? err).slice(0, 300), kind: (err as { kind?: string })?.kind ?? null }, 502);
+      }
+    }
+
+    // POST /pricecharting/enrich-card — the ON-VIEW PriceCharting refresh (2026-10-07). Body
+    // { canonicalProductId, force? }. Content's POST /api/cards/enrich (class `graded`) proxies HERE.
+    // ONE product's full PriceCharting price set (loose + every graded bucket, incl. CGC 10 Pristine /
+    // BGS 10 Black Label / TAG 10 / ACE 10) → `prices` source='pricecharting'; freshness class
+    // `pricecharting_product` 7 days, `force` floored at 24 h, a miss negative-cached 24 h. Order of
+    // refusals: the secret (401) → the token (503 pricecharting_not_configured) → the switch (409
+    // pricecharting_onview_disabled — app_config.pricecharting_onview_enabled, default '0') → 400 →
+    // the work. Capacity (daily cap / queue full / a 429 cooldown) answers 200 { ok:false,
+    // reason:'capacity' } — the caller treats it as "later". See src/lib/pricechartingOnView.ts.
+    if (pathname === '/pricecharting/enrich-card' && request.method === 'POST') {
+      const secret = request.headers.get('x-worker-secret');
+      if (!env.INGESTION_WORKER_SECRET || secret !== env.INGESTION_WORKER_SECRET) {
+        return json({ ok: false, error: 'Unauthorized' }, 401);
+      }
+      if (!env.PRICECHARTING_TOKEN) {
+        return json({ ok: false, error: 'pricecharting_not_configured' }, 503);
+      }
+      if (!(await pcOnViewEnabled(env.DB))) {
+        return json({ ok: false, error: 'pricecharting_onview_disabled' }, 409);
+      }
+      const body = await request.json().catch(() => ({})) as { canonicalProductId?: number | string; force?: unknown };
+      const canonicalProductId = Number(body.canonicalProductId);
+      if (!Number.isInteger(canonicalProductId) || canonicalProductId < 1) {
+        return json({ ok: false, error: 'canonicalProductId (canonical products.id) is required' }, 400);
+      }
+      try {
+        const result = await enrichPcCard(env, canonicalProductId, { force: body.force === true });
+        return json(result, 200);
+      } catch (err) {
+        logger.warn('pricecharting enrich-card failed', { canonicalProductId, error: String(err) });
+        return json({ ok: false, error: String((err as Error)?.message ?? err).slice(0, 300) }, 502);
       }
     }
 

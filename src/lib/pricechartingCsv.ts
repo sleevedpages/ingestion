@@ -27,7 +27,22 @@
  *   bgs-10-price       → grade 'BGS 10'
  *   condition-17-price → grade 'CGC 10'
  *   condition-18-price → grade 'SGC 10'
- * (No TAG/ACE bucket; sub-10 grades are company-agnostic — same caveats as the API path.)
+ * (Sub-10 grades are company-agnostic — same caveats as the API path.)
+ *
+ * CSV-ONLY PREMIUM / EXTRA-COMPANY BUCKETS (the JustTCG switch session, 2026-10-06 — Phase 2;
+ * PC_CSV_EXTRA_COLUMNS below), written WITH a company so selectGradedRows can relabel them:
+ *   condition-19-price → 'CGC 10', company CGC, is_perfect 1 → serves as "CGC Pristine 10"
+ *   condition-20-price → 'BGS 10', company BGS, is_perfect 1 → serves as "BGS Black Label 10"
+ *   condition-21-price → 'TAG 10', company TAG
+ *   condition-22-price → 'ACE 10', company ACE
+ * ⚠️ COLUMN-PRESENCE DRIVEN. Our download-custom export did NOT carry these four columns when
+ * this shipped (the cached one-piece-cards CSV of 2026-10-05 ends at condition-18-price), so
+ * today they write nothing; a file that carries them writes them with no code change. They are
+ * deliberately NOT in GRADE_KEY_LABEL: the on-demand API decoder (decodeGradedKey) is unchanged.
+ * ➕ 2026-10-07: PriceCharting confirmed these four are API-ONLY (never in the CSV); the on-view
+ * refresh (src/lib/pricechartingOnView.ts) writes them from `GET /api/product` through THIS map
+ * (`csvRowToPriceRows` over the penny fields rendered as dollars), so both paths stay one decoder.
+ * Same for PC_LOW_GRADE_COLUMNS ('Grade 1' … 'Grade 6').
  */
 
 import { GRADE_KEY_LABEL, LOOSE_KEY } from './pricechartingClient.js'
@@ -121,10 +136,44 @@ export function normalizeUpc(raw: unknown): string | null {
  * decodes to (null for the ungraded/market row). Derived from the shared API decode map
  * so the two paths can never drift. The ungraded row is first.
  */
-export interface PcPriceColumn { col: string; grade: string | null }
+export interface PcPriceColumn { col: string; grade: string | null; company?: string; isPerfect?: boolean }
+
+/**
+ * The CSV-only buckets that name their grading company (see the header). A perfect bucket is
+ * stored the way Scrydex stores one — the STANDARD-10 grade string + `is_perfect = 1` + the
+ * company — so Content's relabel-before-dedup (`selectGradedRows`) serves it under the
+ * company's premium label and it can never win the standard-10 label. Column-presence driven.
+ */
+export const PC_CSV_EXTRA_COLUMNS: PcPriceColumn[] = [
+  { col: 'condition-19-price', grade: 'CGC 10', company: 'CGC', isPerfect: true },
+  { col: 'condition-20-price', grade: 'BGS 10', company: 'BGS', isPerfect: true },
+  { col: 'condition-21-price', grade: 'TAG 10', company: 'TAG', isPerfect: false },
+  { col: 'condition-22-price', grade: 'ACE 10', company: 'ACE', isPerfect: false },
+]
+
+/**
+ * The company-agnostic LOW grades (2026-10-07, the on-view PriceCharting refresh). PriceCharting's
+ * API documentation (read 2026-10-07, https://www.pricecharting.com/api-documentation) lists
+ * `condition-9/10/13/14/15/16-price` = "Graded 1 … 6 by a grading company" (there is no 11 / 12).
+ * Labelled like the other sub-10 buckets ('Grade N'), so Content's `matchGradedEntry` values an
+ * owned PSA 6 off 'Grade 6' with no read-side change. Column-presence driven exactly like
+ * PC_CSV_EXTRA_COLUMNS: our CSV export carries none of them (verified 2026-07-15), so the CSV
+ * PROCESS writes nothing new; the API product response carries them when PriceCharting has a value.
+ */
+export const PC_LOW_GRADE_COLUMNS: PcPriceColumn[] = [
+  { col: 'condition-9-price',  grade: 'Grade 1' },
+  { col: 'condition-10-price', grade: 'Grade 2' },
+  { col: 'condition-13-price', grade: 'Grade 3' },
+  { col: 'condition-14-price', grade: 'Grade 4' },
+  { col: 'condition-15-price', grade: 'Grade 5' },
+  { col: 'condition-16-price', grade: 'Grade 6' },
+]
+
 export const PC_PRICE_COLUMNS: PcPriceColumn[] = [
   { col: LOOSE_KEY, grade: null }, // ungraded / market
   ...Object.entries(GRADE_KEY_LABEL).map(([col, grade]) => ({ col, grade })),
+  ...PC_CSV_EXTRA_COLUMNS,
+  ...PC_LOW_GRADE_COLUMNS,
 ]
 /** Just the graded columns (sealed product skips these — it has no graded tiers). */
 export const PC_GRADED_COLUMNS = PC_PRICE_COLUMNS.filter((c) => c.grade !== null)
@@ -230,6 +279,9 @@ export interface PcDecodedPriceRow {
   valueDollars: number
   retailBuyDollars?: number
   retailSellDollars?: number
+  /** Set only by a PC_CSV_EXTRA_COLUMNS bucket (→ `prices.company` / `prices.is_perfect`). */
+  company?: string
+  isPerfect?: boolean
 }
 
 /**
@@ -245,10 +297,11 @@ export function csvRowToPriceRows(
 ): PcDecodedPriceRow[] {
   const cols = opts.isSealed ? PC_PRICE_COLUMNS.filter((c) => c.grade === null) : PC_PRICE_COLUMNS
   const rows: PcDecodedPriceRow[] = []
-  for (const { col, grade } of cols) {
+  for (const { col, grade, company, isPerfect } of cols) {
     const cents = parseDollarsToCents(row[col])
     if (cents == null) continue
     const out: PcDecodedPriceRow = { grade, valueDollars: cents / 100 }
+    if (company) { out.company = company; out.isPerfect = !!isPerfect }
     if (grade === null) {
       // The ungraded/market row carries the retail buy/sell negotiating spread.
       const buy = parseDollarsToCents(row[RETAIL_BUY_KEY])
